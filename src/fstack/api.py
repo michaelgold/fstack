@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from fstack.provisioning import ProvisioningRequest, ProvisioningResponse
 from fstack.service import (
@@ -46,7 +47,9 @@ def _require_operator(
     if (
         credentials is None
         or credentials.scheme.lower() != "bearer"
-        or not hmac.compare_digest(credentials.credentials, expected)
+        or not hmac.compare_digest(
+            credentials.credentials.encode("utf-8"), expected.encode("utf-8")
+        )
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -83,8 +86,10 @@ def create_app() -> FastAPI:
             content={"code": exc.code, "message": messages[exc.code]},
         )
 
-    @app.exception_handler(HTTPException)
-    async def stable_http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    @app.exception_handler(StarletteHTTPException)
+    async def stable_http_error_handler(
+        _request: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
         if isinstance(exc.detail, dict) and set(exc.detail) == {"code", "message"}:
             return JSONResponse(status_code=exc.status_code, content=exc.detail)
         return JSONResponse(

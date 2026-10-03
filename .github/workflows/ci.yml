@@ -45,11 +45,7 @@ jobs:
           uv lock --check
           git diff --check
       - name: Tracked-file secret scan
-        run: |
-          PATTERN='(gho''_|github''_pat|BEGIN (RSA|OPENSSH|PRIVATE) KEY|refresh''_token|access''_token|password[[:space:]]*=|secret[[:space:]]*=[^[:space:]]+)'
-          if git grep -InE "$PATTERN" -- . ':!.env.example'; then
-            exit 1
-          fi
+        run: uv run python tools/scan_tracked_secrets.py
       - name: Static checks
         run: |
           uv run ruff check .

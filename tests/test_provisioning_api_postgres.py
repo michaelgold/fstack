@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
-from time import sleep
+from time import monotonic, sleep
 from uuid import UUID, uuid4
 
 import pytest
@@ -551,8 +551,29 @@ def test_competing_uncommitted_claim_rollback_allows_request_to_win(
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(submit)
-            sleep(0.2)
-            assert not future.done()
+            deadline = monotonic() + 5
+            blocked_on_claim = False
+            while monotonic() < deadline:
+                with migrated_database.connect() as monitor:
+                    blocked_on_claim = monitor.execute(
+                        text(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1
+                                FROM pg_stat_activity
+                                WHERE datname = current_database()
+                                  AND pid <> pg_backend_pid()
+                                  AND state = 'active'
+                                  AND wait_event_type = 'Lock'
+                                  AND query ILIKE '%INSERT INTO provisioning_operations%'
+                            )
+                            """
+                        )
+                    ).scalar_one()
+                if blocked_on_claim:
+                    break
+                sleep(0.05)
+            assert blocked_on_claim
             blocker_transaction.rollback()
             response = future.result(timeout=5)
     finally:
