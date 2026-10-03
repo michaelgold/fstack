@@ -31,6 +31,22 @@ def test_secret_scan_rejects_fstack_operator_token_assignment(tmp_path: Path) ->
     assert value not in result.stdout
 
 
+@pytest.mark.parametrize(
+    "key",
+    ["TOKEN", "PASSWORD", "SECRET", "API_KEY", "DATABASE_URL"],
+)
+def test_secret_scan_rejects_exact_credential_keys(tmp_path: Path, key: str) -> None:
+    candidate = tmp_path / "runtime.env"
+    value = "exact-key-live-" + "credential"
+    candidate.write_text(f"{key}={value}\n")
+
+    result = _scan(candidate)
+
+    assert result.returncode == 1
+    assert "runtime.env:1" in result.stdout
+    assert value not in result.stdout
+
+
 @pytest.mark.parametrize("quote", ['"', "'"])
 def test_secret_scan_rejects_quoted_operator_token_assignment(
     tmp_path: Path,

@@ -29,7 +29,7 @@ PLACEHOLDER_VALUES = {
 }
 ASSIGNMENT = re.compile(
     r"(?<![A-Z0-9_])(?P<quote>[\"']?)"
-    r"(?P<key>[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|DATABASE_URL|API_KEY|PRIVATE_KEY|AUTHORIZATION))"
+    r"(?P<key>(?:[A-Z][A-Z0-9_]*)?(?:TOKEN|SECRET|PASSWORD|PASSWD|DATABASE_URL|API_KEY|PRIVATE_KEY|AUTHORIZATION))"
     r"(?P=quote)\s*[:=]\s*(?P<value>.+?)\s*$"
 )
 CREDENTIAL_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:([^@\s/]+)@")
