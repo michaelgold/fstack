@@ -35,7 +35,7 @@ ASSIGNMENT = re.compile(
 CREDENTIAL_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:([^@\s/]+)@")
 KNOWN_SECRET = re.compile(
     r"(?:gh[opurs]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|"
-    r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)"
+    r"-----BEGIN (?:RSA |OPENSSH |EC |DSA |ENCRYPTED )?PRIVATE KEY-----)"
 )
 VARIABLE_EXPRESSION = re.compile(
     r"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|"

@@ -29,6 +29,7 @@ def test_framework_generated_http_errors_use_stable_envelope(monkeypatch) -> Non
     assert not_found.json() == {"code": "http_error", "message": "request failed"}
     assert method_not_allowed.status_code == 405
     assert method_not_allowed.json() == {"code": "http_error", "message": "request failed"}
+    assert method_not_allowed.headers["allow"] == "GET"
 
 
 def test_non_ascii_bearer_credential_returns_stable_unauthorized(monkeypatch) -> None:

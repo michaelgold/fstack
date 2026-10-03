@@ -62,6 +62,18 @@ def test_secret_scan_rejects_database_url_credentials(tmp_path: Path) -> None:
     assert password not in result.stdout
 
 
+def test_secret_scan_rejects_encrypted_pkcs8_private_key(tmp_path: Path) -> None:
+    candidate = tmp_path / "private.pem"
+    header = "-----BEGIN " + "ENCRYPTED PRIVATE KEY-----"
+    candidate.write_text(f"{header}\nencoded-key-material\n")
+
+    result = _scan(candidate)
+
+    assert result.returncode == 1
+    assert "private.pem:1" in result.stdout
+    assert header not in result.stdout
+
+
 @pytest.mark.parametrize(
     "value",
     [
