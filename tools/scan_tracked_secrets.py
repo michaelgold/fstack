@@ -13,6 +13,7 @@ IGNORED_REPOSITORY_PATHS = {
     "tools/scan_tracked_secrets.py",
 }
 PLACEHOLDER_VALUES = {
+    "***",
     "ci-operator-token",
     "do-not-echo",
     "fstack-test-password",
@@ -20,6 +21,7 @@ PLACEHOLDER_VALUES = {
     "irrelevant",
     "password",
     "replace-me",
+    "replace-with-a-long-random-token",
     "replace-with-a-long-random-operator-token",
     "smoke-operator-token",
     "test-operator-token",
@@ -35,6 +37,10 @@ KNOWN_SECRET = re.compile(
     r"(?:gh[opurs]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|"
     r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)"
 )
+VARIABLE_EXPRESSION = re.compile(
+    r"(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|"
+    r"\$\{\{\s*(?:env|secrets|vars)\.[A-Za-z_][A-Za-z0-9_]*\s*\}\})"
+)
 
 
 def _normalized_value(raw: str) -> str:
@@ -45,13 +51,10 @@ def _normalized_value(raw: str) -> str:
 
 
 def _is_placeholder(value: str) -> bool:
-    normalized = unquote(_normalized_value(value))
+    normalized = _normalized_value(value)
     if normalized in PLACEHOLDER_VALUES:
         return True
-    lowered = normalized.lower()
-    if "placeholder" in lowered or lowered.startswith("replace-"):
-        return True
-    if normalized.startswith("${{") or normalized.startswith("$"):
+    if VARIABLE_EXPRESSION.fullmatch(normalized) is not None:
         return True
     parsed = urlsplit(normalized)
     return parsed.password is not None and unquote(parsed.password) in PLACEHOLDER_VALUES
