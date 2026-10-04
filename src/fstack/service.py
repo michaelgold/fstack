@@ -7,7 +7,11 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
 
-from fstack.provisioning import ProvisioningRequest, request_fingerprint
+from fstack.provisioning import (
+    ProvisioningRequest,
+    ProvisioningStatusResponse,
+    request_fingerprint,
+)
 
 
 class ProvisioningConflictError(Exception):
@@ -225,4 +229,53 @@ def create_provisioning_operation(
         workload_id=workload_id,
         deployment_id=deployment_id,
         replayed=False,
+    )
+
+
+def get_provisioning_operation(
+    connection: Connection,
+    *,
+    operation_id: UUID,
+) -> ProvisioningStatusResponse | None:
+    """Load the sanitized public status for one provisioning operation."""
+    row = (
+        connection.execute(
+            text(
+                """
+                SELECT id AS operation_id, organization_id, business_id,
+                       environment_id, workload_id, deployment_id, state,
+                       created_at, started_at, completed_at, attempt_count,
+                       last_error_code, last_error_retryable
+                FROM provisioning_operations
+                WHERE id = :operation_id
+                """
+            ),
+            {"operation_id": operation_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    last_error = None
+    if row["last_error_code"] is not None:
+        last_error = {
+            "code": row["last_error_code"],
+            "retryable": row["last_error_retryable"],
+        }
+    return ProvisioningStatusResponse.model_validate(
+        {
+            "operation_id": row["operation_id"],
+            "organization_id": row["organization_id"],
+            "business_id": row["business_id"],
+            "environment_id": row["environment_id"],
+            "workload_id": row["workload_id"],
+            "deployment_id": row["deployment_id"],
+            "state": row["state"],
+            "created_at": row["created_at"],
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+            "attempt_count": row["attempt_count"],
+            "last_error": last_error,
+        }
     )

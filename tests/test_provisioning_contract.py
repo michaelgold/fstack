@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -88,3 +90,56 @@ def test_request_rejects_noncanonical_or_secret_shaped_values(field: str, value:
 
     with pytest.raises(ValidationError):
         provisioning.ProvisioningRequest.model_validate(body)
+
+
+def test_status_response_rejects_negative_attempt_count() -> None:
+    identity = {
+        "operation_id": uuid4(),
+        "organization_id": uuid4(),
+        "business_id": uuid4(),
+        "environment_id": uuid4(),
+        "workload_id": uuid4(),
+        "deployment_id": uuid4(),
+    }
+
+    with pytest.raises(ValidationError):
+        provisioning.ProvisioningStatusResponse.model_validate(
+            {
+                **identity,
+                "state": "pending",
+                "created_at": datetime.now(UTC),
+                "started_at": None,
+                "completed_at": None,
+                "attempt_count": -1,
+                "last_error": None,
+            }
+        )
+
+
+def test_status_response_normalizes_timestamps_to_utc() -> None:
+    non_utc = datetime(2026, 10, 4, 12, tzinfo=timezone(timedelta(hours=5)))
+    response = provisioning.ProvisioningStatusResponse.model_validate(
+        {
+            "operation_id": uuid4(),
+            "organization_id": uuid4(),
+            "business_id": uuid4(),
+            "environment_id": uuid4(),
+            "workload_id": uuid4(),
+            "deployment_id": uuid4(),
+            "state": "pending",
+            "created_at": non_utc,
+            "started_at": None,
+            "completed_at": None,
+            "attempt_count": 0,
+            "last_error": None,
+        }
+    )
+
+    assert response.model_dump_json().count("2026-10-04T07:00:00Z") == 1
+
+
+def test_status_error_rejects_unsanitized_code() -> None:
+    with pytest.raises(ValidationError):
+        provisioning.ProvisioningStatusError.model_validate(
+            {"code": "Raw Docker exception: secret", "retryable": False}
+        )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import os
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -14,12 +15,17 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from fstack.provisioning import ProvisioningRequest, ProvisioningResponse
+from fstack.provisioning import (
+    ProvisioningRequest,
+    ProvisioningResponse,
+    ProvisioningStatusResponse,
+)
 from fstack.service import (
     OrganizationExistsError,
     ProvisioningConflictError,
     PublicDomainExistsError,
     create_provisioning_operation,
+    get_provisioning_operation,
 )
 
 _OPERATOR_PRINCIPAL = "installation-operator"
@@ -56,6 +62,21 @@ def _require_operator(
             detail={"code": "unauthorized", "message": "operator authorization required"},
         )
     return _OPERATOR_PRINCIPAL
+
+
+def _require_operator_for_status(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)],
+) -> str:
+    try:
+        return _require_operator(credentials)
+    except HTTPException as exc:
+        headers = dict(exc.headers or {})
+        headers["Cache-Control"] = "no-store"
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=headers,
+        ) from None
 
 
 def _validate_idempotency_key(value: str) -> str:
@@ -104,17 +125,54 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_handler(
-        _request: Request,
+        request: Request,
         _exc: RequestValidationError,
     ) -> JSONResponse:
+        headers = None
+        if request.method == "GET" and request.url.path.startswith("/v1/provisioning/operations/"):
+            headers = {"Cache-Control": "no-store"}
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"code": "invalid_request", "message": "request validation failed"},
+            headers=headers,
         )
 
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "fstack"}
+
+    @app.get(
+        "/v1/provisioning/operations/{operation_id}",
+        response_model=ProvisioningStatusResponse,
+    )
+    def get_operation(
+        operation_id: UUID,
+        response: Response,
+        _actor_principal: str = Depends(_require_operator_for_status),
+    ) -> ProvisioningStatusResponse:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            with engine.connect() as connection:
+                result = get_provisioning_operation(connection, operation_id=operation_id)
+        except SQLAlchemyError:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": "persistence_failed",
+                    "message": "request could not be persisted",
+                },
+                headers={"Cache-Control": "no-store"},
+            ) from None
+        if result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "operation_not_found",
+                    "message": "operation was not found",
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+        return result
 
     @app.post(
         "/v1/provisioning/operations",

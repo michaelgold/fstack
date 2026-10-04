@@ -64,3 +64,22 @@ def test_non_ascii_bearer_credential_returns_stable_unauthorized(monkeypatch) ->
         "code": "unauthorized",
         "message": "operator authorization required",
     }
+
+
+def test_authenticated_invalid_operation_uuid_is_not_cacheable(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "FSTACK_DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid"
+    )
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+
+    response = TestClient(create_app()).get(
+        "/v1/provisioning/operations/not-a-uuid",
+        headers={"Authorization": "Bearer test-operator-token"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "code": "invalid_request",
+        "message": "request validation failed",
+    }
+    assert response.headers["cache-control"] == "no-store"

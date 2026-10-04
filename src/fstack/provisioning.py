@@ -6,11 +6,12 @@ import hashlib
 import json
 import re
 import unicodedata
+from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID
 
 import idna
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 REQUEST_VERSION = "fstack.crusher-provisioning-request.v1"
 SLUG_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
@@ -116,6 +117,43 @@ class ProvisioningResponse(BaseModel):
     deployment_id: UUID
     state: Literal["pending"] = "pending"
     replayed: bool
+
+
+class ProvisioningStatusError(BaseModel):
+    """Sanitized durable provisioning failure."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    retryable: bool
+
+
+class ProvisioningStatusResponse(BaseModel):
+    """Exact public status of a durable provisioning operation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: UUID
+    organization_id: UUID
+    business_id: UUID
+    environment_id: UUID
+    workload_id: UUID
+    deployment_id: UUID
+    state: Literal["pending", "running", "succeeded", "failed"]
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    attempt_count: int = Field(ge=0)
+    last_error: ProvisioningStatusError | None
+
+    @field_validator("created_at", "started_at", "completed_at")
+    @classmethod
+    def normalize_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.utcoffset() is None:
+            raise ValueError("timestamp must include a UTC offset")
+        return value.astimezone(UTC)
 
 
 def request_fingerprint(request: ProvisioningRequest) -> str:
