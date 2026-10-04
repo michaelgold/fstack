@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: fstack
+          POSTGRES_PASSWORD: fstack-test-password
+          POSTGRES_DB: fstack_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fstack -d fstack_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      FSTACK_DATABASE_URL: postgresql+psycopg://fstack:fstack-test-password@127.0.0.1:5432/fstack_test
+      FSTACK_TEST_DATABASE_URL: postgresql://fstack:fstack-test-password@127.0.0.1:5432/fstack_test
+      FSTACK_OPERATOR_TOKEN: ci-operator-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: 0.9.17
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Sync locked dependencies
+        run: uv sync --frozen
+      - name: Lockfile and diff checks
+        run: |
+          uv lock --check
+          git diff --check
+      - name: Tracked-file secret scan
+        run: uv run python tools/scan_tracked_secrets.py
+      - name: Static checks
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run mypy
+      - name: Migration roundtrip
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+      - name: Tests
+        run: uv run pytest -q
+      - name: Build installed image
+        run: docker build -t fstack:${{ github.sha }} .

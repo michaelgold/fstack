@@ -1,0 +1,46 @@
+[project]
+name = "fstack"
+version = "0.1.0"
+description = "Open-core control plane for isolated AI businesses and workloads"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.17,<2",
+    "fastapi[opentelemetry]==0.142.2",
+    "idna>=3.10,<4",
+    "psycopg[binary]>=3.2,<4",
+    "pydantic-settings>=2.10,<3",
+    "sqlalchemy>=2.0,<3",
+    "uvicorn>=0.35,<1",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.12,<3",
+    "mypy>=1.17,<2",
+    "pytest>=8.4,<10",
+    "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["fstack"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "postgres: requires a live PostgreSQL database",
+]
