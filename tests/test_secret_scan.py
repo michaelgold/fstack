@@ -64,6 +64,19 @@ def test_secret_scan_rejects_quoted_operator_token_assignment(
     assert value not in result.stdout
 
 
+def test_secret_scan_rejects_multiline_structured_assignment(tmp_path: Path) -> None:
+    candidate = tmp_path / "config.json"
+    key = "TOKEN"
+    value = "multiline-live-" + "credential"
+    candidate.write_text(f'{{\n  "{key}":\n  "{value}"\n}}\n')
+
+    result = _scan(candidate)
+
+    assert result.returncode == 1
+    assert "config.json:2" in result.stdout
+    assert value not in result.stdout
+
+
 def test_secret_scan_rejects_database_url_credentials(tmp_path: Path) -> None:
     candidate = tmp_path / "runtime.env"
     password = "live-db-" + "password"

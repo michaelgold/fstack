@@ -573,6 +573,8 @@ def test_competing_uncommitted_claim_rollback_allows_request_to_win(
                 if blocked_on_claim:
                     break
                 sleep(0.05)
+            if not blocked_on_claim and blocker_transaction.is_active:
+                blocker_transaction.rollback()
             assert blocked_on_claim
             blocker_transaction.rollback()
             response = future.result(timeout=5)

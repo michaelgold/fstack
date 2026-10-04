@@ -30,7 +30,8 @@ PLACEHOLDER_VALUES = {
 ASSIGNMENT = re.compile(
     r"(?<![A-Z0-9_])(?P<quote>[\"']?)"
     r"(?P<key>(?:[A-Z][A-Z0-9_]*)?(?:TOKEN|SECRET|PASSWORD|PASSWD|DATABASE_URL|API_KEY|PRIVATE_KEY|AUTHORIZATION))"
-    r"(?P=quote)\s*[:=]\s*(?P<value>.+?)\s*$"
+    r"(?P=quote)\s*[:=]\s*(?P<value>.+?)\s*$",
+    re.MULTILINE,
 )
 CREDENTIAL_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:([^@\s/]+)@")
 KNOWN_SECRET = re.compile(
@@ -61,19 +62,19 @@ def _is_placeholder(value: str) -> bool:
 
 
 def scan_text(path: Path, text: str) -> list[int]:
-    findings: list[int] = []
+    findings: set[int] = set()
+    for assignment in ASSIGNMENT.finditer(text):
+        if not _is_placeholder(assignment.group("value")):
+            findings.add(text.count("\n", 0, assignment.start("key")) + 1)
+
     for line_number, line in enumerate(text.splitlines(), start=1):
         if KNOWN_SECRET.search(line):
-            findings.append(line_number)
-            continue
-        assignment = ASSIGNMENT.search(line)
-        if assignment is not None and not _is_placeholder(assignment.group("value")):
-            findings.append(line_number)
+            findings.add(line_number)
             continue
         credential_url = CREDENTIAL_URL.search(line)
         if credential_url is not None and not _is_placeholder(credential_url.group(1)):
-            findings.append(line_number)
-    return findings
+            findings.add(line_number)
+    return sorted(findings)
 
 
 def _tracked_files() -> list[Path]:
