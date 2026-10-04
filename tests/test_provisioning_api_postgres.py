@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from fstack.api import create_app
 from fstack.provisioning import ProvisioningRequest, request_fingerprint
@@ -102,6 +102,148 @@ def test_create_operation_persists_complete_pending_desired_state(
         "actor_principal": "installation-operator",
         "payload": {},
     }
+
+
+@pytest.mark.postgres
+def test_pending_operation_can_be_read_after_creation(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+    client = TestClient(create_app())
+    headers = {
+        "Authorization": "Bearer test-operator-token",
+        "Idempotency-Key": "create-acme-mailer",
+    }
+    created = client.post("/v1/provisioning/operations", headers=headers, json=VALID_BODY)
+
+    response = client.get(
+        f"/v1/provisioning/operations/{created.json()['operation_id']}",
+        headers={"Authorization": "Bearer test-operator-token"},
+    )
+
+    assert created.status_code == 202
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload) == {
+        "operation_id",
+        "organization_id",
+        "business_id",
+        "environment_id",
+        "workload_id",
+        "deployment_id",
+        "state",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "attempt_count",
+        "last_error",
+    }
+    assert {
+        key: payload[key]
+        for key in (
+            "operation_id",
+            "organization_id",
+            "business_id",
+            "environment_id",
+            "workload_id",
+            "deployment_id",
+        )
+    } == {
+        key: created.json()[key]
+        for key in (
+            "operation_id",
+            "organization_id",
+            "business_id",
+            "environment_id",
+            "workload_id",
+            "deployment_id",
+        )
+    }
+    assert payload["state"] == "pending"
+    assert payload["started_at"] is None
+    assert payload["completed_at"] is None
+    assert payload["attempt_count"] == 0
+    assert payload["last_error"] is None
+    assert payload["created_at"].endswith("Z")
+    assert response.headers["cache-control"] == "no-store"
+    assert "replayed" not in payload
+
+
+@pytest.mark.postgres
+def test_operation_status_authenticates_before_lookup(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+    lookup_called = False
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        nonlocal lookup_called
+        lookup_called = True
+        raise AssertionError("lookup must not run before authentication")
+
+    monkeypatch.setattr("fstack.api.get_provisioning_operation", fail_if_called)
+    client = TestClient(create_app())
+
+    response = client.get(f"/v1/provisioning/operations/{uuid4()}")
+
+    assert lookup_called is False
+    assert response.status_code == 401
+    assert response.json() == {
+        "code": "unauthorized",
+        "message": "operator authorization required",
+    }
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.postgres
+def test_unknown_operation_status_returns_exact_not_found(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+    client = TestClient(create_app(), raise_server_exceptions=False)
+
+    response = client.get(
+        f"/v1/provisioning/operations/{uuid4()}",
+        headers={"Authorization": "Bearer test-operator-token"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "code": "operation_not_found",
+        "message": "operation was not found",
+    }
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.postgres
+def test_operation_status_persistence_failure_is_sanitized(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+    marker = "raw-secret-marker"
+
+    def fail_lookup(*_args: object, **_kwargs: object) -> None:
+        raise SQLAlchemyError(marker)
+
+    monkeypatch.setattr("fstack.api.get_provisioning_operation", fail_lookup)
+    client = TestClient(create_app(), raise_server_exceptions=False)
+
+    response = client.get(
+        f"/v1/provisioning/operations/{uuid4()}",
+        headers={"Authorization": "Bearer test-operator-token"},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "code": "persistence_failed",
+        "message": "request could not be persisted",
+    }
+    assert response.headers["cache-control"] == "no-store"
+    assert marker not in response.text
 
 
 @pytest.mark.postgres
