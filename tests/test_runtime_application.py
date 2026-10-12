@@ -652,7 +652,9 @@ def test_realistic_docker_create_raw_inspect_omissions_have_exact_comparable_sch
                 "Type": mount["Type"],
                 "Source": mount["Source"],
                 "Destination": mount["Target"],
+                "Mode": "",
                 "RW": not mount["ReadOnly"],
+                "Propagation": "rprivate",
             }
             for mount in host["Mounts"]
         ],
@@ -708,7 +710,9 @@ class _HostileValue:
         ("Mounts", "Type", _HostileValue()),
         ("Mounts", "Source", _HostileValue()),
         ("Mounts", "Destination", _HostileValue()),
+        ("Mounts", "Mode", _HostileValue()),
         ("Mounts", "RW", 0),
+        ("Mounts", "Propagation", _HostileValue()),
     ],
 )
 def test_docker_mounts_reject_wrong_exact_field_types(
@@ -755,6 +759,50 @@ def test_docker_mounts_reject_unknown_types(tmp_path: Path, mount_location: str)
         else inspect_json["Mounts"]
     )
     mounts[0]["Type"] = "volume"
+
+    with pytest.raises(DockerCommandError, match="^docker_unavailable$"):
+        DockerCLI()._normalized(inspect_json)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("Mode", "ro"),
+        ("Propagation", "rshared"),
+    ],
+)
+def test_docker_top_level_bind_policy_is_exact(tmp_path: Path, field: str, invalid: str) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    expected = _container_spec(
+        plan,
+        ImageInspection(reference=plan.canonical_spec["crusher_image"], environment=(), labels={}),
+        "api",
+    )
+    inspect_json = _network_alias_inspect(expected, "a" * 64, ["a" * 12, expected["name"]])
+    inspect_json["Mounts"][0][field] = invalid
+
+    with pytest.raises(DockerCommandError, match="^docker_unavailable$"):
+        DockerCLI()._normalized(inspect_json)
+
+
+@pytest.mark.parametrize("field", ["Mode", "Propagation"])
+def test_docker_top_level_bind_policy_fields_are_required(tmp_path: Path, field: str) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    expected = _container_spec(
+        plan,
+        ImageInspection(reference=plan.canonical_spec["crusher_image"], environment=(), labels={}),
+        "api",
+    )
+    inspect_json = _network_alias_inspect(expected, "a" * 64, ["a" * 12, expected["name"]])
+    del inspect_json["Mounts"][0][field]
 
     with pytest.raises(DockerCommandError, match="^docker_unavailable$"):
         DockerCLI()._normalized(inspect_json)
@@ -972,7 +1020,9 @@ def _network_alias_inspect(
                 "Type": mount["type"],
                 "Source": mount["source"],
                 "Destination": mount["target"],
+                "Mode": "",
                 "RW": not mount["read_only"],
+                "Propagation": "rprivate",
             }
             for mount in expected["mounts"]
         ],

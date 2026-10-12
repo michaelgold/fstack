@@ -194,6 +194,7 @@ class DockerCLI:
         target_key: str,
         writable_key: str,
         writable_means_read_only: bool,
+        fixed_fields: Mapping[str, object],
     ) -> list[dict[str, Any]]:
         if type(value) is not list:
             raise DockerCommandError("docker_unavailable")
@@ -203,7 +204,13 @@ class DockerCLI:
             if type(item) is not dict:
                 raise DockerCommandError("docker_unavailable")
             mount = cast(dict[str, Any], item)
-            if set(mount) != {"Type", "Source", target_key, writable_key}:
+            if set(mount) != {"Type", "Source", target_key, writable_key, *fixed_fields}:
+                raise DockerCommandError("docker_unavailable")
+            if any(
+                type(cls._required(mount, key)) is not type(expected)
+                or cls._required(mount, key) != expected
+                for key, expected in fixed_fields.items()
+            ):
                 raise DockerCommandError("docker_unavailable")
             mount_type = cls._required(mount, "Type")
             source = cls._required(mount, "Source")
@@ -302,6 +309,7 @@ class DockerCLI:
                 target_key="Target",
                 writable_key="ReadOnly",
                 writable_means_read_only=True,
+                fixed_fields={},
             ),
             "pid_mode": pid_mode or None,
             "ports": cast(dict[str, Any], port_bindings),
@@ -342,6 +350,7 @@ class DockerCLI:
             target_key="Destination",
             writable_key="RW",
             writable_means_read_only=False,
+            fixed_fields={"Mode": "", "Propagation": "rprivate"},
         )
         if host_config["mounts"] != normalized_mounts:
             raise DockerCommandError("docker_unavailable")
