@@ -181,6 +181,27 @@ def test_database_bundle_accepts_exact_supported_scheme(scheme: str) -> None:
     runtime_application_module._validate_bundles(owner_raw, application_raw)
 
 
+@pytest.mark.parametrize("target", ["owner", "application"])
+@pytest.mark.parametrize(
+    "scheme",
+    ["POSTGRESQL", "PostgreSQL", "POSTGRESQL+PSYCOPG", "PostgreSQL+Psycopg"],
+)
+def test_database_bundle_rejects_non_lowercase_supported_scheme(target: str, scheme: str) -> None:
+    owner_scheme = scheme if target == "owner" else "postgresql+psycopg"
+    application_scheme = scheme if target == "application" else "postgresql+psycopg"
+    owner_raw, application_raw = _database_bundle(
+        f"{owner_scheme}://owner:owner-password@db.example/acme",
+        f"{application_scheme}://crusher_app:app-password@db.example/acme",
+    )
+
+    with pytest.raises(RuntimeApplicationError) as exc_info:
+        runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+    assert exc_info.value.code == "invalid_secret_bundle"
+    _assert_no_exception_marker(exc_info.value, "owner-password")
+    _assert_no_exception_marker(exc_info.value, "app-password")
+
+
 @pytest.mark.parametrize(
     ("owner_scheme", "application_scheme"),
     [
@@ -273,6 +294,48 @@ def test_database_bundle_rejects_invalid_database_url_components(
 
     assert exc_info.value.code == "invalid_secret_bundle"
     _assert_no_exception_marker(exc_info.value, "password")
+
+
+@pytest.mark.parametrize("target", ["owner", "application"])
+@pytest.mark.parametrize(
+    "port",
+    ["0", "", "65536", "-1", "+1", " 5432", "5432 ", "not-a-port"],
+)
+def test_database_bundle_rejects_invalid_explicit_database_port(target: str, port: str) -> None:
+    owner_url = "postgresql+psycopg://owner:" + "owner-" + "password@db.example/acme"
+    application_url = "postgresql+psycopg://crusher_app:" + "app-" + "password@db.example/acme"
+    if target == "owner":
+        owner_url = "postgresql+psycopg://owner:" + "owner-" + f"password@db.example:{port}/acme"
+    else:
+        application_url = (
+            "postgresql+psycopg://crusher_app:" + "app-" + f"password@db.example:{port}/acme"
+        )
+    owner_raw, application_raw = _database_bundle(owner_url, application_url)
+
+    with pytest.raises(RuntimeApplicationError) as exc_info:
+        runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+    assert exc_info.value.code == "invalid_secret_bundle"
+    _assert_no_exception_marker(exc_info.value, "password")
+
+
+@pytest.mark.parametrize("port", [1, 5432, 65535])
+def test_database_bundle_accepts_valid_explicit_database_port(port: int) -> None:
+    owner_raw, application_raw = _database_bundle(
+        "postgresql+psycopg://owner:" + "owner-" + f"password@db.example:{port}/acme",
+        "postgresql+psycopg://crusher_app:" + "app-" + f"password@db.example:{port}/acme",
+    )
+
+    runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+
+def test_database_bundle_treats_omitted_database_port_as_5432() -> None:
+    owner_raw, application_raw = _database_bundle(
+        "postgresql+psycopg://owner:" + "owner-" + "password@db.example/acme",
+        "postgresql+psycopg://crusher_app:" + "app-" + "password@db.example:5432/acme",
+    )
+
+    runtime_application_module._validate_bundles(owner_raw, application_raw)
 
 
 def _write_bundle(root: Path) -> str:

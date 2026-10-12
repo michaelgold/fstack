@@ -118,13 +118,31 @@ def _decode_json(raw: bytes, expected: set[str]) -> dict[str, str]:
 
 
 def _database_url(value: str) -> tuple[str, str, int, str, str, str]:
+    scheme, separator, _ = value.partition("://")
     try:
         parsed = urlsplit(value)
-        port = parsed.port or 5432
+        parsed_port = parsed.port
     except ValueError:
         _raise("invalid_secret_bundle", retryable=False)
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        closing_bracket = authority.find("]")
+        port_suffix = authority[closing_bracket + 1 :] if closing_bracket >= 0 else authority
+        explicit_port = bool(port_suffix)
+        port_text = port_suffix[1:] if port_suffix.startswith(":") else ""
+    else:
+        _, port_separator, port_text = authority.rpartition(":")
+        explicit_port = bool(port_separator)
+    if explicit_port:
+        if re.fullmatch(r"[0-9]+", port_text) is None or parsed_port is None:
+            _raise("invalid_secret_bundle", retryable=False)
+        port = parsed_port
+    else:
+        port = 5432
     if (
-        parsed.scheme not in {"postgresql", "postgres", "postgresql+psycopg"}
+        not separator
+        or scheme not in {"postgresql", "postgres", "postgresql+psycopg"}
+        or parsed.scheme != scheme
         or not parsed.hostname
         or parsed.fragment
         or parsed.query
@@ -132,6 +150,7 @@ def _database_url(value: str) -> tuple[str, str, int, str, str, str]:
         or parsed.path == "/"
         or parsed.username is None
         or parsed.password is None
+        or not 1 <= port <= 65535
     ):
         _raise("invalid_secret_bundle", retryable=False)
     hostname = parsed.hostname
