@@ -197,14 +197,17 @@ def _require_descriptor_primitives() -> tuple[int, int]:
     return nofollow, directory
 
 
-def _validate_descriptor(descriptor: int, *, directory: bool) -> os.stat_result:
+def _validate_descriptor(
+    descriptor: int, *, directory: bool, exact_mode: int | None = None
+) -> os.stat_result:
     try:
         info = os.fstat(descriptor)
     except OSError:
         _raise("unsafe_secret_file", retryable=False)
     expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
-    forbidden = 0o077
-    if not expected or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & forbidden:
+    mode = stat.S_IMODE(info.st_mode)
+    unsafe_mode = mode != exact_mode if exact_mode is not None else bool(mode & 0o077)
+    if not expected or info.st_uid != os.getuid() or unsafe_mode:
         _raise("unsafe_secret_file", retryable=False)
     return info
 
@@ -297,7 +300,7 @@ def _open_or_create_stage_file(directory_fd: int, name: str) -> tuple[int, bool]
                 os.open(
                     name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
-                    0o400,
+                    0o444,
                     dir_fd=directory_fd,
                 ),
                 True,
@@ -348,7 +351,12 @@ def _stage(plan: RuntimePlan) -> _StagedSecretEvidence:
         for name, raw in expected_files.items():
             descriptor, created = _open_or_create_stage_file(directory_fd, name)
             try:
-                info = _validate_descriptor(descriptor, directory=False)
+                if created:
+                    try:
+                        os.fchmod(descriptor, 0o444)
+                    except OSError:
+                        _raise("unsafe_secret_file", retryable=False)
+                info = _validate_descriptor(descriptor, directory=False, exact_mode=0o444)
                 identities[name] = (info.st_dev, info.st_ino)
                 if created:
                     _write_all(descriptor, raw)
@@ -377,7 +385,7 @@ def _stage(plan: RuntimePlan) -> _StagedSecretEvidence:
                 except OSError:
                     _raise("unsafe_secret_file", retryable=False)
                 try:
-                    info = _validate_descriptor(descriptor, directory=False)
+                    info = _validate_descriptor(descriptor, directory=False, exact_mode=0o444)
                     if (
                         (info.st_dev, info.st_ino) != identities[name]
                         or info.st_size > _MAX_SECRET_BYTES
@@ -427,7 +435,7 @@ def _validate_staged(plan: RuntimePlan, evidence: _StagedSecretEvidence) -> None
             except OSError:
                 _raise("unsafe_secret_file", retryable=False)
             try:
-                info = _validate_descriptor(descriptor, directory=False)
+                info = _validate_descriptor(descriptor, directory=False, exact_mode=0o444)
                 raw = _read_descriptor(descriptor)
                 if (
                     (info.st_dev, info.st_ino) != (expected.device, expected.inode)

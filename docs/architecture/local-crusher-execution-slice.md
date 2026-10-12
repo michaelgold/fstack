@@ -294,8 +294,9 @@ deterministic directory
 root is worker-owned mode `0700`, has no writable ancestor available to less privileged
 users, and is outside the reference-addressable source tree. The deployment directory is
 created with directory-relative exclusive non-following operations at mode `0700`; staged
-`owner.json` and `application.json` are created at mode `0400`, fsynced with their parent,
-and never rewritten in place. A pre-existing snapshot is accepted only when ownership,
+`owner.json` and `application.json` are created at mode `0444` inside the confined
+directory so cap-dropped container root can read each bind-mounted leaf, fsynced with their
+parent, and never rewritten in place. A pre-existing snapshot is accepted only when ownership,
 mode, regular-file identity and bytes exactly match the newly resolved bundle. Otherwise
 execution fails closed with `unsafe_secret_file`. Snapshots are installation-local runtime
 secret material, retained while their deterministic containers exist and never represented

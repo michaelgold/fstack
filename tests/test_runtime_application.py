@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -225,7 +226,11 @@ def test_apply_runtime_plan_stages_secrets_migrates_starts_and_probes(tmp_path: 
     docker = FakeDocker(plan.canonical_spec["crusher_image"])
     submitted: list[str] = []
 
-    result = apply_runtime_plan(plan, docker, persist_submitted=submitted.append)
+    previous_umask = os.umask(0o077)
+    try:
+        result = apply_runtime_plan(plan, docker, persist_submitted=submitted.append)
+    finally:
+        os.umask(previous_umask)
 
     assert result == f"container-{plan.canonical_spec['api_container_name']}"
     assert submitted == [result]
@@ -234,8 +239,10 @@ def test_apply_runtime_plan_stages_secrets_migrates_starts_and_probes(tmp_path: 
     assert (
         json.loads((stage / "application.json").read_text())["magic_link_secret"] == "magic-secret"
     )
-    assert oct(os.stat(stage).st_mode & 0o777) == "0o700"
-    assert oct(os.stat(stage / "owner.json").st_mode & 0o777) == "0o400"
+    assert stat.S_IMODE(os.stat(stage_root).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(stage).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(stage / "owner.json").st_mode) == 0o444
+    assert stat.S_IMODE(os.stat(stage / "application.json").st_mode) == 0o444
     assert [call[0] for call in docker.calls].count("create_container") == 2
     assert docker.calls[-2:] == [
         (
@@ -249,6 +256,31 @@ def test_apply_runtime_plan_stages_secrets_migrates_starts_and_probes(tmp_path: 
             ("/app/.venv/bin/python", "-c", runtime_submission.HTTP_PROBE_V1),
         ),
     ]
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o600])
+def test_existing_staged_secret_with_noncanonical_mode_fails_closed(
+    tmp_path: Path, mode: int
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    stage = stage_root / plan.deployment_id.hex
+    stage.mkdir(mode=0o700)
+    source = source_root / "acme" / "database"
+    for name in ("owner.json", "application.json"):
+        staged = stage / name
+        staged.write_bytes((source / name).read_bytes())
+        staged.chmod(mode if name == "owner.json" else 0o400)
+    docker = FakeDocker(plan.canonical_spec["crusher_image"])
+
+    with pytest.raises(RuntimeApplicationError) as exc_info:
+        apply_runtime_plan(plan, docker, persist_submitted=lambda _identifier: None)
+
+    assert exc_info.value.code == "unsafe_secret_file"
+    assert docker.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1250,7 +1282,7 @@ def _replace_staged_application(plan: RuntimePlan) -> None:
     path = plan.stage_root / plan.deployment_id.hex / "application.json"
     replacement = path.with_suffix(".attacker")
     replacement.write_bytes(path.read_bytes() + b" ")
-    replacement.chmod(0o400)
+    replacement.chmod(0o444)
     replacement.replace(path)
 
 
