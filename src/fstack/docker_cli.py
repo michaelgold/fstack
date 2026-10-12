@@ -165,8 +165,12 @@ class DockerCLI:
         return cast(list[dict[str, Any]], value)
 
     @classmethod
-    def _string_dict(cls, mapping: Mapping[str, Any], key: str) -> dict[str, str]:
+    def _string_dict(
+        cls, mapping: Mapping[str, Any], key: str, *, nullable: bool = False
+    ) -> dict[str, str]:
         value = cls._required(mapping, key)
+        if nullable and value is None:
+            return {}
         if type(value) is not dict or not all(
             type(item_key) is str and type(item_value) is str
             for item_key, item_value in value.items()
@@ -299,8 +303,8 @@ class DockerCLI:
                 "name": restart_name,
             },
             "security_opt": cls._string_list(host, "SecurityOpt", nullable=True),
-            "sysctls": cls._string_dict(host, "Sysctls"),
-            "tmpfs": cls._string_dict(host, "Tmpfs"),
+            "sysctls": cls._string_dict(host, "Sysctls", nullable=True),
+            "tmpfs": cls._string_dict(host, "Tmpfs", nullable=True),
             "uts_mode": uts_mode or None,
         }
 

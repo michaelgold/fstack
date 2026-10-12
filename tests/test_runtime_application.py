@@ -620,6 +620,8 @@ def test_realistic_docker_create_inspect_round_trip_has_exact_comparable_schema(
     identifier = docker.create_container(expected)
     payload = captured["payload"]
     host = payload["HostConfig"]
+    assert host["Sysctls"] == {}
+    assert host["Tmpfs"] == {}
     inspect_json = {
         "Id": identifier,
         "Name": f"/{captured['name']}",
@@ -640,6 +642,8 @@ def test_realistic_docker_create_inspect_round_trip_has_exact_comparable_schema(
             "IpcMode": "private",
             "Links": None,
             "PidMode": "",
+            "Sysctls": None,
+            "Tmpfs": None,
             "UTSMode": "",
         },
         "Mounts": [
@@ -1135,8 +1139,18 @@ def test_docker_host_config_requires_every_sealed_field(tmp_path: Path, field: s
         ("ReadonlyRootfs", 0),
         ("RestartPolicy", []),
         ("SecurityOpt", {}),
+        ("Sysctls", ""),
         ("Sysctls", []),
+        ("Sysctls", 0),
+        ("Sysctls", False),
+        ("Sysctls", {"net.ipv4.ip_forward": 1}),
+        ("Sysctls", {1: "net.ipv4.ip_forward"}),
+        ("Tmpfs", ""),
         ("Tmpfs", []),
+        ("Tmpfs", 0),
+        ("Tmpfs", False),
+        ("Tmpfs", {"/run": 1}),
+        ("Tmpfs", {1: "rw"}),
         ("UTSMode", None),
     ],
 )
