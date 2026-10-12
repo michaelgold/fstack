@@ -346,7 +346,8 @@ Both deterministic containers use the exact requested Crusher digest and labels:
 The canonical common Docker create fields are:
 
 - platform: the local daemon's native Linux platform; no cross-platform emulation;
-- entrypoint: explicitly empty;
+- entrypoint: inherited exactly from the requested immutable image digest and then sent
+  explicitly in the create request;
 - user: `0:0`; working directory: `/app`;
 - container environment policy: `inherit-from-requested-digest`, with no Docker
   environment overrides;
@@ -359,7 +360,8 @@ The canonical common Docker create fields are:
   `security_opt=['no-new-privileges:true']`;
 - no tmpfs, volumes or mounts except the one exact read-only secret-file bind;
 - logging driver `json-file` with an explicit empty option map;
-- `auto_remove=false`, no init override and no stop-signal override.
+- `auto_remove=false`, no init override, and the stop signal inherited exactly from the
+  requested immutable image digest and sent explicitly in the create request.
 
 The migration-specific fields are:
 

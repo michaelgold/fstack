@@ -56,13 +56,34 @@ The runtime provider owns:
 - health and readiness;
 - provider-native deployment reconciliation.
 
-## Initial vertical slice
+## Local Docker runtime vertical slice
 
-`ProvisionCrusherWorkflow` currently invokes one idempotent activity that prepares
-or replays the exact PostgreSQL-backed Crusher runtime submission. The activity is
-safe to execute again after an ambiguous completion because it addresses the exact
-operation and returns the existing deterministic submission instead of creating a
-second runtime submission.
+`ProvisionCrusherWorkflow` orchestrates prepare, local-Docker application/readiness,
+and terminal PostgreSQL finalization. Preparation only seals or replays the exact
+runtime submission. The apply activity atomically marks the operation running, stages
+the approved local-file database bundle, reconciles deterministic migration and API
+containers, records the API container identity immediately after creation/adoption,
+then requires migration success, application-role PostgreSQL connectivity, Docker
+health, and the exact Crusher `/health` response. A separate activity atomically
+confirms the submission, succeeds the operation, and appends the product audit event.
+Permanent provider/domain failures are finalized once through the corresponding atomic
+failure activity; retryable failures remain Temporal activity failures and preserve any
+submitted provider identity for reconciliation.
+
+Docker reconciliation validates the requested immutable image digest before mutation
+and compares existing deterministic-name resources against the complete sealed spec and
+exact Fstack labels. Matching resources are replay-safe. Unmanaged or mismatched
+resources fail closed and are never deleted or replaced. Provider output and exception
+text are discarded in favor of bounded sanitized codes. Known domain conflicts are
+nonretryable; unexpected database, state, and provider failures cross every activity
+boundary as the generic retryable `activity_infrastructure_failure` error.
+
+The local secret provider is intentionally narrow: database references must use
+`secret://local-file/<segments>`, resolved beneath `FSTACK_LOCAL_SECRET_ROOT` without
+following symlinks. Exact owner/application JSON is copied privately to
+`FSTACK_SECRET_STAGE_ROOT/<deployment hex>/` and mounted read-only. Secret values never
+enter PostgreSQL, Temporal payloads, Docker labels/commands/environment overrides, logs,
+or public API responses. Object-storage references are not resolved in this slice.
 
 The API transaction creates the operation and one exact workflow-dispatch intent together.
 The Temporal worker continuously drains pending intents, starts deterministic workflow
@@ -88,8 +109,9 @@ runtime-submission history exists.
 The runtime record stores provider, generation, deterministic submission key, sealed
 specification fingerprint, deterministic resource names, provider external identity,
 sanitized terminal failure and lifecycle timestamps. It does not own retries or
-workflow progress. The next slice moves runtime application, readiness and terminal
-PostgreSQL finalization into Temporal activities.
+workflow progress. Runtime application, readiness, and terminal PostgreSQL finalization
+are now Temporal activities; PostgreSQL still contains no attempts, leases, heartbeats,
+retry scheduler, or polling claims.
 
 ## Test boundary
 

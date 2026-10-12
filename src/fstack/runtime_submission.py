@@ -23,7 +23,7 @@ SPEC_VERSION = "fstack.local-crusher-spec.v1"
 class PreparedRuntimeSubmission:
     submission_id: UUID
     operation_id: UUID
-    state: Literal["prepared", "submitted", "confirmed"]
+    state: Literal["prepared", "submitted", "confirmed", "failed"]
     provider: Literal["local_docker"]
     generation: int
     submission_key: str
@@ -143,14 +143,19 @@ def _canonical_spec(
     deployment_id = operation["deployment_id"]
     stage_directory = secret_stage_root / deployment_id.hex
     common = {
+        "auto_remove": False,
         "cap_add": [],
         "cap_drop": ["ALL"],
         "devices": [],
         "device_requests": [],
-        "entrypoint": [],
+        "dns": [],
+        "dns_options": [],
+        "dns_search": [],
+        "entrypoint": "inherit-from-requested-digest",
         "environment": "inherit-from-requested-digest",
         "environment_overrides": [],
         "extra_hosts": [],
+        "group_add": [],
         "image": operation["crusher_image"],
         "init": None,
         "ipc_mode": None,
@@ -164,7 +169,8 @@ def _canonical_spec(
         "privileged": False,
         "readonly_rootfs": False,
         "security_opt": ["no-new-privileges:true"],
-        "stop_signal": None,
+        "stop_signal": "inherit-from-requested-digest",
+        "sysctls": {},
         "tmpfs": {},
         "user": "0:0",
         "uts_mode": None,
@@ -347,44 +353,6 @@ def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmi
             "spec_fingerprint": fingerprint,
             "api_container_name": api_name,
             "migration_container_name": migration_name,
-        },
-    )
-    connection.execute(
-        text(
-            """
-            WITH boundary AS (SELECT clock_timestamp() AS now)
-            UPDATE provisioning_operations
-            SET state = 'running', started_at = boundary.now, updated_at = boundary.now
-            FROM boundary
-            WHERE id = :operation_id AND state = 'pending'
-            """
-        ),
-        {"operation_id": operation_id},
-    )
-    connection.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, organization_id, operation_id, event_type, actor_principal, payload
-            ) VALUES (
-                :id, :organization_id, :operation_id, 'provisioning.started',
-                :actor_principal, CAST(:payload AS jsonb)
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "organization_id": operation["organization_id"],
-            "operation_id": operation_id,
-            "actor_principal": operation["actor_principal"],
-            "payload": json.dumps(
-                {
-                    "runtime_submission_id": str(submission_id),
-                    "provider": PROVIDER,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
         },
     )
     return PreparedRuntimeSubmission(

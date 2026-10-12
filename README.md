@@ -22,7 +22,7 @@ Fstack uses PostgreSQL exclusively for persisted state. There is no SQLite runti
 
 ## First vertical slice
 
-The initial delivery accepts an idempotent request for a branded business and atomically records its organization, default production environment, Crusher workload, desired deployment, secret references, provisioning operation, audit event and Temporal dispatch intent. The Temporal worker drains that transactional outbox, starts deterministic workflow `provisioning/<operation UUID>`, and prepares one idempotent runtime submission. Runtime-provider application and readiness are the next slice.
+The initial delivery accepts an idempotent request for a branded business and atomically records its organization, default production environment, Crusher workload, desired deployment, secret references, provisioning operation, audit event and Temporal dispatch intent. The Temporal worker drains that transactional outbox, starts deterministic workflow `provisioning/<operation UUID>`, prepares one idempotent runtime submission, applies it to local Docker, verifies migration plus database and HTTP readiness, and atomically finalizes PostgreSQL.
 
 See [`docs/architecture/first-crusher-slice.md`](docs/architecture/first-crusher-slice.md) for the frozen acceptance contract.
 
@@ -45,11 +45,17 @@ start the Fstack provisioning worker and transactional outbox dispatcher with:
 export FSTACK_TEMPORAL_TARGET=127.0.0.1:7233
 export FSTACK_TEMPORAL_NAMESPACE=default
 export FSTACK_TEMPORAL_TASK_QUEUE=fstack-provisioning
+export FSTACK_DOCKER_NETWORK=fstack-local
+export FSTACK_LOCAL_SECRET_ROOT=/var/lib/fstack/source-secrets
+export FSTACK_SECRET_STAGE_ROOT=/var/lib/fstack/runtime-secrets
 uv run python -m fstack.temporal_worker
 ```
 
 Each operation uses the deterministic Workflow ID `provisioning/<operation UUID>`. The
 worker retries pending dispatch intents until Temporal accepts that deterministic start.
+Only `secret://local-file/...` database references are resolved by the local Docker slice.
+Source and staged JSON files must satisfy the private ownership/mode contract documented in
+the Temporal architecture. Object-storage references remain sealed desired state only.
 See [`docs/architecture/temporal-provisioning.md`](docs/architecture/temporal-provisioning.md)
 for the durability and ownership boundary.
 
