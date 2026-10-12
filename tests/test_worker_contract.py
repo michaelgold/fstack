@@ -223,6 +223,68 @@ def test_database_probe_hides_query_failure(monkeypatch: Any, capsys: Any) -> No
     assert marker not in captured.err
 
 
+def test_database_probe_hides_cursor_cleanup_failure(monkeypatch: Any, capsys: Any) -> None:
+    marker = "cursor cleanup exposed app-" + "password"
+
+    class CleanupFailingCursor(_ProbeCursor):
+        def __exit__(self, *_args: object) -> None:
+            raise RuntimeError(marker)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg",
+        SimpleNamespace(connect=lambda *_args, **_kwargs: _ProbeConnection(CleanupFailingCursor())),
+    )
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: nullcontext(
+            io.StringIO(json.dumps({"application_url": _probe_url("postgresql+psycopg")}))
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(runtime_submission.DATABASE_PROBE_V1, {})
+
+    assert exc_info.value.code == 1
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    captured = capsys.readouterr()
+    assert captured == ("", "")
+    assert marker not in captured.out
+    assert marker not in captured.err
+
+
+def test_database_probe_hides_connection_cleanup_failure(monkeypatch: Any, capsys: Any) -> None:
+    marker = "connection cleanup exposed app-" + "password"
+
+    class CleanupFailingConnection(_ProbeConnection):
+        def __exit__(self, *_args: object) -> None:
+            raise RuntimeError(marker)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg",
+        SimpleNamespace(connect=lambda *_args, **_kwargs: CleanupFailingConnection(_ProbeCursor())),
+    )
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: nullcontext(
+            io.StringIO(json.dumps({"application_url": _probe_url("postgresql+psycopg")}))
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(runtime_submission.DATABASE_PROBE_V1, {})
+
+    assert exc_info.value.code == 1
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    captured = capsys.readouterr()
+    assert captured == ("", "")
+    assert marker not in captured.out
+    assert marker not in captured.err
+
+
 def test_database_probe_rejects_nonexact_select_result(monkeypatch: Any, capsys: Any) -> None:
     monkeypatch.setitem(
         sys.modules,
@@ -249,7 +311,7 @@ def test_frozen_launcher_and_probe_sources_have_contract_hashes() -> None:
     expected = {
         "MIGRATION_LAUNCHER_V1": "5cc3ebc8fdbff87500470236433ef65ca72607f9edc821e29fc8b2c5fcf1c592",
         "API_LAUNCHER_V1": "33bb430f5625620c4c7c5b1ffefbe11feb2b97650590b61ffcc4b9e3e82186ca",
-        "DATABASE_PROBE_V1": "3e33cea9bce2ff5a450733505ad9e5f120e265057ca6a4f9388716b41e5d6615",
+        "DATABASE_PROBE_V1": "468cb44c0fe5d7ef89fffac589d4152449b8b98978a340e330f84e5304ff6040",
         "HTTP_PROBE_V1": "a6045ff06180fe16a7ca13efcf1744d377c61a9f66e00d789feecbd6bb7f4d1f",
     }
 
@@ -286,7 +348,7 @@ def test_canonical_spec_seals_complete_docker_policy() -> None:
     assert spec["version"] == "fstack.local-crusher-spec.v1"
     assert spec["source_hashes"] == {
         "api_launcher_v1": "33bb430f5625620c4c7c5b1ffefbe11feb2b97650590b61ffcc4b9e3e82186ca",
-        "database_probe_v1": "3e33cea9bce2ff5a450733505ad9e5f120e265057ca6a4f9388716b41e5d6615",
+        "database_probe_v1": "468cb44c0fe5d7ef89fffac589d4152449b8b98978a340e330f84e5304ff6040",
         "http_probe_v1": "a6045ff06180fe16a7ca13efcf1744d377c61a9f66e00d789feecbd6bb7f4d1f",
         "migration_launcher_v1": "5cc3ebc8fdbff87500470236433ef65ca72607f9edc821e29fc8b2c5fcf1c592",
     }

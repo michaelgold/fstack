@@ -80,11 +80,14 @@ try:
     elif not application_url.startswith(('postgresql://', 'postgres://')):
         application_url = None
     if application_url is not None:
+        query_succeeded = False
         with psycopg.connect(application_url, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute('SELECT 1')
                 if cursor.fetchone() == (1,):
-                    status = 0
+                    query_succeeded = True
+        if query_succeeded:
+            status = 0
 except Exception:
     pass
 if status != 0:
@@ -103,7 +106,7 @@ if type(payload) is not dict or payload != {'status': 'ok', 'service': 'crusher'
 """
 SOURCE_HASHES = {
     "api_launcher_v1": "33bb430f5625620c4c7c5b1ffefbe11feb2b97650590b61ffcc4b9e3e82186ca",
-    "database_probe_v1": "3e33cea9bce2ff5a450733505ad9e5f120e265057ca6a4f9388716b41e5d6615",
+    "database_probe_v1": "468cb44c0fe5d7ef89fffac589d4152449b8b98978a340e330f84e5304ff6040",
     "http_probe_v1": "a6045ff06180fe16a7ca13efcf1744d377c61a9f66e00d789feecbd6bb7f4d1f",
     "migration_launcher_v1": "5cc3ebc8fdbff87500470236433ef65ca72607f9edc821e29fc8b2c5fcf1c592",
 }

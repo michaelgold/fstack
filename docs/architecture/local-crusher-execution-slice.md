@@ -455,8 +455,9 @@ Success requires all of:
    `postgresql+psycopg://` prefix to libpq's `postgresql://`, leaves exact
    `postgresql://` and `postgres://` prefixes unchanged, opens
    `psycopg.connect(application_url, connect_timeout=5)`, executes literal `SELECT 1`,
-   requires exact row `(1,)`, closes the connection and exits zero without printing. Any
-   parsing, prefix, connection or query failure exits one without output;
+   requires exact row `(1,)`, closes the cursor and connection, and only then exits zero
+   without printing. Any parsing, prefix, connection, query or cleanup failure exits one
+   without output;
 3. Docker reports the API container health status `healthy` under the frozen healthcheck;
 4. after another immediate lease check, bounded `docker exec` runs exactly
    `['/app/.venv/bin/python', '-c', HTTP_PROBE_V1]`. The fixed probe requests
@@ -478,11 +479,14 @@ try:
     elif not application_url.startswith(('postgresql://', 'postgres://')):
         application_url = None
     if application_url is not None:
+        query_succeeded = False
         with psycopg.connect(application_url, connect_timeout=5) as connection:
             with connection.cursor() as cursor:
                 cursor.execute('SELECT 1')
                 if cursor.fetchone() == (1,):
-                    status = 0
+                    query_succeeded = True
+        if query_succeeded:
+            status = 0
 except Exception:
     pass
 if status != 0:
@@ -509,7 +513,7 @@ the displayed final newline. Its literal SHA-256 is:
 
 - `MIGRATION_LAUNCHER_V1`: `5cc3ebc8fdbff87500470236433ef65ca72607f9edc821e29fc8b2c5fcf1c592`;
 - `API_LAUNCHER_V1`: `33bb430f5625620c4c7c5b1ffefbe11feb2b97650590b61ffcc4b9e3e82186ca`;
-- `DATABASE_PROBE_V1`: `3e33cea9bce2ff5a450733505ad9e5f120e265057ca6a4f9388716b41e5d6615`;
+- `DATABASE_PROBE_V1`: `468cb44c0fe5d7ef89fffac589d4152449b8b98978a340e330f84e5304ff6040`;
 - `HTTP_PROBE_V1`: `a6045ff06180fe16a7ca13efcf1744d377c61a9f66e00d789feecbd6bb7f4d1f`.
 
 Implementation tests extract the exact constants used for Docker commands, recompute all
