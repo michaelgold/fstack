@@ -244,8 +244,7 @@ def get_provisioning_operation(
                 """
                 SELECT id AS operation_id, organization_id, business_id,
                        environment_id, workload_id, deployment_id, state,
-                       created_at, started_at, completed_at, attempt_count,
-                       last_error_code, last_error_retryable
+                       created_at, started_at, completed_at, last_error_code
                 FROM provisioning_operations
                 WHERE id = :operation_id
                 """
@@ -259,10 +258,7 @@ def get_provisioning_operation(
         return None
     last_error = None
     if row["last_error_code"] is not None:
-        last_error = {
-            "code": row["last_error_code"],
-            "retryable": row["last_error_retryable"],
-        }
+        last_error = {"code": row["last_error_code"]}
     return ProvisioningStatusResponse.model_validate(
         {
             "operation_id": row["operation_id"],
@@ -275,7 +271,6 @@ def get_provisioning_operation(
             "created_at": row["created_at"],
             "started_at": row["started_at"],
             "completed_at": row["completed_at"],
-            "attempt_count": row["attempt_count"],
             "last_error": last_error,
         }
     )

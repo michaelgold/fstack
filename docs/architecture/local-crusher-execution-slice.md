@@ -1,6 +1,9 @@
 # Local Crusher execution slice
 
-Status: frozen acceptance contract; independently accepted at candidate SHA-256 `b4d17090903cd20c7bc1f946f654cde70f2b496f40bfc187dec2eccea0d9eae7`.
+Status: superseded on October 5, 2026 by the Temporal-only authority model in
+[`temporal-provisioning.md`](temporal-provisioning.md). This document preserves the
+rejected PostgreSQL lease-worker design for historical review only; it is not an
+implementation contract.
 
 ## Product outcome
 

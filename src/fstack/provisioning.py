@@ -125,7 +125,6 @@ class ProvisioningStatusError(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     code: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
-    retryable: bool
 
 
 class ProvisioningStatusResponse(BaseModel):
@@ -143,7 +142,6 @@ class ProvisioningStatusResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
-    attempt_count: int = Field(ge=0)
     last_error: ProvisioningStatusError | None
 
     @field_validator("created_at", "started_at", "completed_at")
