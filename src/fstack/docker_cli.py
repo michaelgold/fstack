@@ -142,6 +142,14 @@ class DockerCLI:
             raise DockerCommandError("docker_unavailable")
         return mapping[key]
 
+    @staticmethod
+    def _with_raw_inspect_omission_defaults(host: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(host)
+        normalized.setdefault("Init", None)
+        normalized.setdefault("Sysctls", {})
+        normalized.setdefault("Tmpfs", {})
+        return normalized
+
     @classmethod
     def _string_list(
         cls, mapping: Mapping[str, Any], key: str, *, nullable: bool = False
@@ -233,6 +241,7 @@ class DockerCLI:
 
     @classmethod
     def _host_config(cls, host: Mapping[str, Any]) -> dict[str, Any]:
+        host = cls._with_raw_inspect_omission_defaults(host)
         network_mode = cls._required(host, "NetworkMode")
         auto_remove = cls._required(host, "AutoRemove")
         init = cls._required(host, "Init")

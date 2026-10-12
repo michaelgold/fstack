@@ -592,7 +592,7 @@ def test_image_inspection_captures_digest_entrypoint_and_stop_signal(
     assert image.stop_signal == "SIGQUIT"
 
 
-def test_realistic_docker_create_inspect_round_trip_has_exact_comparable_schema(
+def test_realistic_docker_create_raw_inspect_omissions_have_exact_comparable_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_root = tmp_path / "source"
@@ -620,8 +620,12 @@ def test_realistic_docker_create_inspect_round_trip_has_exact_comparable_schema(
     identifier = docker.create_container(expected)
     payload = captured["payload"]
     host = payload["HostConfig"]
+    assert host["Init"] is None
     assert host["Sysctls"] == {}
     assert host["Tmpfs"] == {}
+    raw_inspect_host = {
+        key: value for key, value in host.items() if key not in {"Init", "Sysctls", "Tmpfs"}
+    }
     inspect_json = {
         "Id": identifier,
         "Name": f"/{captured['name']}",
@@ -637,13 +641,10 @@ def test_realistic_docker_create_inspect_round_trip_has_exact_comparable_schema(
             "WorkingDir": payload["WorkingDir"],
         },
         "HostConfig": {
-            **host,
-            "Init": None,
+            **raw_inspect_host,
             "IpcMode": "private",
             "Links": None,
             "PidMode": "",
-            "Sysctls": None,
-            "Tmpfs": None,
             "UTSMode": "",
         },
         "Mounts": [
@@ -1066,6 +1067,28 @@ def test_docker_host_config_sealed_empty_fields_are_exact_spec_conflicts(
     assert actual != expected
 
 
+def test_docker_host_config_present_null_omission_equivalents_remain_allowed(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    expected = _container_spec(
+        plan,
+        ImageInspection(reference=plan.canonical_spec["crusher_image"], environment=(), labels={}),
+        "api",
+    )
+    identifier = "a" * 64
+    inspect_json = _network_alias_inspect(expected, identifier, [identifier[:12], expected["name"]])
+    inspect_json["HostConfig"]["Init"] = None
+    inspect_json["HostConfig"]["Sysctls"] = None
+    inspect_json["HostConfig"]["Tmpfs"] = None
+
+    assert DockerCLI()._normalized(inspect_json) == expected
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -1080,7 +1103,6 @@ def test_docker_host_config_sealed_empty_fields_are_exact_spec_conflicts(
         "DnsSearch",
         "ExtraHosts",
         "GroupAdd",
-        "Init",
         "IpcMode",
         "Links",
         "LogConfig",
@@ -1091,8 +1113,6 @@ def test_docker_host_config_sealed_empty_fields_are_exact_spec_conflicts(
         "ReadonlyRootfs",
         "RestartPolicy",
         "SecurityOpt",
-        "Sysctls",
-        "Tmpfs",
         "UTSMode",
     ],
 )
