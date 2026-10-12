@@ -117,14 +117,14 @@ def _decode_json(raw: bytes, expected: set[str]) -> dict[str, str]:
     return cast(dict[str, str], value)
 
 
-def _database_url(value: str) -> tuple[str, int, str, str, str]:
+def _database_url(value: str) -> tuple[str, str, int, str, str, str]:
     try:
         parsed = urlsplit(value)
         port = parsed.port or 5432
     except ValueError:
         _raise("invalid_secret_bundle", retryable=False)
     if (
-        parsed.scheme not in {"postgresql", "postgres"}
+        parsed.scheme not in {"postgresql", "postgres", "postgresql+psycopg"}
         or not parsed.hostname
         or parsed.fragment
         or parsed.query
@@ -138,6 +138,7 @@ def _database_url(value: str) -> tuple[str, int, str, str, str]:
     username = parsed.username
     password = parsed.password
     return (
+        parsed.scheme,
         hostname.lower(),
         port,
         unquote(parsed.path[1:]),
@@ -174,11 +175,11 @@ def _validate_bundles(owner_raw: bytes, application_raw: bytes) -> None:
     )
     owner_db = _database_url(owner["owner_url"])
     application_db = _database_url(application["application_url"])
-    if owner_db[:3] != application_db[:3]:
+    if owner_db[:4] != application_db[:4]:
         _raise("invalid_secret_bundle", retryable=False)
-    if owner_db[3] == application_db[3]:
+    if owner_db[4] == application_db[4]:
         _raise("invalid_secret_bundle", retryable=False)
-    if application_db[3:] != (owner["application_user"], owner["application_password"]):
+    if application_db[4:] != (owner["application_user"], owner["application_password"]):
         _raise("invalid_secret_bundle", retryable=False)
     _base_url(application["public_base_url"])
     _base_url(application["dashboard_base_url"])

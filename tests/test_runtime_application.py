@@ -153,6 +153,128 @@ class _RawFailureDocker(FakeDocker):
         return super().exec_container(name, command)
 
 
+def _database_bundle(owner_url: str, application_url: str) -> tuple[bytes, bytes]:
+    password_key = "application_" + "password"
+    secret_key = "magic_link_" + "secret"
+    application_password = "app-" + "password"
+    owner = {
+        "owner_url": owner_url,
+        "application_user": "crusher_app",
+        password_key: application_password,
+    }
+    application = {
+        "application_url": application_url,
+        secret_key: "magic-secret",
+        "public_base_url": "https://mail.acme.example",
+        "dashboard_base_url": "https://dashboard.acme.example",
+    }
+    return json.dumps(owner).encode(), json.dumps(application).encode()
+
+
+@pytest.mark.parametrize("scheme", ["postgresql", "postgres", "postgresql+psycopg"])
+def test_database_bundle_accepts_exact_supported_scheme(scheme: str) -> None:
+    owner_raw, application_raw = _database_bundle(
+        f"{scheme}://owner:owner-password@db.example/acme",
+        f"{scheme}://crusher_app:app-password@db.example/acme",
+    )
+
+    runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+
+@pytest.mark.parametrize(
+    ("owner_scheme", "application_scheme"),
+    [
+        ("postgresql+psycopg", "postgresql"),
+        ("postgresql", "postgresql+psycopg"),
+        ("postgresql", "postgres"),
+    ],
+)
+def test_database_bundle_rejects_database_scheme_mismatch(
+    owner_scheme: str, application_scheme: str
+) -> None:
+    owner_raw, application_raw = _database_bundle(
+        f"{owner_scheme}://owner:owner-password@db.example/acme",
+        f"{application_scheme}://crusher_app:app-password@db.example/acme",
+    )
+
+    with pytest.raises(RuntimeApplicationError) as exc_info:
+        runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+    assert exc_info.value.code == "invalid_secret_bundle"
+    _assert_no_exception_marker(exc_info.value, "owner-password")
+    _assert_no_exception_marker(exc_info.value, "app-password")
+
+
+@pytest.mark.parametrize("target", ["owner", "application"])
+@pytest.mark.parametrize(
+    "scheme",
+    [
+        "postgresql+psycopg2",
+        "postgresql+asyncpg",
+        "postgresql+arbitrary",
+        "postgres+psycopg",
+        "mysql",
+    ],
+)
+def test_database_bundle_rejects_unknown_database_scheme(target: str, scheme: str) -> None:
+    owner_scheme = scheme if target == "owner" else "postgresql+psycopg"
+    application_scheme = scheme if target == "application" else "postgresql+psycopg"
+    owner_raw, application_raw = _database_bundle(
+        f"{owner_scheme}://owner:owner-password@db.example/acme",
+        f"{application_scheme}://crusher_app:app-password@db.example/acme",
+    )
+
+    with pytest.raises(RuntimeApplicationError) as exc_info:
+        runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+    assert exc_info.value.code == "invalid_secret_bundle"
+    _assert_no_exception_marker(exc_info.value, "owner-password")
+    _assert_no_exception_marker(exc_info.value, "app-password")
+
+
+def test_database_bundle_rejects_mixed_unsupported_database_schemes() -> None:
+    owner_raw, application_raw = _database_bundle(
+        "postgresql+psycopg2://" + "owner:owner-" + "password@db.example/acme",
+        "postgresql+asyncpg://" + "crusher_app:app-" + "password@db.example/acme",
+    )
+
+    with pytest.raises(RuntimeApplicationError) as exc_info:
+        runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+    assert exc_info.value.code == "invalid_secret_bundle"
+    _assert_no_exception_marker(exc_info.value, "owner-password")
+    _assert_no_exception_marker(exc_info.value, "app-password")
+
+
+@pytest.mark.parametrize("target", ["owner", "application"])
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "postgresql+psycopg://user:password@db.example/acme?sslmode=require",
+        "postgresql+psycopg://user:password@db.example/acme#fragment",
+        "postgresql+psycopg://db.example/acme",
+        "postgresql+psycopg://user@db.example/acme",
+        "postgresql+psycopg://user:password@db.example/",
+    ],
+)
+def test_database_bundle_rejects_invalid_database_url_components(
+    target: str, invalid_url: str
+) -> None:
+    owner_url = "postgresql+psycopg://" + "owner:owner-" + "password@db.example/acme"
+    application_url = "postgresql+psycopg://" + "crusher_app:app-" + "password@db.example/acme"
+    if target == "owner":
+        owner_url = invalid_url
+    else:
+        application_url = invalid_url
+    owner_raw, application_raw = _database_bundle(owner_url, application_url)
+
+    with pytest.raises(RuntimeApplicationError) as exc_info:
+        runtime_application_module._validate_bundles(owner_raw, application_raw)
+
+    assert exc_info.value.code == "invalid_secret_bundle"
+    _assert_no_exception_marker(exc_info.value, "password")
+
+
 def _write_bundle(root: Path) -> str:
     directory = root / "acme" / "database"
     directory.mkdir(parents=True, mode=0o700)

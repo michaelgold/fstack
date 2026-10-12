@@ -304,8 +304,10 @@ in PostgreSQL or public APIs.
 
 Before Docker client construction, semantic bundle validation requires:
 
-- `owner_url` and `application_url` are canonical PostgreSQL URLs accepted by
-  SQLAlchemy/Crusher, with no fragments and with explicit database names;
+- `owner_url` and `application_url` use the same exact accepted database scheme:
+  `postgresql`, legacy `postgres`, or SQLAlchemy psycopg 3 `postgresql+psycopg`; no other
+  driver suffix is accepted. Both are canonical PostgreSQL URLs accepted by
+  SQLAlchemy/Crusher, with no query, fragment or omitted database name;
 - `owner_url` contains owner userinfo;
 - the decoded application URL username/password exactly equal `application_user` and
   `application_password`;
