@@ -1041,6 +1041,7 @@ def test_docker_auto_remove_true_is_an_exact_spec_conflict(tmp_path: Path) -> No
         ("DnsSearch", ["attacker.example"]),
         ("GroupAdd", ["1234"]),
         ("Sysctls", {"net.ipv4.ip_forward": "1"}),
+        ("Tmpfs", {"/run": "rw"}),
     ],
 )
 def test_docker_host_config_sealed_empty_fields_are_exact_spec_conflicts(
