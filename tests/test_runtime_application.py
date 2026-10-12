@@ -258,6 +258,148 @@ def test_apply_runtime_plan_stages_secrets_migrates_starts_and_probes(tmp_path: 
     ]
 
 
+def test_preexisting_stage_root_with_noncanonical_mode_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    stage = stage_root / plan.deployment_id.hex
+    stage.mkdir(mode=0o700)
+    source = source_root / "acme" / "database"
+    for name in ("owner.json", "application.json"):
+        staged = stage / name
+        staged.write_bytes((source / name).read_bytes())
+        staged.chmod(0o444)
+    stage_root.chmod(0o500)
+    docker = FakeDocker(plan.canonical_spec["crusher_image"])
+    original_open_directory = runtime_application_module._open_directory
+    stage_root_descriptors: list[int] = []
+
+    def capture_stage_root_descriptor(path: str | Path, *, dir_fd: int | None = None) -> int:
+        descriptor = original_open_directory(path, dir_fd=dir_fd)
+        if dir_fd is None and Path(path) == stage_root:
+            stage_root_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(
+        runtime_application_module, "_open_directory", capture_stage_root_descriptor
+    )
+    try:
+        with pytest.raises(RuntimeApplicationError) as exc_info:
+            apply_runtime_plan(plan, docker, persist_submitted=lambda _identifier: None)
+    finally:
+        stage_root.chmod(0o700)
+
+    assert exc_info.value.code == "unsafe_secret_file"
+    assert docker.calls == []
+    assert stage_root_descriptors
+    for descriptor in stage_root_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_preexisting_deployment_directory_with_noncanonical_mode_fails_closed(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    stage = stage_root / plan.deployment_id.hex
+    stage.mkdir(mode=0o700)
+    source = source_root / "acme" / "database"
+    for name in ("owner.json", "application.json"):
+        staged = stage / name
+        staged.write_bytes((source / name).read_bytes())
+        staged.chmod(0o444)
+    stage.chmod(0o500)
+    docker = FakeDocker(plan.canonical_spec["crusher_image"])
+
+    try:
+        with pytest.raises(RuntimeApplicationError) as exc_info:
+            apply_runtime_plan(plan, docker, persist_submitted=lambda _identifier: None)
+    finally:
+        stage.chmod(0o700)
+
+    assert exc_info.value.code == "unsafe_secret_file"
+    assert docker.calls == []
+
+
+@pytest.mark.parametrize("target", ["stage_root", "deployment_directory"])
+def test_staged_directory_mode_change_fails_on_revalidation(
+    tmp_path: Path, target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    stage = stage_root / plan.deployment_id.hex
+    docker = FakeDocker(plan.canonical_spec["crusher_image"])
+    changed = stage_root if target == "stage_root" else stage
+    docker.after_inspect_image = lambda: changed.chmod(0o500)
+    original_open_directory = runtime_application_module._open_directory
+    stage_root_descriptors: list[int] = []
+
+    def capture_stage_root_descriptor(path: str | Path, *, dir_fd: int | None = None) -> int:
+        descriptor = original_open_directory(path, dir_fd=dir_fd)
+        if dir_fd is None and Path(path) == stage_root:
+            stage_root_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(
+        runtime_application_module, "_open_directory", capture_stage_root_descriptor
+    )
+    try:
+        with pytest.raises(RuntimeApplicationError) as exc_info:
+            apply_runtime_plan(plan, docker, persist_submitted=lambda _identifier: None)
+    finally:
+        changed.chmod(0o700)
+
+    assert exc_info.value.code == "unsafe_secret_file"
+    assert all(call[0] != "create_container" for call in docker.calls)
+    assert len(stage_root_descriptors) == 2
+    for descriptor in stage_root_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_deployment_directory_mode_change_fails_during_staging_revalidation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    stage = stage_root / plan.deployment_id.hex
+    docker = FakeDocker(plan.canonical_spec["crusher_image"])
+    original_fsync = runtime_application_module.os.fsync
+    fsync_calls = 0
+
+    def change_mode_after_directory_sync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        original_fsync(descriptor)
+        fsync_calls += 1
+        if fsync_calls == 3:
+            stage.chmod(0o500)
+
+    monkeypatch.setattr(runtime_application_module.os, "fsync", change_mode_after_directory_sync)
+    try:
+        with pytest.raises(RuntimeApplicationError) as exc_info:
+            apply_runtime_plan(plan, docker, persist_submitted=lambda _identifier: None)
+    finally:
+        if stage.exists():
+            stage.chmod(0o700)
+
+    assert exc_info.value.code == "unsafe_secret_file"
+    assert docker.calls == []
+
+
 @pytest.mark.parametrize("mode", [0o400, 0o600])
 def test_existing_staged_secret_with_noncanonical_mode_fails_closed(
     tmp_path: Path, mode: int

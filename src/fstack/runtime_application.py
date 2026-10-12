@@ -334,6 +334,7 @@ def _stage(plan: RuntimePlan) -> _StagedSecretEvidence:
     stage_root_fd = _open_directory(plan.stage_root)
     directory_fd: int | None = None
     try:
+        _validate_descriptor(stage_root_fd, directory=True, exact_mode=0o700)
         directory_name = plan.deployment_id.hex
         try:
             os.mkdir(directory_name, mode=0o700, dir_fd=stage_root_fd)
@@ -342,7 +343,7 @@ def _stage(plan: RuntimePlan) -> _StagedSecretEvidence:
         except OSError:
             _raise("unsafe_secret_file", retryable=False)
         directory_fd = _open_directory(directory_name, dir_fd=stage_root_fd)
-        directory_info = _validate_descriptor(directory_fd, directory=True)
+        directory_info = _validate_descriptor(directory_fd, directory=True, exact_mode=0o700)
         expected_files = {
             "owner.json": owner_raw,
             "application.json": application_raw,
@@ -371,7 +372,9 @@ def _stage(plan: RuntimePlan) -> _StagedSecretEvidence:
 
         final_directory_fd = _open_directory(directory_name, dir_fd=stage_root_fd)
         try:
-            final_directory_info = _validate_descriptor(final_directory_fd, directory=True)
+            final_directory_info = _validate_descriptor(
+                final_directory_fd, directory=True, exact_mode=0o700
+            )
             if (final_directory_info.st_dev, final_directory_info.st_ino) != (
                 directory_info.st_dev,
                 directory_info.st_ino,
@@ -421,8 +424,9 @@ def _validate_staged(plan: RuntimePlan, evidence: _StagedSecretEvidence) -> None
     stage_root_fd = _open_directory(plan.stage_root)
     directory_fd: int | None = None
     try:
+        _validate_descriptor(stage_root_fd, directory=True, exact_mode=0o700)
         directory_fd = _open_directory(plan.deployment_id.hex, dir_fd=stage_root_fd)
-        directory_info = _validate_descriptor(directory_fd, directory=True)
+        directory_info = _validate_descriptor(directory_fd, directory=True, exact_mode=0o700)
         if (directory_info.st_dev, directory_info.st_ino) != (
             evidence.directory_device,
             evidence.directory_inode,
