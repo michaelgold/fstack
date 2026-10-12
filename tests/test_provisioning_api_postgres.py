@@ -69,6 +69,7 @@ def test_create_operation_persists_complete_pending_desired_state(
                 "database_bindings",
                 "storage_bindings",
                 "provisioning_operations",
+                "workflow_dispatches",
                 "audit_events",
             )
         }
@@ -89,6 +90,16 @@ def test_create_operation_persists_complete_pending_desired_state(
             .mappings()
             .one()
         )
+        dispatch = (
+            connection.execute(
+                text(
+                    "SELECT operation_id, workflow_id, workflow_type, state, dispatched_at "
+                    "FROM workflow_dispatches"
+                )
+            )
+            .mappings()
+            .one()
+        )
 
     assert set(counts.values()) == {1}
     assert operation == {
@@ -101,6 +112,13 @@ def test_create_operation_persists_complete_pending_desired_state(
         "event_type": "provisioning.requested",
         "actor_principal": "installation-operator",
         "payload": {},
+    }
+    assert dispatch == {
+        "operation_id": UUID(payload["operation_id"]),
+        "workflow_id": f"provisioning/{payload['operation_id']}",
+        "workflow_type": "fstack.provision_crusher.v1",
+        "state": "pending",
+        "dispatched_at": None,
     }
 
 
@@ -136,7 +154,6 @@ def test_pending_operation_can_be_read_after_creation(
         "created_at",
         "started_at",
         "completed_at",
-        "attempt_count",
         "last_error",
     }
     assert {
@@ -163,7 +180,6 @@ def test_pending_operation_can_be_read_after_creation(
     assert payload["state"] == "pending"
     assert payload["started_at"] is None
     assert payload["completed_at"] is None
-    assert payload["attempt_count"] == 0
     assert payload["last_error"] is None
     assert payload["created_at"].endswith("Z")
     assert response.headers["cache-control"] == "no-store"
@@ -309,6 +325,7 @@ def test_identical_replay_returns_the_original_operation_without_new_rows(
             "database_bindings",
             "storage_bindings",
             "provisioning_operations",
+            "workflow_dispatches",
             "audit_events",
         ):
             assert connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 1
@@ -737,6 +754,7 @@ def test_competing_uncommitted_claim_rollback_allows_request_to_win(
             "database_bindings",
             "storage_bindings",
             "provisioning_operations",
+            "workflow_dispatches",
             "audit_events",
         ):
             assert connection.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 1

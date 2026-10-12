@@ -22,7 +22,7 @@ Fstack uses PostgreSQL exclusively for persisted state. There is no SQLite runti
 
 ## First vertical slice
 
-The initial delivery accepts an idempotent request for a branded business and atomically records its organization, default production environment, Crusher workload, desired deployment, secret references, provisioning operation and audit event. External infrastructure execution follows as a separately claimed durable operation; an API retry must never create a duplicate business or side effect.
+The initial delivery accepts an idempotent request for a branded business and atomically records its organization, default production environment, Crusher workload, desired deployment, secret references, provisioning operation, audit event and Temporal dispatch intent. The Temporal worker drains that transactional outbox, starts deterministic workflow `provisioning/<operation UUID>`, and prepares one idempotent runtime submission. Runtime-provider application and readiness are the next slice.
 
 See [`docs/architecture/first-crusher-slice.md`](docs/architecture/first-crusher-slice.md) for the frozen acceptance contract.
 
@@ -37,6 +37,21 @@ export FSTACK_OPERATOR_TOKEN=replace-with-a-long-random-token
 uv run alembic upgrade head
 uv run uvicorn fstack.main:app --reload
 ```
+
+Temporal is the durable provisioning workflow engine. Run a local Temporal service, then
+start the Fstack provisioning worker and transactional outbox dispatcher with:
+
+```bash
+export FSTACK_TEMPORAL_TARGET=127.0.0.1:7233
+export FSTACK_TEMPORAL_NAMESPACE=default
+export FSTACK_TEMPORAL_TASK_QUEUE=fstack-provisioning
+uv run python -m fstack.temporal_worker
+```
+
+Each operation uses the deterministic Workflow ID `provisioning/<operation UUID>`. The
+worker retries pending dispatch intents until Temporal accepts that deterministic start.
+See [`docs/architecture/temporal-provisioning.md`](docs/architecture/temporal-provisioning.md)
+for the durability and ownership boundary.
 
 Persistence tests require an explicit PostgreSQL URL; they never fall back to SQLite:
 
