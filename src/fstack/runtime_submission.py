@@ -70,13 +70,25 @@ os.execv('/app/.venv/bin/uvicorn', [
 ])
 """
 DATABASE_PROBE_V1 = """import json, psycopg, sys
-with open('/run/secrets/fstack/application.json', encoding='utf-8') as stream:
-    bundle = json.load(stream)
-with psycopg.connect(bundle['application_url'], connect_timeout=5) as connection:
-    with connection.cursor() as cursor:
-        cursor.execute('SELECT 1')
-        if cursor.fetchone() != (1,):
-            sys.exit(1)
+status = 1
+try:
+    with open('/run/secrets/fstack/application.json', encoding='utf-8') as stream:
+        bundle = json.load(stream)
+    application_url = bundle['application_url']
+    if application_url.startswith('postgresql+psycopg://'):
+        application_url = 'postgresql://' + application_url.removeprefix('postgresql+psycopg://')
+    elif not application_url.startswith(('postgresql://', 'postgres://')):
+        application_url = None
+    if application_url is not None:
+        with psycopg.connect(application_url, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT 1')
+                if cursor.fetchone() == (1,):
+                    status = 0
+except Exception:
+    pass
+if status != 0:
+    sys.exit(1)
 """
 HTTP_PROBE_V1 = """import json, sys, urllib.request
 with urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5) as response:
@@ -91,7 +103,7 @@ if type(payload) is not dict or payload != {'status': 'ok', 'service': 'crusher'
 """
 SOURCE_HASHES = {
     "api_launcher_v1": "33bb430f5625620c4c7c5b1ffefbe11feb2b97650590b61ffcc4b9e3e82186ca",
-    "database_probe_v1": "18fd9cf708c5ad62179182abd3bf93f8e3fca2ac2eb60382cf984bc632f5493e",
+    "database_probe_v1": "3e33cea9bce2ff5a450733505ad9e5f120e265057ca6a4f9388716b41e5d6615",
     "http_probe_v1": "a6045ff06180fe16a7ca13efcf1744d377c61a9f66e00d789feecbd6bb7f4d1f",
     "migration_launcher_v1": "5cc3ebc8fdbff87500470236433ef65ca72607f9edc821e29fc8b2c5fcf1c592",
 }
