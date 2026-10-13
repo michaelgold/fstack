@@ -294,8 +294,9 @@ deterministic directory
 root is worker-owned mode `0700`, has no writable ancestor available to less privileged
 users, and is outside the reference-addressable source tree. The deployment directory is
 created with directory-relative exclusive non-following operations at mode `0700`; staged
-`owner.json` and `application.json` are created at mode `0400`, fsynced with their parent,
-and never rewritten in place. A pre-existing snapshot is accepted only when ownership,
+`owner.json` and `application.json` are created at mode `0444` inside the confined
+directory so cap-dropped container root can read each bind-mounted leaf, fsynced with their
+parent, and never rewritten in place. A pre-existing snapshot is accepted only when ownership,
 mode, regular-file identity and bytes exactly match the newly resolved bundle. Otherwise
 execution fails closed with `unsafe_secret_file`. Snapshots are installation-local runtime
 secret material, retained while their deterministic containers exist and never represented
@@ -303,8 +304,10 @@ in PostgreSQL or public APIs.
 
 Before Docker client construction, semantic bundle validation requires:
 
-- `owner_url` and `application_url` are canonical PostgreSQL URLs accepted by
-  SQLAlchemy/Crusher, with no fragments and with explicit database names;
+- `owner_url` and `application_url` use the same exact accepted database scheme:
+  `postgresql`, legacy `postgres`, or SQLAlchemy psycopg 3 `postgresql+psycopg`; no other
+  driver suffix is accepted. Both are canonical PostgreSQL URLs accepted by
+  SQLAlchemy/Crusher, with no query, fragment or omitted database name;
 - `owner_url` contains owner userinfo;
 - the decoded application URL username/password exactly equal `application_user` and
   `application_password`;
@@ -346,7 +349,8 @@ Both deterministic containers use the exact requested Crusher digest and labels:
 The canonical common Docker create fields are:
 
 - platform: the local daemon's native Linux platform; no cross-platform emulation;
-- entrypoint: explicitly empty;
+- entrypoint: inherited exactly from the requested immutable image digest and then sent
+  explicitly in the create request;
 - user: `0:0`; working directory: `/app`;
 - container environment policy: `inherit-from-requested-digest`, with no Docker
   environment overrides;
@@ -359,7 +363,14 @@ The canonical common Docker create fields are:
   `security_opt=['no-new-privileges:true']`;
 - no tmpfs, volumes or mounts except the one exact read-only secret-file bind;
 - logging driver `json-file` with an explicit empty option map;
-- `auto_remove=false`, no init override and no stop-signal override.
+- `auto_remove=false`, no init override, and the stop signal inherited exactly from the
+  requested immutable image digest and sent explicitly in the create request;
+- empty cgroup and parent, private cgroup namespace, empty user namespace mode;
+- zero memory, reservation, swap, OOM score, NanoCPU, shares, periods, quotas, realtime,
+  cpuset and block-I/O limits; nullable swappiness and PID limit; OOM kill enabled;
+- no block-I/O device limits or device cgroup rules;
+- runtime `runc`, shared memory size 67,108,864 bytes, no ulimits, and the exact Docker 29
+  default masked/read-only path lists sealed in the fingerprint and emitted on create.
 
 The migration-specific fields are:
 
@@ -386,6 +397,12 @@ inspection by applying the already-sealed inheritance policy. This metadata acqu
 does not alter the fingerprint. Every policy field above, including explicit empty sets
 and all four launcher/probe source hashes, is part of the canonical spec fingerprint. No
 host port is published and no DNS or proxy configuration changes.
+
+Inspection parses exact Docker scalar and nested resource types without coercion. The
+Docker 29 `null` form is normalized to an empty list only for block-I/O device lists,
+device-cgroup rules and ulimits, and to sealed `false` only for `OomKillDisable`; those
+fields are otherwise required, as are all scalar limits and path lists. Any mutation of a
+sealed field is a deterministic-name conflict.
 
 The migration container mounts only `owner.json` and runs, in order:
 
@@ -446,10 +463,13 @@ Success requires all of:
 1. migration container exits zero;
 2. after an immediate lease check, bounded `docker exec` runs exactly
    `['/app/.venv/bin/python', '-c', DATABASE_PROBE_V1]` in the running API container. The
-   fixed probe reads
-   `/run/secrets/fstack/application.json`, opens `psycopg.connect(application_url,
-   connect_timeout=5)`, executes literal `SELECT 1`, requires exact row `(1,)`, closes the
-   connection and exits zero without printing;
+   fixed probe reads `/run/secrets/fstack/application.json`, converts only an exact
+   `postgresql+psycopg://` prefix to libpq's `postgresql://`, leaves exact
+   `postgresql://` and `postgres://` prefixes unchanged, opens
+   `psycopg.connect(application_url, connect_timeout=5)`, executes literal `SELECT 1`,
+   requires exact row `(1,)`, closes the cursor and connection, and only then exits zero
+   without printing. Any parsing, prefix, connection, query or cleanup failure exits one
+   without output;
 3. Docker reports the API container health status `healthy` under the frozen healthcheck;
 4. after another immediate lease check, bounded `docker exec` runs exactly
    `['/app/.venv/bin/python', '-c', HTTP_PROBE_V1]`. The fixed probe requests
@@ -461,13 +481,28 @@ Success requires all of:
 
 ```python
 import json, psycopg, sys
-with open('/run/secrets/fstack/application.json', encoding='utf-8') as stream:
-    bundle = json.load(stream)
-with psycopg.connect(bundle['application_url'], connect_timeout=5) as connection:
-    with connection.cursor() as cursor:
-        cursor.execute('SELECT 1')
-        if cursor.fetchone() != (1,):
-            sys.exit(1)
+status = 1
+try:
+    with open('/run/secrets/fstack/application.json', encoding='utf-8') as stream:
+        bundle = json.load(stream)
+    application_url = bundle['application_url']
+    if application_url.startswith('postgresql+psycopg://'):
+        application_url = 'postgresql://' + application_url.removeprefix('postgresql+psycopg://')
+    elif not application_url.startswith(('postgresql://', 'postgres://')):
+        application_url = None
+    if application_url is not None:
+        query_succeeded = False
+        with psycopg.connect(application_url, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT 1')
+                if cursor.fetchone() == (1,):
+                    query_succeeded = True
+        if query_succeeded:
+            status = 0
+except Exception:
+    pass
+if status != 0:
+    sys.exit(1)
 ```
 
 `HTTP_PROBE_V1` is exactly:
@@ -490,7 +525,7 @@ the displayed final newline. Its literal SHA-256 is:
 
 - `MIGRATION_LAUNCHER_V1`: `5cc3ebc8fdbff87500470236433ef65ca72607f9edc821e29fc8b2c5fcf1c592`;
 - `API_LAUNCHER_V1`: `33bb430f5625620c4c7c5b1ffefbe11feb2b97650590b61ffcc4b9e3e82186ca`;
-- `DATABASE_PROBE_V1`: `18fd9cf708c5ad62179182abd3bf93f8e3fca2ac2eb60382cf984bc632f5493e`;
+- `DATABASE_PROBE_V1`: `468cb44c0fe5d7ef89fffac589d4152449b8b98978a340e330f84e5304ff6040`;
 - `HTTP_PROBE_V1`: `a6045ff06180fe16a7ca13efcf1744d377c61a9f66e00d789feecbd6bb7f4d1f`.
 
 Implementation tests extract the exact constants used for Docker commands, recompute all

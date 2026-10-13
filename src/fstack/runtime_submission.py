@@ -17,13 +17,34 @@ PROVIDER: Literal["local_docker"] = "local_docker"
 GENERATION = 1
 SUBMISSION_VERSION = "fstack.local-crusher-submission.v1"
 SPEC_VERSION = "fstack.local-crusher-spec.v1"
+DEFAULT_MASKED_PATHS = (
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/sys/devices/virtual/powercap",
+    "/sys/firmware",
+)
+DEFAULT_READONLY_PATHS = (
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+)
 
 
 @dataclass(frozen=True)
 class PreparedRuntimeSubmission:
     submission_id: UUID
     operation_id: UUID
-    state: Literal["prepared", "submitted", "confirmed"]
+    state: Literal["prepared", "submitted", "confirmed", "failed"]
     provider: Literal["local_docker"]
     generation: int
     submission_key: str
@@ -70,13 +91,28 @@ os.execv('/app/.venv/bin/uvicorn', [
 ])
 """
 DATABASE_PROBE_V1 = """import json, psycopg, sys
-with open('/run/secrets/fstack/application.json', encoding='utf-8') as stream:
-    bundle = json.load(stream)
-with psycopg.connect(bundle['application_url'], connect_timeout=5) as connection:
-    with connection.cursor() as cursor:
-        cursor.execute('SELECT 1')
-        if cursor.fetchone() != (1,):
-            sys.exit(1)
+status = 1
+try:
+    with open('/run/secrets/fstack/application.json', encoding='utf-8') as stream:
+        bundle = json.load(stream)
+    application_url = bundle['application_url']
+    if application_url.startswith('postgresql+psycopg://'):
+        application_url = 'postgresql://' + application_url.removeprefix('postgresql+psycopg://')
+    elif not application_url.startswith(('postgresql://', 'postgres://')):
+        application_url = None
+    if application_url is not None:
+        query_succeeded = False
+        with psycopg.connect(application_url, connect_timeout=5) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT 1')
+                if cursor.fetchone() == (1,):
+                    query_succeeded = True
+        if query_succeeded:
+            status = 0
+except Exception:
+    pass
+if status != 0:
+    sys.exit(1)
 """
 HTTP_PROBE_V1 = """import json, sys, urllib.request
 with urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5) as response:
@@ -91,7 +127,7 @@ if type(payload) is not dict or payload != {'status': 'ok', 'service': 'crusher'
 """
 SOURCE_HASHES = {
     "api_launcher_v1": "33bb430f5625620c4c7c5b1ffefbe11feb2b97650590b61ffcc4b9e3e82186ca",
-    "database_probe_v1": "18fd9cf708c5ad62179182abd3bf93f8e3fca2ac2eb60382cf984bc632f5493e",
+    "database_probe_v1": "468cb44c0fe5d7ef89fffac589d4152449b8b98978a340e330f84e5304ff6040",
     "http_probe_v1": "a6045ff06180fe16a7ca13efcf1744d377c61a9f66e00d789feecbd6bb7f4d1f",
     "migration_launcher_v1": "5cc3ebc8fdbff87500470236433ef65ca72607f9edc821e29fc8b2c5fcf1c592",
 }
@@ -143,30 +179,67 @@ def _canonical_spec(
     deployment_id = operation["deployment_id"]
     stage_directory = secret_stage_root / deployment_id.hex
     common = {
+        "auto_remove": False,
+        "blkio_device_read_bps": [],
+        "blkio_device_read_iops": [],
+        "blkio_device_write_bps": [],
+        "blkio_device_write_iops": [],
+        "blkio_weight": 0,
+        "blkio_weight_device": [],
         "cap_add": [],
         "cap_drop": ["ALL"],
+        "cgroup": "",
+        "cgroup_parent": "",
+        "cgroupns_mode": "private",
+        "cpu_period": 0,
+        "cpu_quota": 0,
+        "cpu_realtime_period": 0,
+        "cpu_realtime_runtime": 0,
+        "cpu_shares": 0,
+        "cpuset_cpus": "",
+        "cpuset_mems": "",
+        "device_cgroup_rules": [],
         "devices": [],
         "device_requests": [],
-        "entrypoint": [],
+        "dns": [],
+        "dns_options": [],
+        "dns_search": [],
+        "entrypoint": "inherit-from-requested-digest",
         "environment": "inherit-from-requested-digest",
         "environment_overrides": [],
         "extra_hosts": [],
+        "group_add": [],
         "image": operation["crusher_image"],
         "init": None,
         "ipc_mode": None,
         "label_policy": "inherit-from-requested-digest-plus-exact-fstack-labels",
         "links": [],
         "logging": {"driver": "json-file", "options": {}},
+        "masked_paths": list(DEFAULT_MASKED_PATHS),
+        "memory": 0,
+        "memory_reservation": 0,
+        "memory_swap": 0,
+        "memory_swappiness": None,
+        "nano_cpus": 0,
         "network": {"aliases": "deterministic-container-name-only", "name": docker_network},
+        "oom_kill_disable": False,
+        "oom_score_adj": 0,
         "pid_mode": None,
+        "pids_limit": None,
         "platform": "native-linux",
         "ports": {},
         "privileged": False,
         "readonly_rootfs": False,
+        "readonly_paths": list(DEFAULT_READONLY_PATHS),
+        "runtime": "runc",
         "security_opt": ["no-new-privileges:true"],
-        "stop_signal": None,
+        "shm_size": 67_108_864,
+        "stop_signal": "inherit-from-requested-digest",
+        "sysctls": {},
         "tmpfs": {},
+        "ulimits": [],
         "user": "0:0",
+        "userns_mode": "",
         "uts_mode": None,
         "working_dir": "/app",
     }
@@ -347,44 +420,6 @@ def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmi
             "spec_fingerprint": fingerprint,
             "api_container_name": api_name,
             "migration_container_name": migration_name,
-        },
-    )
-    connection.execute(
-        text(
-            """
-            WITH boundary AS (SELECT clock_timestamp() AS now)
-            UPDATE provisioning_operations
-            SET state = 'running', started_at = boundary.now, updated_at = boundary.now
-            FROM boundary
-            WHERE id = :operation_id AND state = 'pending'
-            """
-        ),
-        {"operation_id": operation_id},
-    )
-    connection.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, organization_id, operation_id, event_type, actor_principal, payload
-            ) VALUES (
-                :id, :organization_id, :operation_id, 'provisioning.started',
-                :actor_principal, CAST(:payload AS jsonb)
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "organization_id": operation["organization_id"],
-            "operation_id": operation_id,
-            "actor_principal": operation["actor_principal"],
-            "payload": json.dumps(
-                {
-                    "runtime_submission_id": str(submission_id),
-                    "provider": PROVIDER,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
         },
     )
     return PreparedRuntimeSubmission(
