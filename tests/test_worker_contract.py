@@ -355,8 +355,25 @@ def test_canonical_spec_seals_complete_docker_policy() -> None:
     common = spec["docker"]["common"]
     assert common == {
         "auto_remove": False,
+        "blkio_device_read_bps": [],
+        "blkio_device_read_iops": [],
+        "blkio_device_write_bps": [],
+        "blkio_device_write_iops": [],
+        "blkio_weight": 0,
+        "blkio_weight_device": [],
         "cap_add": [],
         "cap_drop": ["ALL"],
+        "cgroup": "",
+        "cgroup_parent": "",
+        "cgroupns_mode": "private",
+        "cpu_period": 0,
+        "cpu_quota": 0,
+        "cpu_realtime_period": 0,
+        "cpu_realtime_runtime": 0,
+        "cpu_shares": 0,
+        "cpuset_cpus": "",
+        "cpuset_mems": "",
+        "device_cgroup_rules": [],
         "devices": [],
         "device_requests": [],
         "dns": [],
@@ -373,17 +390,31 @@ def test_canonical_spec_seals_complete_docker_policy() -> None:
         "label_policy": "inherit-from-requested-digest-plus-exact-fstack-labels",
         "links": [],
         "logging": {"driver": "json-file", "options": {}},
+        "masked_paths": list(runtime_submission.DEFAULT_MASKED_PATHS),
+        "memory": 0,
+        "memory_reservation": 0,
+        "memory_swap": 0,
+        "memory_swappiness": None,
+        "nano_cpus": 0,
         "network": {"aliases": "deterministic-container-name-only", "name": "fstack-local"},
+        "oom_kill_disable": False,
+        "oom_score_adj": 0,
         "pid_mode": None,
+        "pids_limit": None,
         "platform": "native-linux",
         "ports": {},
         "privileged": False,
         "readonly_rootfs": False,
+        "readonly_paths": list(runtime_submission.DEFAULT_READONLY_PATHS),
+        "runtime": "runc",
         "security_opt": ["no-new-privileges:true"],
+        "shm_size": 67_108_864,
         "stop_signal": "inherit-from-requested-digest",
         "sysctls": {},
         "tmpfs": {},
+        "ulimits": [],
         "user": "0:0",
+        "userns_mode": "",
         "uts_mode": None,
         "working_dir": "/app",
     }
@@ -440,4 +471,6 @@ def test_canonical_spec_seals_complete_docker_policy() -> None:
     }
 
     serialized = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
-    assert runtime_submission._spec_fingerprint(spec) == hashlib.sha256(serialized).hexdigest()
+    fingerprint = runtime_submission._spec_fingerprint(spec)
+    assert fingerprint == hashlib.sha256(serialized).hexdigest()
+    assert fingerprint == "7c3382c1dd9e685673f5e3a3279f8c5d8bdfe3eb9769c40b07b36fd4728c822e"

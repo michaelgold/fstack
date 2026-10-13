@@ -10,11 +10,17 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
+from fstack.docker_cli import APPLY_DOCKER_TIMEOUT_BUDGET
+
 PREPARE_LOCAL_CRUSHER_ACTIVITY = "fstack.prepare_local_crusher.v1"
 APPLY_LOCAL_CRUSHER_ACTIVITY = "fstack.apply_local_crusher.v1"
 FINALIZE_LOCAL_CRUSHER_SUCCESS_ACTIVITY = "fstack.finalize_local_crusher_success.v1"
 FINALIZE_LOCAL_CRUSHER_FAILURE_ACTIVITY = "fstack.finalize_local_crusher_failure.v1"
 FINALIZE_LOCAL_CRUSHER_PREPARE_FAILURE_ACTIVITY = "fstack.finalize_local_crusher_prepare_failure.v1"
+APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=30)
+
+if APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT <= APPLY_DOCKER_TIMEOUT_BUDGET:
+    raise RuntimeError("apply activity timeout must exceed the declared Docker timeout budget")
 
 
 @dataclass(frozen=True)
@@ -103,7 +109,7 @@ class ProvisionCrusherWorkflow:
                 APPLY_LOCAL_CRUSHER_ACTIVITY,
                 submission,
                 result_type=RuntimeSubmission,
-                start_to_close_timeout=timedelta(minutes=20),
+                start_to_close_timeout=APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT,
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(seconds=2),
                     maximum_interval=timedelta(seconds=30),

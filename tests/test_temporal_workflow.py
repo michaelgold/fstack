@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 from temporalio import activity
+from temporalio.api.enums.v1 import EventType
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 import fstack.runtime_submission as runtime_submission_module
 import fstack.temporal_worker as temporal_worker_module
+import fstack.temporal_workflow as temporal_workflow_module
+from fstack.docker_cli import APPLY_DOCKER_TIMEOUT_BUDGET
 from fstack.runtime_submission import OperationNotClaimableError, PreparedRuntimeSubmission
 from fstack.temporal_client import start_provision_crusher_workflow
 from fstack.temporal_worker import (
@@ -91,6 +95,14 @@ def _assert_no_exception_marker(exc: BaseException, marker: str) -> None:
         pending.extend((current.__cause__, current.__context__))
 
 
+def test_apply_activity_timeout_exceeds_declared_docker_budget() -> None:
+    assert APPLY_DOCKER_TIMEOUT_BUDGET.total_seconds() == 1710
+    assert timedelta(minutes=30) == temporal_workflow_module.APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT
+    assert temporal_workflow_module.APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT > (
+        APPLY_DOCKER_TIMEOUT_BUDGET
+    )
+
+
 def test_provision_crusher_workflow_prepares_applies_and_finalizes_in_order() -> None:
     operation_id = UUID("11111111-1111-4111-8111-111111111111")
     calls: list[str] = []
@@ -120,12 +132,14 @@ def test_provision_crusher_workflow_prepares_applies_and_finalizes_in_order() ->
                 activities=[prepare, apply, finalize],
             ),
         ):
-            result = await environment.client.execute_workflow(
+            handle = await environment.client.start_workflow(
                 ProvisionCrusherWorkflow.run,
                 ProvisionCrusherInput(operation_id=str(operation_id)),
                 id=f"provisioning/{operation_id}",
                 task_queue="test-provision-crusher",
             )
+            result = await handle.result()
+            history = await handle.fetch_history()
 
         assert result == ProvisionCrusherResult(
             operation_id=str(operation_id),
@@ -137,6 +151,15 @@ def test_provision_crusher_workflow_prepares_applies_and_finalizes_in_order() ->
             "apply:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "finalize:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         ]
+        apply_scheduled = next(
+            event.activity_task_scheduled_event_attributes
+            for event in history.events
+            if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+            and event.activity_task_scheduled_event_attributes.activity_type.name
+            == APPLY_LOCAL_CRUSHER_ACTIVITY
+        )
+        assert apply_scheduled.start_to_close_timeout.ToTimedelta() == timedelta(minutes=30)
+        assert apply_scheduled.start_to_close_timeout.ToTimedelta() > APPLY_DOCKER_TIMEOUT_BUDGET
 
     asyncio.run(run())
 

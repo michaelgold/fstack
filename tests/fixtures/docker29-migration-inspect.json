@@ -1,0 +1,209 @@
+{
+  "Config": {
+    "AttachStderr": false,
+    "AttachStdin": false,
+    "AttachStdout": false,
+    "Cmd": [
+      "/app/.venv/bin/python",
+      "-c",
+      "import json, os, subprocess, sys\nwith open('/run/secrets/fstack/owner.json', encoding='utf-8') as stream:\n    bundle = json.load(stream)\nenvironment = os.environ.copy()\ndatabase_prefix = 'CRUSHER_DATABASE_'\nenvironment[database_prefix + 'OWNER_URL'] = bundle['owner_url']\nenvironment[database_prefix + 'URL'] = bundle['owner_url']\nenvironment[database_prefix + 'APPLICATION_USER'] = bundle['application_user']\nenvironment[database_prefix + 'APPLICATION_' + 'PASSWORD'] = bundle['application_password']\nfor command in (\n    ['/app/.venv/bin/python', '-m', 'crusher.db.application_role'],\n    ['/app/.venv/bin/python', '-m', 'crusher.migrations.core.deploy'],\n    ['/app/.venv/bin/python', '-m', 'crusher.db.application_role'],\n):\n    result = subprocess.run(command, env=environment, check=False)\n    if result.returncode != 0:\n        sys.exit(result.returncode)\n"
+    ],
+    "Domainname": "",
+    "Entrypoint": [],
+    "Env": [
+      "PATH=/app/.venv/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "LANG=C.UTF-8",
+      "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+      "PYTHON_VERSION=3.12.15",
+      "PYTHON_SHA256=c2c4321961fab0fb999d66e0cecf521c2ab3994c7992873ea99e306c1094fd5a",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "PYTHONUNBUFFERED=1",
+      "UV_COMPILE_BYTECODE=1",
+      "UV_LINK_MODE=copy"
+    ],
+    "ExposedPorts": {
+      "8000/tcp": {}
+    },
+    "Healthcheck": {
+      "Interval": 30000000000,
+      "Retries": 3,
+      "StartPeriod": 10000000000,
+      "Test": [
+        "NONE"
+      ],
+      "Timeout": 5000000000
+    },
+    "Hostname": "16de52958634",
+    "Image": "ghcr.io/michaelgold/crusher@sha256:64e643882b5b50447b6d98498645af10de20a24ffa1b03c092827f94216c4a49",
+    "Labels": {
+      "io.fstack.deployment_id": "1a59fac5-15f9-48c2-910f-439a74112175",
+      "io.fstack.managed": "true",
+      "io.fstack.operation_id": "57e05b2f-d8ed-4788-9354-1eccfdba3e89",
+      "io.fstack.organization_id": "39d37d01-984e-4991-bff8-fbcc68c24c75",
+      "io.fstack.spec_fingerprint": "1df7b2cc941713074012c8675c26279316936bac72af828977d791f0dacab473",
+      "io.fstack.submission_key": "181c45a6b49bd852b3e39510abb40a0461de4c6ac0fc192b2607c37591486c07"
+    },
+    "OpenStdin": false,
+    "StdinOnce": false,
+    "Tty": false,
+    "User": "0:0",
+    "Volumes": null,
+    "WorkingDir": "/app"
+  },
+  "HostConfig": {
+    "AutoRemove": false,
+    "Binds": null,
+    "BlkioDeviceReadBps": null,
+    "BlkioDeviceReadIOps": null,
+    "BlkioDeviceWriteBps": null,
+    "BlkioDeviceWriteIOps": null,
+    "BlkioWeight": 0,
+    "BlkioWeightDevice": null,
+    "CapAdd": [],
+    "CapDrop": [
+      "ALL"
+    ],
+    "Cgroup": "",
+    "CgroupParent": "",
+    "CgroupnsMode": "private",
+    "ConsoleSize": [
+      0,
+      0
+    ],
+    "ContainerIDFile": "",
+    "CpuCount": 0,
+    "CpuPercent": 0,
+    "CpuPeriod": 0,
+    "CpuQuota": 0,
+    "CpuRealtimePeriod": 0,
+    "CpuRealtimeRuntime": 0,
+    "CpuShares": 0,
+    "CpusetCpus": "",
+    "CpusetMems": "",
+    "DeviceCgroupRules": null,
+    "DeviceRequests": [],
+    "Devices": [],
+    "Dns": [],
+    "DnsOptions": [],
+    "DnsSearch": [],
+    "ExtraHosts": [],
+    "GroupAdd": [],
+    "IOMaximumBandwidth": 0,
+    "IOMaximumIOps": 0,
+    "IpcMode": "private",
+    "Isolation": "",
+    "Links": null,
+    "LogConfig": {
+      "Config": {},
+      "Type": "json-file"
+    },
+    "MaskedPaths": [
+      "/proc/acpi",
+      "/proc/asound",
+      "/proc/interrupts",
+      "/proc/kcore",
+      "/proc/keys",
+      "/proc/latency_stats",
+      "/proc/sched_debug",
+      "/proc/scsi",
+      "/proc/timer_list",
+      "/proc/timer_stats",
+      "/sys/devices/virtual/powercap",
+      "/sys/firmware"
+    ],
+    "Memory": 0,
+    "MemoryReservation": 0,
+    "MemorySwap": 0,
+    "MemorySwappiness": null,
+    "Mounts": [
+      {
+        "ReadOnly": true,
+        "Source": "/var/lib/fstack/runtime-secrets/1a59fac515f948c2910f439a74112175/owner.json",
+        "Target": "/run/secrets/fstack/owner.json",
+        "Type": "bind"
+      }
+    ],
+    "NanoCpus": 0,
+    "NetworkMode": "fstack-canary-32640e5",
+    "OomKillDisable": false,
+    "OomScoreAdj": 0,
+    "PidMode": "",
+    "PidsLimit": null,
+    "PortBindings": {},
+    "Privileged": false,
+    "PublishAllPorts": false,
+    "ReadonlyPaths": [
+      "/proc/bus",
+      "/proc/fs",
+      "/proc/irq",
+      "/proc/sys",
+      "/proc/sysrq-trigger"
+    ],
+    "ReadonlyRootfs": false,
+    "RestartPolicy": {
+      "MaximumRetryCount": 0,
+      "Name": "no"
+    },
+    "Runtime": "runc",
+    "SecurityOpt": [
+      "no-new-privileges:true"
+    ],
+    "ShmSize": 67108864,
+    "UTSMode": "",
+    "Ulimits": null,
+    "UsernsMode": "",
+    "VolumeDriver": "",
+    "VolumesFrom": null
+  },
+  "Id": "16de52958634b89501c3d094ebc873f3e463665a46227e9843e0829d15c4b6d8",
+  "Mounts": [
+    {
+      "Destination": "/run/secrets/fstack/owner.json",
+      "Mode": "",
+      "Propagation": "rprivate",
+      "RW": false,
+      "Source": "/var/lib/fstack/runtime-secrets/1a59fac515f948c2910f439a74112175/owner.json",
+      "Type": "bind"
+    }
+  ],
+  "Name": "/fstack-crusher-migrate-1a59fac515f948c2910f439a74112175",
+  "NetworkSettings": {
+    "Networks": {
+      "fstack-canary-32640e5": {
+        "Aliases": [
+          "fstack-crusher-migrate-1a59fac515f948c2910f439a74112175"
+        ],
+        "DNSNames": null,
+        "DriverOpts": null,
+        "EndpointID": "",
+        "Gateway": "",
+        "GlobalIPv6Address": "",
+        "GlobalIPv6PrefixLen": 0,
+        "GwPriority": 0,
+        "IPAMConfig": null,
+        "IPAddress": "",
+        "IPPrefixLen": 0,
+        "IPv6Gateway": "",
+        "Links": null,
+        "MacAddress": "",
+        "NetworkID": ""
+      }
+    },
+    "Ports": {},
+    "SandboxID": "",
+    "SandboxKey": ""
+  },
+  "State": {
+    "Dead": false,
+    "Error": "",
+    "ExitCode": 0,
+    "FinishedAt": "0001-01-01T00:00:00Z",
+    "OOMKilled": false,
+    "Paused": false,
+    "Pid": 0,
+    "Restarting": false,
+    "Running": false,
+    "StartedAt": "0001-01-01T00:00:00Z",
+    "Status": "created"
+  }
+}

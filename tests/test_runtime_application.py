@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -899,12 +900,98 @@ def test_docker_create_payload_preserves_exec_healthcheck(monkeypatch: pytest.Mo
             }
         ],
         "restart_policy": {"name": "unless-stopped", "maximum_retry_count": 0},
+        **{
+            key: value
+            for key, value in runtime_submission._canonical_spec(
+                {
+                    "operation_id": UUID(int=1),
+                    "organization_id": UUID(int=2),
+                    "deployment_id": UUID(int=3),
+                    "crusher_image": "example/crusher@sha256:" + "a" * 64,
+                    "public_domain": "example.invalid",
+                    "database_secret_ref": "secret://local-file/acme/database",
+                    "object_storage_secret_ref": "secret://vault/acme/object-storage",
+                },
+                api_container_name="api",
+                migration_container_name="migration",
+                docker_network="fstack-test",
+                secret_stage_root=Path("/private"),
+            )["docker"]["common"].items()
+            if key
+            in {
+                "blkio_device_read_bps",
+                "blkio_device_read_iops",
+                "blkio_device_write_bps",
+                "blkio_device_write_iops",
+                "blkio_weight",
+                "blkio_weight_device",
+                "cgroup",
+                "cgroup_parent",
+                "cgroupns_mode",
+                "cpu_period",
+                "cpu_quota",
+                "cpu_realtime_period",
+                "cpu_realtime_runtime",
+                "cpu_shares",
+                "cpuset_cpus",
+                "cpuset_mems",
+                "device_cgroup_rules",
+                "masked_paths",
+                "memory",
+                "memory_reservation",
+                "memory_swap",
+                "memory_swappiness",
+                "nano_cpus",
+                "oom_kill_disable",
+                "oom_score_adj",
+                "pids_limit",
+                "readonly_paths",
+                "runtime",
+                "shm_size",
+                "ulimits",
+                "userns_mode",
+            }
+        },
     }
 
     assert docker.create_container(spec) == "a" * 64
     assert captured["name"] == "fstack-crusher-test"
     assert captured["payload"]["Healthcheck"]["Test"] == command
     assert captured["payload"]["HostConfig"]["AutoRemove"] is False
+    expected_sealed_host = {
+        "Cgroup": "",
+        "CgroupParent": "",
+        "CgroupnsMode": "private",
+        "UsernsMode": "",
+        "Memory": 0,
+        "MemoryReservation": 0,
+        "MemorySwap": 0,
+        "MemorySwappiness": None,
+        "OomKillDisable": False,
+        "OomScoreAdj": 0,
+        "PidsLimit": None,
+        "NanoCpus": 0,
+        "CpuShares": 0,
+        "CpuPeriod": 0,
+        "CpuQuota": 0,
+        "CpuRealtimePeriod": 0,
+        "CpuRealtimeRuntime": 0,
+        "CpusetCpus": "",
+        "CpusetMems": "",
+        "BlkioWeight": 0,
+        "BlkioWeightDevice": [],
+        "BlkioDeviceReadBps": [],
+        "BlkioDeviceWriteBps": [],
+        "BlkioDeviceReadIOps": [],
+        "BlkioDeviceWriteIOps": [],
+        "DeviceCgroupRules": [],
+        "Runtime": "runc",
+        "ShmSize": 67_108_864,
+        "Ulimits": [],
+        "MaskedPaths": list(runtime_submission.DEFAULT_MASKED_PATHS),
+        "ReadonlyPaths": list(runtime_submission.DEFAULT_READONLY_PATHS),
+    }
+    assert captured["payload"]["HostConfig"].items() >= expected_sealed_host.items()
     assert captured["payload"]["HostConfig"]["Dns"] == []
     assert captured["payload"]["HostConfig"]["DnsOptions"] == []
     assert captured["payload"]["HostConfig"]["DnsSearch"] == []
@@ -1028,6 +1115,56 @@ def test_realistic_docker_create_raw_inspect_omissions_have_exact_comparable_sch
     }
 
     assert docker._normalized(inspect_json) == expected
+
+
+def test_saved_docker_29_inspection_roundtrips_complete_canonical_spec() -> None:
+    fixture = json.loads(
+        Path("tests/fixtures/docker29-migration-inspect.json").read_text(encoding="utf-8")
+    )
+    labels = fixture["Config"]["Labels"]
+    operation_id = UUID(labels["io.fstack.operation_id"])
+    deployment_id = UUID(labels["io.fstack.deployment_id"])
+    api_name, migration_name = runtime_submission._container_names(deployment_id)
+    operation = {
+        "operation_id": operation_id,
+        "organization_id": UUID(labels["io.fstack.organization_id"]),
+        "deployment_id": deployment_id,
+        "crusher_image": fixture["Config"]["Image"],
+        "public_domain": "fixture.invalid",
+        "database_secret_ref": "secret://local-file/acme/database",
+        "object_storage_secret_ref": "secret://vault/acme/object-storage",
+    }
+    canonical = runtime_submission._canonical_spec(
+        operation,
+        api_container_name=api_name,
+        migration_container_name=migration_name,
+        docker_network=fixture["HostConfig"]["NetworkMode"],
+        secret_stage_root=Path("/var/lib/fstack/runtime-secrets"),
+    )
+    fingerprint = runtime_submission._spec_fingerprint(canonical)
+    plan = RuntimePlan(
+        submission_id=UUID(int=1),
+        operation_id=operation_id,
+        deployment_id=deployment_id,
+        submission_key=runtime_submission._submission_key(operation_id),
+        spec_fingerprint=fingerprint,
+        canonical_spec=canonical,
+        database_secret_ref=operation["database_secret_ref"],
+        source_root=Path("/unused"),
+        stage_root=Path("/var/lib/fstack/runtime-secrets"),
+    )
+    fixture["Config"]["Labels"]["io.fstack.spec_fingerprint"] = fingerprint
+    expected = _container_spec(
+        plan,
+        ImageInspection(
+            reference=operation["crusher_image"],
+            environment=tuple(fixture["Config"]["Env"]),
+            labels={},
+        ),
+        "migration",
+    )
+
+    assert DockerCLI()._normalized(fixture) == expected
 
 
 @pytest.mark.parametrize("mount_location", ["HostConfig", "Mounts"])
@@ -1335,8 +1472,25 @@ def _network_alias_inspect(
         },
         "HostConfig": {
             "NetworkMode": expected["network"]["name"],
+            "BlkioDeviceReadBps": expected["blkio_device_read_bps"],
+            "BlkioDeviceReadIOps": expected["blkio_device_read_iops"],
+            "BlkioDeviceWriteBps": expected["blkio_device_write_bps"],
+            "BlkioDeviceWriteIOps": expected["blkio_device_write_iops"],
+            "BlkioWeight": expected["blkio_weight"],
+            "BlkioWeightDevice": expected["blkio_weight_device"],
             "CapAdd": expected["cap_add"],
             "CapDrop": expected["cap_drop"],
+            "Cgroup": expected["cgroup"],
+            "CgroupParent": expected["cgroup_parent"],
+            "CgroupnsMode": expected["cgroupns_mode"],
+            "CpuPeriod": expected["cpu_period"],
+            "CpuQuota": expected["cpu_quota"],
+            "CpuRealtimePeriod": expected["cpu_realtime_period"],
+            "CpuRealtimeRuntime": expected["cpu_realtime_runtime"],
+            "CpuShares": expected["cpu_shares"],
+            "CpusetCpus": expected["cpuset_cpus"],
+            "CpusetMems": expected["cpuset_mems"],
+            "DeviceCgroupRules": expected["device_cgroup_rules"],
             "Devices": expected["devices"],
             "DeviceRequests": expected["device_requests"],
             "Dns": expected["dns"],
@@ -1352,6 +1506,11 @@ def _network_alias_inspect(
                 "Type": expected["logging"]["driver"],
                 "Config": expected["logging"]["options"],
             },
+            "MaskedPaths": expected["masked_paths"],
+            "Memory": expected["memory"],
+            "MemoryReservation": expected["memory_reservation"],
+            "MemorySwap": expected["memory_swap"],
+            "MemorySwappiness": expected["memory_swappiness"],
             "Mounts": [
                 {
                     "Type": mount["type"],
@@ -1361,17 +1520,26 @@ def _network_alias_inspect(
                 }
                 for mount in expected["mounts"]
             ],
+            "NanoCpus": expected["nano_cpus"],
+            "OomKillDisable": expected["oom_kill_disable"],
+            "OomScoreAdj": expected["oom_score_adj"],
             "PidMode": expected["pid_mode"] or "",
+            "PidsLimit": expected["pids_limit"],
             "PortBindings": expected["ports"],
             "Privileged": expected["privileged"],
             "ReadonlyRootfs": expected["readonly_rootfs"],
+            "ReadonlyPaths": expected["readonly_paths"],
             "RestartPolicy": {
                 "Name": expected["restart_policy"]["name"],
                 "MaximumRetryCount": expected["restart_policy"]["maximum_retry_count"],
             },
             "SecurityOpt": expected["security_opt"],
+            "Runtime": expected["runtime"],
+            "ShmSize": expected["shm_size"],
             "Sysctls": expected["sysctls"],
             "Tmpfs": expected["tmpfs"],
+            "Ulimits": expected["ulimits"],
+            "UsernsMode": expected["userns_mode"],
             "UTSMode": expected["uts_mode"] or "",
         },
         "Mounts": [
@@ -1476,6 +1644,115 @@ def test_docker_host_config_sealed_empty_fields_are_exact_spec_conflicts(
     assert actual != expected
 
 
+HOST_CONFIG_FINITE_FIELDS = {
+    "Cgroup": "other",
+    "CgroupParent": "/attacker",
+    "CgroupnsMode": "host",
+    "UsernsMode": "host",
+    "Memory": 1024,
+    "MemoryReservation": 512,
+    "MemorySwap": 2048,
+    "MemorySwappiness": 1,
+    "OomKillDisable": True,
+    "OomScoreAdj": 1,
+    "PidsLimit": 7,
+    "NanoCpus": 1,
+    "CpuShares": 2,
+    "CpuPeriod": 3,
+    "CpuQuota": 4,
+    "CpuRealtimePeriod": 5,
+    "CpuRealtimeRuntime": 6,
+    "CpusetCpus": "0",
+    "CpusetMems": "0",
+    "BlkioWeight": 10,
+    "BlkioWeightDevice": [{"Path": "/dev/null", "Weight": 10}],
+    "BlkioDeviceReadBps": [{"Path": "/dev/null", "Rate": 1}],
+    "BlkioDeviceWriteBps": [{"Path": "/dev/null", "Rate": 1}],
+    "BlkioDeviceReadIOps": [{"Path": "/dev/null", "Rate": 1}],
+    "BlkioDeviceWriteIOps": [{"Path": "/dev/null", "Rate": 1}],
+    "DeviceCgroupRules": ["c 1:3 rwm"],
+    "Runtime": "kata",
+    "ShmSize": 1,
+    "Ulimits": [{"Name": "nofile", "Hard": 1, "Soft": 1}],
+    "MaskedPaths": ["/proc/attacker"],
+    "ReadonlyPaths": ["/proc/attacker"],
+}
+
+
+@pytest.mark.parametrize(("field", "mutated"), HOST_CONFIG_FINITE_FIELDS.items())
+def test_every_finite_host_config_mutation_is_a_spec_conflict(
+    tmp_path: Path, field: str, mutated: object
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    expected = _container_spec(
+        plan,
+        ImageInspection(reference=plan.canonical_spec["crusher_image"], environment=(), labels={}),
+        "api",
+    )
+    inspect_json = _network_alias_inspect(expected, "a" * 64, ["a" * 12, expected["name"]])
+    inspect_json["HostConfig"][field] = deepcopy(mutated)
+
+    assert DockerCLI()._normalized(inspect_json) != expected
+
+
+@pytest.mark.parametrize("field", HOST_CONFIG_FINITE_FIELDS)
+def test_every_finite_host_config_field_is_required(tmp_path: Path, field: str) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    expected = _container_spec(
+        plan,
+        ImageInspection(reference=plan.canonical_spec["crusher_image"], environment=(), labels={}),
+        "api",
+    )
+    inspect_json = _network_alias_inspect(expected, "a" * 64, ["a" * 12, expected["name"]])
+    del inspect_json["HostConfig"][field]
+
+    with pytest.raises(DockerCommandError, match="^docker_unavailable$"):
+        DockerCLI()._normalized(inspect_json)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("Cgroup", 0),
+        ("Memory", False),
+        ("MemorySwappiness", "0"),
+        ("OomKillDisable", 0),
+        ("PidsLimit", 1.0),
+        ("BlkioWeightDevice", [{"Path": "/dev/null", "Weight": 1, "Extra": 0}]),
+        ("BlkioDeviceReadBps", [{"Path": "/dev/null", "Rate": True}]),
+        ("DeviceCgroupRules", [1]),
+        ("Ulimits", [{"Name": "nofile", "Hard": 1, "Soft": 1, "Extra": 0}]),
+        ("MaskedPaths", [1]),
+    ],
+)
+def test_finite_host_config_rejects_wrong_exact_types_and_nested_fields(
+    tmp_path: Path, field: str, invalid: object
+) -> None:
+    source_root = tmp_path / "source"
+    stage_root = tmp_path / "stage"
+    source_root.mkdir(mode=0o700)
+    stage_root.mkdir(mode=0o700)
+    plan = _plan(source_root, stage_root)
+    expected = _container_spec(
+        plan,
+        ImageInspection(reference=plan.canonical_spec["crusher_image"], environment=(), labels={}),
+        "api",
+    )
+    inspect_json = _network_alias_inspect(expected, "a" * 64, ["a" * 12, expected["name"]])
+    inspect_json["HostConfig"][field] = invalid
+
+    with pytest.raises(DockerCommandError, match="^docker_unavailable$"):
+        DockerCLI()._normalized(inspect_json)
+
+
 def test_docker_host_config_present_null_omission_equivalents_remain_allowed(
     tmp_path: Path,
 ) -> None:
@@ -1494,6 +1771,16 @@ def test_docker_host_config_present_null_omission_equivalents_remain_allowed(
     inspect_json["HostConfig"]["Init"] = None
     inspect_json["HostConfig"]["Sysctls"] = None
     inspect_json["HostConfig"]["Tmpfs"] = None
+    for field in (
+        "BlkioWeightDevice",
+        "BlkioDeviceReadBps",
+        "BlkioDeviceWriteBps",
+        "BlkioDeviceReadIOps",
+        "BlkioDeviceWriteIOps",
+        "DeviceCgroupRules",
+        "Ulimits",
+    ):
+        inspect_json["HostConfig"][field] = None
 
     assert DockerCLI()._normalized(inspect_json) == expected
 

@@ -364,7 +364,13 @@ The canonical common Docker create fields are:
 - no tmpfs, volumes or mounts except the one exact read-only secret-file bind;
 - logging driver `json-file` with an explicit empty option map;
 - `auto_remove=false`, no init override, and the stop signal inherited exactly from the
-  requested immutable image digest and sent explicitly in the create request.
+  requested immutable image digest and sent explicitly in the create request;
+- empty cgroup and parent, private cgroup namespace, empty user namespace mode;
+- zero memory, reservation, swap, OOM score, NanoCPU, shares, periods, quotas, realtime,
+  cpuset and block-I/O limits; nullable swappiness and PID limit; OOM kill enabled;
+- no block-I/O device limits or device cgroup rules;
+- runtime `runc`, shared memory size 67,108,864 bytes, no ulimits, and the exact Docker 29
+  default masked/read-only path lists sealed in the fingerprint and emitted on create.
 
 The migration-specific fields are:
 
@@ -391,6 +397,11 @@ inspection by applying the already-sealed inheritance policy. This metadata acqu
 does not alter the fingerprint. Every policy field above, including explicit empty sets
 and all four launcher/probe source hashes, is part of the canonical spec fingerprint. No
 host port is published and no DNS or proxy configuration changes.
+
+Inspection parses exact Docker scalar and nested resource types without coercion. The
+Docker 29 `null` form is normalized to an empty list only for block-I/O device lists,
+device-cgroup rules and ulimits; those fields are otherwise required, as are all scalar
+limits and path lists. Any mutation of a sealed field is a deterministic-name conflict.
 
 The migration container mounts only `owner.json` and runs, in order:
 

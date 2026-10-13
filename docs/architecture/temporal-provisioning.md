@@ -70,6 +70,12 @@ Permanent provider/domain failures are finalized once through the corresponding 
 failure activity; retryable failures remain Temporal activity failures and preserve any
 submitted provider identity for reconciliation.
 
+The synchronous apply activity has a 30-minute Start-to-Close timeout. Its Docker boundary
+centralizes a 1,710-second declared worst-case call budget (30-second ordinary calls and
+600-second pull/wait calls), and the workflow contract requires the activity timeout to
+remain strictly greater than that budget so Temporal cannot retry while a bounded call path
+is still executing.
+
 Docker reconciliation validates the requested immutable image digest before mutation
 and compares existing deterministic-name resources against the complete sealed spec and
 exact Fstack labels. Matching resources are replay-safe. Unmanaged or mismatched
@@ -77,6 +83,12 @@ resources fail closed and are never deleted or replaced. Provider output and exc
 text are discarded in favor of bounded sanitized codes. Known domain conflicts are
 nonretryable; unexpected database, state, and provider failures cross every activity
 boundary as the generic retryable `activity_infrastructure_failure` error.
+
+The sealed comparison includes namespace/cgroup mode, memory/OOM/PID limits, CPU controls,
+block-I/O and device rules, runtime/shared-memory/ulimit settings, and the exact masked and
+read-only path lists. Docker 29 `null` is equivalent to an explicit empty list only for the
+documented nullable list fields; missing non-equivalent fields, wrong scalar types, and
+extra nested resource fields fail inspection.
 
 The local secret provider is intentionally narrow: database references must use
 `secret://local-file/<segments>`, resolved beneath `FSTACK_LOCAL_SECRET_ROOT` without

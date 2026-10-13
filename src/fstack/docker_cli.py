@@ -8,6 +8,7 @@ import socket
 import subprocess
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from datetime import timedelta
 from http.client import HTTPConnection
 from typing import Any, cast
 from urllib.parse import quote
@@ -18,13 +19,30 @@ from fstack.runtime_application import (
     RuntimeApplicationError,
 )
 
+DOCKER_COMMAND_TIMEOUT_SECONDS = 30.0
+DOCKER_LONG_COMMAND_TIMEOUT_SECONDS = 600.0
+_IMAGE_DOCKER_TIMEOUT_BUDGET_SECONDS = (
+    2 * DOCKER_COMMAND_TIMEOUT_SECONDS + DOCKER_LONG_COMMAND_TIMEOUT_SECONDS
+)
+_MIGRATION_DOCKER_TIMEOUT_BUDGET_SECONDS = (
+    5 * DOCKER_COMMAND_TIMEOUT_SECONDS + DOCKER_LONG_COMMAND_TIMEOUT_SECONDS
+)
+_API_DOCKER_TIMEOUT_BUDGET_SECONDS = 10 * DOCKER_COMMAND_TIMEOUT_SECONDS
+APPLY_DOCKER_TIMEOUT_BUDGET = timedelta(
+    seconds=(
+        _IMAGE_DOCKER_TIMEOUT_BUDGET_SECONDS
+        + _MIGRATION_DOCKER_TIMEOUT_BUDGET_SECONDS
+        + _API_DOCKER_TIMEOUT_BUDGET_SECONDS
+    )
+)
+
 
 class DockerCommandError(RuntimeError):
     """A Docker command failed; provider output is intentionally discarded."""
 
 
 class DockerCLI:
-    def __init__(self, *, command_timeout: float = 30.0) -> None:
+    def __init__(self, *, command_timeout: float = DOCKER_COMMAND_TIMEOUT_SECONDS) -> None:
         self._command_timeout = command_timeout
 
     def _run(self, arguments: Sequence[str], *, timeout: float | None = None) -> str:
@@ -96,7 +114,7 @@ class DockerCLI:
         except DockerCommandError:
             # A pull can complete after its client times out; reconcile by digest.
             with suppress(DockerCommandError):
-                self._run(["pull", reference], timeout=600.0)
+                self._run(["pull", reference], timeout=DOCKER_LONG_COMMAND_TIMEOUT_SECONDS)
             raw = self._run(["image", "inspect", reference])
         value = self._json_one(raw)
         repo_digests = value.get("RepoDigests")
@@ -185,6 +203,57 @@ class DockerCLI:
         ):
             raise DockerCommandError("docker_unavailable")
         return cast(dict[str, str], value)
+
+    @classmethod
+    def _exact_int(
+        cls, mapping: Mapping[str, Any], key: str, *, nullable: bool = False
+    ) -> int | None:
+        value = cls._required(mapping, key)
+        if nullable and value is None:
+            return None
+        if type(value) is not int:
+            raise DockerCommandError("docker_unavailable")
+        return value
+
+    @classmethod
+    def _exact_string(cls, mapping: Mapping[str, Any], key: str) -> str:
+        value = cls._required(mapping, key)
+        if type(value) is not str:
+            raise DockerCommandError("docker_unavailable")
+        return value
+
+    @classmethod
+    def _exact_bool(cls, mapping: Mapping[str, Any], key: str) -> bool:
+        value = cls._required(mapping, key)
+        if type(value) is not bool:
+            raise DockerCommandError("docker_unavailable")
+        return value
+
+    @classmethod
+    def _typed_dict_list(
+        cls,
+        mapping: Mapping[str, Any],
+        key: str,
+        fields: Mapping[str, type],
+        *,
+        nullable: bool = False,
+    ) -> list[dict[str, Any]]:
+        values = cls._required(mapping, key)
+        if nullable and values is None:
+            return []
+        if type(values) is not list:
+            raise DockerCommandError("docker_unavailable")
+        normalized: list[dict[str, Any]] = []
+        for value in values:
+            if type(value) is not dict or set(value) != set(fields):
+                raise DockerCommandError("docker_unavailable")
+            item = cast(dict[str, Any], value)
+            if any(
+                type(item[field]) is not expected_type for field, expected_type in fields.items()
+            ):
+                raise DockerCommandError("docker_unavailable")
+            normalized.append(dict(item))
+        return normalized
 
     @classmethod
     def _mounts(
@@ -291,8 +360,35 @@ class DockerCLI:
         return {
             "network_mode": network_mode,
             "auto_remove": auto_remove,
+            "blkio_device_read_bps": cls._typed_dict_list(
+                host, "BlkioDeviceReadBps", {"Path": str, "Rate": int}, nullable=True
+            ),
+            "blkio_device_read_iops": cls._typed_dict_list(
+                host, "BlkioDeviceReadIOps", {"Path": str, "Rate": int}, nullable=True
+            ),
+            "blkio_device_write_bps": cls._typed_dict_list(
+                host, "BlkioDeviceWriteBps", {"Path": str, "Rate": int}, nullable=True
+            ),
+            "blkio_device_write_iops": cls._typed_dict_list(
+                host, "BlkioDeviceWriteIOps", {"Path": str, "Rate": int}, nullable=True
+            ),
+            "blkio_weight": cls._exact_int(host, "BlkioWeight"),
+            "blkio_weight_device": cls._typed_dict_list(
+                host, "BlkioWeightDevice", {"Path": str, "Weight": int}, nullable=True
+            ),
             "cap_add": cls._string_list(host, "CapAdd", nullable=True),
             "cap_drop": cls._string_list(host, "CapDrop", nullable=True),
+            "cgroup": cls._exact_string(host, "Cgroup"),
+            "cgroup_parent": cls._exact_string(host, "CgroupParent"),
+            "cgroupns_mode": cls._exact_string(host, "CgroupnsMode"),
+            "cpu_period": cls._exact_int(host, "CpuPeriod"),
+            "cpu_quota": cls._exact_int(host, "CpuQuota"),
+            "cpu_realtime_period": cls._exact_int(host, "CpuRealtimePeriod"),
+            "cpu_realtime_runtime": cls._exact_int(host, "CpuRealtimeRuntime"),
+            "cpu_shares": cls._exact_int(host, "CpuShares"),
+            "cpuset_cpus": cls._exact_string(host, "CpusetCpus"),
+            "cpuset_mems": cls._exact_string(host, "CpusetMems"),
+            "device_cgroup_rules": cls._string_list(host, "DeviceCgroupRules", nullable=True),
             "devices": cls._dict_list(host, "Devices", nullable=True),
             "device_requests": cls._dict_list(host, "DeviceRequests", nullable=True),
             "dns": cls._string_list(host, "Dns", nullable=True),
@@ -304,6 +400,11 @@ class DockerCLI:
             "ipc_mode": None if ipc_mode in {"", "private"} else ipc_mode,
             "links": cls._string_list(host, "Links", nullable=True),
             "logging": {"driver": log_type, "options": log_options},
+            "masked_paths": cls._string_list(host, "MaskedPaths"),
+            "memory": cls._exact_int(host, "Memory"),
+            "memory_reservation": cls._exact_int(host, "MemoryReservation"),
+            "memory_swap": cls._exact_int(host, "MemorySwap"),
+            "memory_swappiness": cls._exact_int(host, "MemorySwappiness", nullable=True),
             "mounts": cls._mounts(
                 cls._required(host, "Mounts"),
                 target_key="Target",
@@ -311,17 +412,28 @@ class DockerCLI:
                 writable_means_read_only=True,
                 fixed_fields={},
             ),
+            "nano_cpus": cls._exact_int(host, "NanoCpus"),
+            "oom_kill_disable": cls._exact_bool(host, "OomKillDisable"),
+            "oom_score_adj": cls._exact_int(host, "OomScoreAdj"),
             "pid_mode": pid_mode or None,
+            "pids_limit": cls._exact_int(host, "PidsLimit", nullable=True),
             "ports": cast(dict[str, Any], port_bindings),
             "privileged": privileged,
             "readonly_rootfs": readonly_rootfs,
+            "readonly_paths": cls._string_list(host, "ReadonlyPaths"),
             "restart_policy": {
                 "maximum_retry_count": maximum_retry_count,
                 "name": restart_name,
             },
             "security_opt": cls._string_list(host, "SecurityOpt", nullable=True),
+            "runtime": cls._exact_string(host, "Runtime"),
+            "shm_size": cls._exact_int(host, "ShmSize"),
             "sysctls": cls._string_dict(host, "Sysctls", nullable=True),
             "tmpfs": cls._string_dict(host, "Tmpfs", nullable=True),
+            "ulimits": cls._typed_dict_list(
+                host, "Ulimits", {"Name": str, "Hard": int, "Soft": int}, nullable=True
+            ),
+            "userns_mode": cls._exact_string(host, "UsernsMode"),
             "uts_mode": uts_mode or None,
         }
 
@@ -392,8 +504,25 @@ class DockerCLI:
         role = "migration" if "migrate" in name else "api"
         return {
             "auto_remove": host_config["auto_remove"],
+            "blkio_device_read_bps": host_config["blkio_device_read_bps"],
+            "blkio_device_read_iops": host_config["blkio_device_read_iops"],
+            "blkio_device_write_bps": host_config["blkio_device_write_bps"],
+            "blkio_device_write_iops": host_config["blkio_device_write_iops"],
+            "blkio_weight": host_config["blkio_weight"],
+            "blkio_weight_device": host_config["blkio_weight_device"],
             "cap_add": host_config["cap_add"],
             "cap_drop": host_config["cap_drop"],
+            "cgroup": host_config["cgroup"],
+            "cgroup_parent": host_config["cgroup_parent"],
+            "cgroupns_mode": host_config["cgroupns_mode"],
+            "cpu_period": host_config["cpu_period"],
+            "cpu_quota": host_config["cpu_quota"],
+            "cpu_realtime_period": host_config["cpu_realtime_period"],
+            "cpu_realtime_runtime": host_config["cpu_realtime_runtime"],
+            "cpu_shares": host_config["cpu_shares"],
+            "cpuset_cpus": host_config["cpuset_cpus"],
+            "cpuset_mems": host_config["cpuset_mems"],
+            "device_cgroup_rules": host_config["device_cgroup_rules"],
             "devices": host_config["devices"],
             "device_requests": host_config["device_requests"],
             "dns": host_config["dns"],
@@ -408,17 +537,31 @@ class DockerCLI:
             "ipc_mode": host_config["ipc_mode"],
             "links": host_config["links"],
             "logging": host_config["logging"],
+            "masked_paths": host_config["masked_paths"],
+            "memory": host_config["memory"],
+            "memory_reservation": host_config["memory_reservation"],
+            "memory_swap": host_config["memory_swap"],
+            "memory_swappiness": host_config["memory_swappiness"],
             "network": {"aliases": normalized_aliases, "name": network_name},
+            "nano_cpus": host_config["nano_cpus"],
+            "oom_kill_disable": host_config["oom_kill_disable"],
+            "oom_score_adj": host_config["oom_score_adj"],
             "pid_mode": host_config["pid_mode"],
+            "pids_limit": host_config["pids_limit"],
             "platform": "native-linux",
             "ports": host_config["ports"],
             "privileged": host_config["privileged"],
             "readonly_rootfs": host_config["readonly_rootfs"],
+            "readonly_paths": host_config["readonly_paths"],
+            "runtime": host_config["runtime"],
             "security_opt": host_config["security_opt"],
+            "shm_size": host_config["shm_size"],
             "stop_signal": config_map.get("StopSignal"),
             "sysctls": host_config["sysctls"],
             "tmpfs": host_config["tmpfs"],
+            "ulimits": host_config["ulimits"],
             "user": config_map.get("User") or "",
+            "userns_mode": host_config["userns_mode"],
             "uts_mode": host_config["uts_mode"],
             "working_dir": config_map.get("WorkingDir") or "",
             "command": config_map.get("Cmd") or [],
@@ -489,8 +632,25 @@ class DockerCLI:
             "HostConfig": {
                 "NetworkMode": spec["network"]["name"],
                 "AutoRemove": spec["auto_remove"],
+                "BlkioDeviceReadBps": spec["blkio_device_read_bps"],
+                "BlkioDeviceReadIOps": spec["blkio_device_read_iops"],
+                "BlkioDeviceWriteBps": spec["blkio_device_write_bps"],
+                "BlkioDeviceWriteIOps": spec["blkio_device_write_iops"],
+                "BlkioWeight": spec["blkio_weight"],
+                "BlkioWeightDevice": spec["blkio_weight_device"],
                 "CapAdd": [],
                 "CapDrop": ["ALL"],
+                "Cgroup": spec["cgroup"],
+                "CgroupParent": spec["cgroup_parent"],
+                "CgroupnsMode": spec["cgroupns_mode"],
+                "CpuPeriod": spec["cpu_period"],
+                "CpuQuota": spec["cpu_quota"],
+                "CpuRealtimePeriod": spec["cpu_realtime_period"],
+                "CpuRealtimeRuntime": spec["cpu_realtime_runtime"],
+                "CpuShares": spec["cpu_shares"],
+                "CpusetCpus": spec["cpuset_cpus"],
+                "CpusetMems": spec["cpuset_mems"],
+                "DeviceCgroupRules": spec["device_cgroup_rules"],
                 "Devices": [],
                 "DeviceRequests": [],
                 "Dns": [],
@@ -505,6 +665,11 @@ class DockerCLI:
                     "Type": spec["logging"]["driver"],
                     "Config": spec["logging"]["options"],
                 },
+                "MaskedPaths": spec["masked_paths"],
+                "Memory": spec["memory"],
+                "MemoryReservation": spec["memory_reservation"],
+                "MemorySwap": spec["memory_swap"],
+                "MemorySwappiness": spec["memory_swappiness"],
                 "Mounts": [
                     {
                         "Type": "bind",
@@ -514,17 +679,26 @@ class DockerCLI:
                     }
                     for mount in spec["mounts"]
                 ],
+                "NanoCpus": spec["nano_cpus"],
+                "OomKillDisable": spec["oom_kill_disable"],
+                "OomScoreAdj": spec["oom_score_adj"],
                 "PidMode": "",
+                "PidsLimit": spec["pids_limit"],
                 "PortBindings": {},
                 "Privileged": False,
                 "ReadonlyRootfs": False,
+                "ReadonlyPaths": spec["readonly_paths"],
                 "RestartPolicy": {
                     "Name": spec["restart_policy"]["name"],
                     "MaximumRetryCount": spec["restart_policy"]["maximum_retry_count"],
                 },
+                "Runtime": spec["runtime"],
                 "SecurityOpt": ["no-new-privileges:true"],
+                "ShmSize": spec["shm_size"],
                 "Sysctls": {},
                 "Tmpfs": {},
+                "Ulimits": spec["ulimits"],
+                "UsernsMode": spec["userns_mode"],
                 "UTSMode": "",
             },
             "NetworkingConfig": {
@@ -537,7 +711,7 @@ class DockerCLI:
         self._run(["start", name])
 
     def wait_container(self, name: str) -> int:
-        raw = self._run(["wait", name], timeout=600.0).strip()
+        raw = self._run(["wait", name], timeout=DOCKER_LONG_COMMAND_TIMEOUT_SECONDS).strip()
         try:
             value = int(raw)
         except ValueError:
