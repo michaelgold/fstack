@@ -6,10 +6,10 @@ import json
 import os
 import socket
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import timedelta
-from http.client import HTTPConnection
 from typing import Any, cast
 from urllib.parse import quote
 
@@ -65,29 +65,148 @@ class DockerCLI:
         if not docker_host.startswith("unix://"):
             raise DockerCommandError("docker_unavailable")
         socket_path = docker_host.removeprefix("unix://")
-
-        class UnixConnection(HTTPConnection):
-            def connect(inner_self) -> None:
-                inner_self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                inner_self.sock.settimeout(self._command_timeout)
-                inner_self.sock.connect(socket_path)
-
-        connection = UnixConnection("localhost", timeout=self._command_timeout)
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        request = (
+            f"POST /containers/create?name={quote(name, safe='')} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii") + body
+        deadline = time.monotonic() + self._command_timeout
         try:
-            connection.request(
-                "POST",
-                f"/containers/create?name={quote(name, safe='')}",
-                body=body,
-                headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
-            )
-            response = connection.getresponse()
-            raw = response.read(65_537)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        except OSError:
+            raise DockerCommandError("docker_unavailable") from None
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise TimeoutError
+            return value
+
+        def receive(target: bytearray, maximum: int) -> None:
+            if len(target) >= maximum:
+                raise DockerCommandError("docker_unavailable")
+            sock.settimeout(remaining())
+            chunk = sock.recv(min(65_536, maximum - len(target)))
+            if not chunk:
+                raise DockerCommandError("docker_unavailable")
+            target.extend(chunk)
+
+        def read_exact(pending: bytearray, size: int) -> bytes:
+            while len(pending) < size:
+                receive(pending, size)
+            result = bytes(pending[:size])
+            del pending[:size]
+            return result
+
+        def read_line(pending: bytearray, maximum: int) -> bytes:
+            while True:
+                end = pending.find(b"\r\n")
+                if end >= 0:
+                    if end > maximum:
+                        raise DockerCommandError("docker_unavailable")
+                    result = bytes(pending[:end])
+                    del pending[: end + 2]
+                    return result
+                receive(pending, maximum + 2)
+
+        def read_chunked(pending: bytearray) -> bytes:
+            result = bytearray()
+            while True:
+                size_line = read_line(pending, 8192)
+                size_text = size_line.split(b";", 1)[0].strip()
+                if not size_text or len(size_text) > 16:
+                    raise DockerCommandError("docker_unavailable")
+                try:
+                    chunk_size = int(size_text, 16)
+                except ValueError:
+                    raise DockerCommandError("docker_unavailable") from None
+                if chunk_size > 65_536 - len(result):
+                    raise DockerCommandError("docker_unavailable")
+                if chunk_size == 0:
+                    trailer_size = 0
+                    while True:
+                        trailer = read_line(pending, 65_536 - trailer_size)
+                        trailer_size += len(trailer) + 2
+                        if not trailer:
+                            return bytes(result)
+                        if b":" not in trailer:
+                            raise DockerCommandError("docker_unavailable")
+                result.extend(read_exact(pending, chunk_size))
+                if read_exact(pending, 2) != b"\r\n":
+                    raise DockerCommandError("docker_unavailable")
+
+        try:
+            sock.settimeout(remaining())
+            sock.connect(socket_path)
+            sent = 0
+            while sent < len(request):
+                sock.settimeout(remaining())
+                count = sock.send(request[sent:])
+                if count <= 0:
+                    raise DockerCommandError("docker_unavailable")
+                sent += count
+
+            pending = bytearray()
+            while b"\r\n\r\n" not in pending:
+                receive(pending, 65_540)
+            header_end = pending.index(b"\r\n\r\n")
+            if header_end > 65_536:
+                raise DockerCommandError("docker_unavailable")
+            header_block = bytes(pending[:header_end])
+            del pending[: header_end + 4]
+            lines = header_block.split(b"\r\n")
+            status_parts = lines[0].split(b" ", 2)
+            if (
+                len(status_parts) < 2
+                or status_parts[0] not in {b"HTTP/1.0", b"HTTP/1.1"}
+                or status_parts[1] != b"201"
+            ):
+                raise DockerCommandError("docker_unavailable")
+
+            headers: dict[bytes, list[bytes]] = {}
+            for line in lines[1:]:
+                if b":" not in line or line[:1] in {b" ", b"\t"}:
+                    raise DockerCommandError("docker_unavailable")
+                key, value = line.split(b":", 1)
+                if not key or any(byte < 33 or byte > 126 for byte in key):
+                    raise DockerCommandError("docker_unavailable")
+                headers.setdefault(key.lower(), []).append(value.strip())
+
+            transfer_encoding = headers.get(b"transfer-encoding")
+            content_lengths = headers.get(b"content-length")
+            if transfer_encoding is not None:
+                if content_lengths is not None or transfer_encoding != [b"chunked"]:
+                    raise DockerCommandError("docker_unavailable")
+                raw = read_chunked(pending)
+            elif content_lengths is not None:
+                if len(set(content_lengths)) != 1:
+                    raise DockerCommandError("docker_unavailable")
+                try:
+                    content_length = int(content_lengths[0])
+                except ValueError:
+                    raise DockerCommandError("docker_unavailable") from None
+                if content_length < 0 or content_length > 65_536:
+                    raise DockerCommandError("docker_unavailable")
+                raw = read_exact(pending, content_length)
+            else:
+                while True:
+                    if len(pending) > 65_536:
+                        raise DockerCommandError("docker_unavailable")
+                    sock.settimeout(remaining())
+                    chunk = sock.recv(min(65_537 - len(pending), 65_536))
+                    if not chunk:
+                        break
+                    pending.extend(chunk)
+                raw = bytes(pending)
         except (OSError, TimeoutError):
             raise DockerCommandError("docker_unavailable") from None
         finally:
-            connection.close()
-        if response.status != 201 or len(raw) > 65_536:
+            sock.close()
+        if len(raw) > 65_536:
             raise DockerCommandError("docker_unavailable")
         try:
             value = json.loads(raw)

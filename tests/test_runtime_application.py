@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import stat
+import threading
+import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +41,51 @@ def _assert_no_exception_marker(exc: BaseException, marker: str) -> None:
         assert marker not in str(current)
         assert marker not in repr(current)
         pending.extend((current.__cause__, current.__context__))
+
+
+@contextmanager
+def _unix_http_response(
+    socket_path: Path, chunks: list[bytes], *, delay_seconds: float = 0.0
+) -> Any:
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(socket_path))
+    server.listen(1)
+    server.settimeout(2.0)
+    request_received = threading.Event()
+
+    def serve() -> None:
+        try:
+            connection, _ = server.accept()
+            with connection:
+                request = bytearray()
+                while b"\r\n\r\n" not in request:
+                    request.extend(connection.recv(4096))
+                headers, _, body = request.partition(b"\r\n\r\n")
+                content_length = next(
+                    int(line.split(b":", 1)[1])
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                while len(body) < content_length:
+                    body += connection.recv(4096)
+                request_received.set()
+                for chunk in chunks:
+                    if delay_seconds:
+                        time.sleep(delay_seconds)
+                    connection.sendall(chunk)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
+        finally:
+            server.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        yield request_received
+    finally:
+        server.close()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
 
 
 @dataclass
@@ -822,6 +871,59 @@ def test_ambiguous_create_is_reconciled_without_exposing_provider_text(tmp_path:
 
     assert result == f"container-{plan.canonical_spec['api_container_name']}"
     assert "secret" not in result
+
+
+def test_docker_create_accepts_bounded_201_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    socket_path = tmp_path / "docker.sock"
+    identifier = "a" * 64
+    body = json.dumps({"Id": identifier}).encode()
+    response = (
+        b"HTTP/1.1 201 Created\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"\r\n"
+        + body
+    )
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{socket_path}")
+
+    with _unix_http_response(socket_path, [response]) as request_received:
+        actual = DockerCLI(command_timeout=0.5)._create_request("fstack-test", {"Image": "x"})
+
+    assert request_received.is_set()
+    assert actual == identifier
+
+
+def test_docker_create_slow_drip_is_bounded_by_total_command_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    socket_path = tmp_path / "docker.sock"
+    body = b'{"Id":"' + b"a" * 64 + b'"}'
+    headers = (
+        b"HTTP/1.1 201 Created\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"\r\n"
+    )
+    chunks = [headers, body[:24], body[24:48], body[48:]]
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{socket_path}")
+
+    error: DockerCommandError | None = None
+    elapsed = float("inf")
+    with _unix_http_response(socket_path, chunks, delay_seconds=0.04) as request_received:
+        started = time.monotonic()
+        try:
+            DockerCLI(command_timeout=0.1)._create_request("fstack-test", {"Image": "x"})
+        except DockerCommandError as exc:
+            error = exc
+            elapsed = time.monotonic() - started
+        else:
+            pytest.fail("slow-drip create unexpectedly succeeded")
+
+    assert str(error) == "docker_unavailable"
+    assert request_received.is_set()
+    assert elapsed < 0.2
 
 
 def test_success_replay_does_not_create_or_start_again(tmp_path: Path) -> None:
