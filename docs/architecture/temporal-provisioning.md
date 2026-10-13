@@ -87,8 +87,8 @@ boundary as the generic retryable `activity_infrastructure_failure` error.
 The sealed comparison includes namespace/cgroup mode, memory/OOM/PID limits, CPU controls,
 block-I/O and device rules, runtime/shared-memory/ulimit settings, and the exact masked and
 read-only path lists. Docker 29 `null` is equivalent to an explicit empty list only for the
-documented nullable list fields; missing non-equivalent fields, wrong scalar types, and
-extra nested resource fields fail inspection.
+documented nullable list fields and to sealed `false` only for `OomKillDisable`; missing
+non-equivalent fields, wrong scalar types, and extra nested resource fields fail inspection.
 
 The local secret provider is intentionally narrow: database references must use
 `secret://local-file/<segments>`, resolved beneath `FSTACK_LOCAL_SECRET_ROOT` without

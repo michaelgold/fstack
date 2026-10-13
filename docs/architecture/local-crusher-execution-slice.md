@@ -400,8 +400,9 @@ host port is published and no DNS or proxy configuration changes.
 
 Inspection parses exact Docker scalar and nested resource types without coercion. The
 Docker 29 `null` form is normalized to an empty list only for block-I/O device lists,
-device-cgroup rules and ulimits; those fields are otherwise required, as are all scalar
-limits and path lists. Any mutation of a sealed field is a deterministic-name conflict.
+device-cgroup rules and ulimits, and to sealed `false` only for `OomKillDisable`; those
+fields are otherwise required, as are all scalar limits and path lists. Any mutation of a
+sealed field is a deterministic-name conflict.
 
 The migration container mounts only `owner.json` and runs, in order:
 
