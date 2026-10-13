@@ -179,7 +179,8 @@ class DockerCLI:
             transfer_encoding = headers.get(b"transfer-encoding")
             content_lengths = headers.get(b"content-length")
             if transfer_encoding is not None:
-                if content_lengths is not None or transfer_encoding != [b"chunked"]:
+                normalized_transfer_encoding = [value.lower() for value in transfer_encoding]
+                if content_lengths is not None or normalized_transfer_encoding != [b"chunked"]:
                     raise DockerCommandError("docker_unavailable")
                 raw = read_chunked(pending)
             elif content_lengths is not None:

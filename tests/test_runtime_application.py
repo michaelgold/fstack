@@ -895,6 +895,100 @@ def test_docker_create_accepts_bounded_201_json(
     assert actual == identifier
 
 
+@pytest.mark.parametrize(
+    "transfer_coding",
+    [b"Chunked", b"CHUNKED", b" \tChUnKeD\t "],
+)
+def test_docker_create_accepts_case_insensitive_chunked_transfer_coding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transfer_coding: bytes,
+) -> None:
+    socket_path = tmp_path / "docker.sock"
+    identifier = "a" * 64
+    body = json.dumps({"Id": identifier}).encode()
+    response = (
+        b"HTTP/1.1 201 Created\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Transfer-Encoding:"
+        + transfer_coding
+        + b"\r\n\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n0\r\n\r\n"
+    )
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{socket_path}")
+
+    with _unix_http_response(socket_path, [response]) as request_received:
+        actual = DockerCLI(command_timeout=0.5)._create_request("fstack-test", {"Image": "x"})
+
+    assert request_received.is_set()
+    assert actual == identifier
+
+
+@pytest.mark.parametrize(
+    "transfer_encoding_headers",
+    [
+        [b"Transfer-Encoding: gzip\r\n"],
+        [b"Transfer-Encoding: chunked, gzip\r\n"],
+        [b"Transfer-Encoding: gzip, chunked\r\n"],
+        [b"Transfer-Encoding: chunked\r\n", b"Transfer-Encoding: chunked\r\n"],
+        [b"Transfer-Encoding: chunk ed\r\n"],
+        [b"Transfer-Encoding: chunked;extension\r\n"],
+        [b"Transfer-Encoding:\t \r\n"],
+    ],
+)
+def test_docker_create_rejects_nonexact_transfer_coding_sequences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transfer_encoding_headers: list[bytes],
+) -> None:
+    socket_path = tmp_path / "docker.sock"
+    body = b'{"Id":"' + b"a" * 64 + b'"}'
+    response = (
+        b"HTTP/1.1 201 Created\r\n"
+        + b"".join(transfer_encoding_headers)
+        + b"\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n0\r\n\r\n"
+    )
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{socket_path}")
+
+    with (
+        _unix_http_response(socket_path, [response]) as request_received,
+        pytest.raises(DockerCommandError, match="^docker_unavailable$"),
+    ):
+        DockerCLI(command_timeout=0.5)._create_request("fstack-test", {"Image": "x"})
+
+    assert request_received.is_set()
+
+
+def test_docker_create_rejects_content_length_with_transfer_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    socket_path = tmp_path / "docker.sock"
+    body = b'{"Id":"' + b"a" * 64 + b'"}'
+    response = (
+        b"HTTP/1.1 201 Created\r\n"
+        b"Transfer-Encoding: Chunked\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"\r\n"
+        + f"{len(body):x}\r\n".encode()
+        + body
+        + b"\r\n0\r\n\r\n"
+    )
+    monkeypatch.setenv("DOCKER_HOST", f"unix://{socket_path}")
+
+    with (
+        _unix_http_response(socket_path, [response]) as request_received,
+        pytest.raises(DockerCommandError, match="^docker_unavailable$"),
+    ):
+        DockerCLI(command_timeout=0.5)._create_request("fstack-test", {"Image": "x"})
+
+    assert request_received.is_set()
+
+
 def test_docker_create_slow_drip_is_bounded_by_total_command_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
