@@ -1263,6 +1263,7 @@ def test_realistic_docker_create_raw_inspect_omissions_have_exact_comparable_sch
     payload = captured["payload"]
     host = payload["HostConfig"]
     assert host["Init"] is None
+    assert host["OomKillDisable"] is False
     assert host["Sysctls"] == {}
     assert host["Tmpfs"] == {}
     raw_inspect_host = {
@@ -1286,6 +1287,7 @@ def test_realistic_docker_create_raw_inspect_omissions_have_exact_comparable_sch
             **raw_inspect_host,
             "IpcMode": "private",
             "Links": None,
+            "OomKillDisable": None,
             "PidMode": "",
             "UTSMode": "",
         },
@@ -1921,6 +1923,9 @@ def test_every_finite_host_config_field_is_required(tmp_path: Path, field: str) 
         ("Memory", False),
         ("MemorySwappiness", "0"),
         ("OomKillDisable", 0),
+        ("OomKillDisable", "false"),
+        ("OomKillDisable", []),
+        ("OomKillDisable", {}),
         ("PidsLimit", 1.0),
         ("BlkioWeightDevice", [{"Path": "/dev/null", "Weight": 1, "Extra": 0}]),
         ("BlkioDeviceReadBps", [{"Path": "/dev/null", "Rate": True}]),

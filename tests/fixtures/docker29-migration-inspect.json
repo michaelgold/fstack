@@ -125,7 +125,7 @@
     ],
     "NanoCpus": 0,
     "NetworkMode": "fstack-canary-32640e5",
-    "OomKillDisable": false,
+    "OomKillDisable": null,
     "OomScoreAdj": 0,
     "PidMode": "",
     "PidsLimit": null,

@@ -350,6 +350,15 @@ class DockerCLI:
         return value
 
     @classmethod
+    def _oom_kill_disable(cls, host: Mapping[str, Any]) -> bool:
+        value = cls._required(host, "OomKillDisable")
+        if value is None:
+            return False
+        if type(value) is not bool:
+            raise DockerCommandError("docker_unavailable")
+        return value
+
+    @classmethod
     def _typed_dict_list(
         cls,
         mapping: Mapping[str, Any],
@@ -533,7 +542,7 @@ class DockerCLI:
                 fixed_fields={},
             ),
             "nano_cpus": cls._exact_int(host, "NanoCpus"),
-            "oom_kill_disable": cls._exact_bool(host, "OomKillDisable"),
+            "oom_kill_disable": cls._oom_kill_disable(host),
             "oom_score_adj": cls._exact_int(host, "OomScoreAdj"),
             "pid_mode": pid_mode or None,
             "pids_limit": cls._exact_int(host, "PidsLimit", nullable=True),
