@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from typing import Any
+from enum import StrEnum
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
-from temporalio.exceptions import ApplicationError
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -21,23 +24,1156 @@ from fstack.runtime_submission import OperationNotClaimableError, PreparedRuntim
 from fstack.temporal_client import start_provision_crusher_workflow
 from fstack.temporal_worker import (
     apply_local_crusher,
+    apply_local_crusher_runtime_v2,
     finalize_local_crusher_failure,
+    finalize_local_crusher_ingress_failure_v2,
+    finalize_local_crusher_ingress_success_v2,
     finalize_local_crusher_prepare_failure,
     finalize_local_crusher_success,
+    preflight_local_caddy_topology_activity,
     prepare_local_crusher,
+    prepare_local_crusher_ingress_v2,
+    probe_local_caddy_ingress,
+    reconcile_local_caddy_ingress,
 )
 from fstack.temporal_workflow import (
     APPLY_LOCAL_CRUSHER_ACTIVITY,
+    APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY,
     FINALIZE_LOCAL_CRUSHER_FAILURE_ACTIVITY,
+    FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY,
+    FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY,
     FINALIZE_LOCAL_CRUSHER_SUCCESS_ACTIVITY,
+    PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY,
     PREPARE_LOCAL_CRUSHER_ACTIVITY,
+    PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY,
+    PROBE_LOCAL_CADDY_INGRESS_ACTIVITY,
+    RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY,
     OperationFailure,
     ProvisionCrusherInput,
     ProvisionCrusherResult,
+    ProvisionCrusherV2Input,
+    ProvisionCrusherV2Result,
     ProvisionCrusherWorkflow,
+    ProvisioningFailureV2,
+    ProvisioningSubmissionIds,
     RuntimeFailure,
     RuntimeSubmission,
 )
+
+
+@workflow.defn(name="test.fstack.task12.sanitized_activity_history")
+class _SanitizedActivityHistoryWorkflow:
+    @workflow.run
+    async def run(self, ids: ProvisioningSubmissionIds) -> str:
+        try:
+            await workflow.execute_activity(
+                PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY,
+                ids,
+                start_to_close_timeout=timedelta(seconds=5),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except ActivityError:
+            return "failed"
+        return "unexpected-success"
+
+
+def test_v2_activity_contract_names_and_payloads_are_sanitized() -> None:
+    assert PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY == "fstack.prepare_local_crusher_ingress.v2"
+    assert APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY == "fstack.apply_local_crusher_runtime.v2"
+    assert PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY == "fstack.preflight_local_caddy_topology.v1"
+    assert RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY == "fstack.reconcile_local_caddy_ingress.v1"
+    assert PROBE_LOCAL_CADDY_INGRESS_ACTIVITY == "fstack.probe_local_caddy_ingress.v1"
+    assert (
+        FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY
+        == "fstack.finalize_local_crusher_ingress_success.v2"
+    )
+    assert (
+        FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY
+        == "fstack.finalize_local_crusher_ingress_failure.v2"
+    )
+    assert set(ProvisionCrusherV2Input.__dataclass_fields__) == {"operation_id"}
+    assert set(ProvisioningSubmissionIds.__dataclass_fields__) == {
+        "operation_id",
+        "runtime_submission_id",
+        "ingress_submission_id",
+    }
+    assert set(ProvisioningFailureV2.__dataclass_fields__) == {
+        "operation_id",
+        "scope",
+        "error_code",
+    }
+    assert set(ProvisionCrusherV2Result.__dataclass_fields__) == {"operation_id", "state"}
+
+
+def test_prepare_v2_returns_only_durable_submission_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    operation_id = UUID("11111111-1111-4111-8111-111111111111")
+    runtime_submission_id = UUID("22222222-2222-4222-8222-222222222222")
+    ingress_submission_id = UUID("33333333-3333-4333-8333-333333333333")
+    prepared = temporal_worker_module.ingress_submission.PreparedProvisioningSubmissions(
+        operation_id=operation_id,
+        runtime_submission_id=runtime_submission_id,
+        ingress_submission_id=ingress_submission_id,
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_submission,
+        "prepare_operation_bundle",
+        lambda value: prepared if value == operation_id else pytest.fail("wrong operation"),
+    )
+
+    result = prepare_local_crusher_ingress_v2(
+        ProvisionCrusherV2Input(operation_id=str(operation_id))
+    )
+
+    assert result == ProvisioningSubmissionIds(
+        operation_id=str(operation_id),
+        runtime_submission_id=str(runtime_submission_id),
+        ingress_submission_id=str(ingress_submission_id),
+    )
+    assert set(result.__dict__) == {
+        "operation_id",
+        "runtime_submission_id",
+        "ingress_submission_id",
+    }
+
+
+@pytest.mark.parametrize("exact_bundle", [False, True])
+def test_prepare_v2_only_makes_conflict_permanent_for_exact_durable_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    exact_bundle: bool,
+) -> None:
+    calls: list[str] = []
+
+    def conflict(_operation_id: UUID) -> object:
+        calls.append("prepare")
+        raise temporal_worker_module.ingress_submission.ProvisioningSubmissionConflictError(
+            "runtime_submission_conflict"
+        )
+
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_submission, "prepare_operation_bundle", conflict
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_submission,
+        "resolve_exact_operation_bundle",
+        lambda _operation_id: (
+            temporal_worker_module.ingress_submission.PreparedProvisioningSubmissions(
+                operation_id=UUID(_v2_ids().operation_id),
+                runtime_submission_id=UUID(_v2_ids().runtime_submission_id),
+                ingress_submission_id=UUID(_v2_ids().ingress_submission_id),
+            )
+            if exact_bundle
+            else None
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_failure",
+        lambda *_args: calls.append("finalize"),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        prepare_local_crusher_ingress_v2(
+            ProvisionCrusherV2Input(operation_id=_v2_ids().operation_id)
+        )
+
+    assert calls == ["prepare"]
+    assert caught.value.non_retryable is exact_bundle
+    expected_code = (
+        "runtime_submission_conflict" if exact_bundle else "activity_infrastructure_failure"
+    )
+    assert caught.value.message == expected_code
+    assert list(caught.value.details) == [expected_code]
+
+
+def test_prepare_v2_pre_durable_infrastructure_failure_is_retryable_without_finalizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "secret-marker://postgres/path/provider"
+    calls: list[str] = []
+
+    def fail(_operation_id: UUID) -> object:
+        calls.append("prepare")
+        raise RuntimeError(marker)
+
+    monkeypatch.setattr(temporal_worker_module.ingress_submission, "prepare_operation_bundle", fail)
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_failure",
+        lambda *_args: calls.append("finalize"),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        prepare_local_crusher_ingress_v2(
+            ProvisionCrusherV2Input(operation_id=_v2_ids().operation_id)
+        )
+
+    assert calls == ["prepare"]
+    _assert_sanitized_retryable_activity_error(caught.value, marker)
+
+
+def _v2_ids() -> ProvisioningSubmissionIds:
+    return ProvisioningSubmissionIds(
+        operation_id="11111111-1111-4111-8111-111111111111",
+        runtime_submission_id="22222222-2222-4222-8222-222222222222",
+        ingress_submission_id="33333333-3333-4333-8333-333333333333",
+    )
+
+
+def test_apply_runtime_v2_reuses_reconciliation_and_returns_no_provider_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = _v2_ids()
+    calls: list[object] = []
+    plan = object()
+    monkeypatch.setattr(
+        temporal_worker_module.runtime_state,
+        "mark_running",
+        lambda submission_id, operation_id: calls.append((submission_id, operation_id)),
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.runtime_state,
+        "load_plan",
+        lambda submission_id: calls.append(submission_id) or plan,
+    )
+    monkeypatch.setattr(
+        temporal_worker_module,
+        "apply_runtime_plan",
+        lambda value, _docker, *, persist_submitted: (
+            calls.append(value),
+            persist_submitted("provider-marker-must-not-return"),
+        ),
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.runtime_state,
+        "persist_submitted",
+        lambda submission_id, external_id: calls.append((submission_id, external_id)),
+    )
+
+    assert apply_local_crusher_runtime_v2(ids) is None
+    assert calls == [
+        (UUID(ids.runtime_submission_id), UUID(ids.operation_id)),
+        UUID(ids.runtime_submission_id),
+        plan,
+        (UUID(ids.runtime_submission_id), "provider-marker-must-not-return"),
+    ]
+
+
+def test_preflight_v2_passes_only_ids_and_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    ids = _v2_ids()
+    calls: list[object] = []
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "preflight_local_caddy_topology",
+        lambda value: calls.append(value),
+    )
+
+    assert preflight_local_caddy_topology_activity(ids) is None
+    assert calls == [
+        temporal_worker_module.caddy_topology.ProvisioningSubmissionIds(**ids.__dict__)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("code", "retryable"),
+    [("caddy_topology_invalid", False), ("caddy_unavailable", True)],
+)
+def test_preflight_v2_maps_only_sanitized_stable_code(
+    monkeypatch: pytest.MonkeyPatch, code: str, retryable: bool
+) -> None:
+    marker = "secret-marker://docker-inspection/address/alias"
+
+    def fail(_ids: object) -> None:
+        try:
+            raise RuntimeError(marker)
+        except RuntimeError as exc:
+            raise temporal_worker_module.caddy_topology.CaddyTopologyError(code, retryable) from exc
+
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "preflight_local_caddy_topology",
+        fail,
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        preflight_local_caddy_topology_activity(_v2_ids())
+
+    assert caught.value.message == code
+    assert list(caught.value.details) == [code]
+    assert caught.value.non_retryable is not retryable
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    _assert_no_exception_marker(caught.value, marker)
+
+
+def test_preflight_v2_failure_keeps_markers_out_of_logs_and_temporal_history(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    marker = "secret-marker://container/network/endpoint/address/alias/inspection"
+
+    def fail(_ids: object) -> None:
+        try:
+            raise RuntimeError(marker)
+        except RuntimeError as exc:
+            raise temporal_worker_module.caddy_topology.CaddyTopologyError(
+                "caddy_topology_invalid", False
+            ) from exc
+
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "preflight_local_caddy_topology",
+        fail,
+    )
+
+    async def run() -> str:
+        environment = await WorkflowEnvironment.start_time_skipping()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            async with (
+                environment,
+                Worker(
+                    environment.client,
+                    task_queue="test-task12-sanitized-history",
+                    workflows=[_SanitizedActivityHistoryWorkflow],
+                    activities=[preflight_local_caddy_topology_activity],
+                    activity_executor=executor,
+                ),
+            ):
+                handle = await environment.client.start_workflow(
+                    _SanitizedActivityHistoryWorkflow.run,
+                    _v2_ids(),
+                    id="test-task12-sanitized-history",
+                    task_queue="test-task12-sanitized-history",
+                )
+                result = await handle.result()
+                history = await handle.fetch_history()
+        assert marker not in history.to_json()
+        return result
+
+    assert asyncio.run(run()) == "failed"
+    assert marker not in caplog.text
+
+
+def test_reconcile_v2_loads_route_internally_and_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = _v2_ids()
+    desired = temporal_worker_module.caddy_topology.DesiredCaddyTopology(
+        deployment_id=UUID("44444444-4444-4444-8444-444444444444"),
+        crusher_container_name="fstack-crusher-44444444444444448444444444444444",
+        public_domain="crusher.example.test",
+        docker_network="fstack-local",
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "_load_desired_state",
+        lambda value: calls.append(value) or desired,
+    )
+    config = object()
+    transport = object()
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_admin.CaddyAdminConfig,
+        "from_environ",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_admin,
+        "CaddyAdminTransport",
+        lambda value: calls.append(value) or transport,
+    )
+
+    class Admin:
+        def __init__(self, value: object) -> None:
+            calls.append(value)
+
+        def reconcile_submission(
+            self, route: object, ingress_submission_id: UUID, operation_id: UUID
+        ) -> None:
+            calls.append((route, ingress_submission_id, operation_id))
+
+    monkeypatch.setattr(temporal_worker_module.caddy_admin, "CaddyAdmin", Admin)
+
+    assert reconcile_local_caddy_ingress(ids) is None
+    assert calls == [
+        temporal_worker_module.caddy_topology.ProvisioningSubmissionIds(**ids.__dict__),
+        config,
+        transport,
+        (
+            temporal_worker_module.ingress_submission._canonical_route(
+                desired.deployment_id, desired.public_domain
+            ),
+            UUID(ids.ingress_submission_id),
+            UUID(ids.operation_id),
+        ),
+    ]
+
+
+def test_reconcile_v2_maps_unknown_ingress_state_code_to_sanitized_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "secret-marker://ingress-state/provider/path"
+    desired = temporal_worker_module.caddy_topology.DesiredCaddyTopology(
+        deployment_id=UUID("44444444-4444-4444-8444-444444444444"),
+        crusher_container_name="fstack-crusher-44444444444444448444444444444444",
+        public_domain="crusher.example.test",
+        docker_network="fstack-local",
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "_load_desired_state",
+        lambda _ids: desired,
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_admin.CaddyAdminConfig,
+        "from_environ",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_admin,
+        "CaddyAdminTransport",
+        lambda _config: object(),
+    )
+
+    class Admin:
+        def __init__(self, _transport: object) -> None:
+            pass
+
+        def reconcile_submission(self, *_args: object) -> None:
+            raise temporal_worker_module.ingress_state.IngressStateError(marker)
+
+    monkeypatch.setattr(temporal_worker_module.caddy_admin, "CaddyAdmin", Admin)
+
+    with pytest.raises(ApplicationError) as caught:
+        reconcile_local_caddy_ingress(_v2_ids())
+
+    _assert_sanitized_retryable_activity_error(caught.value, marker)
+    _assert_no_traceback_local_marker(caught.value, marker)
+
+
+def test_probe_v2_loads_host_internally_and_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    ids = _v2_ids()
+    calls: list[object] = []
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_probe,
+        "probe_ingress",
+        lambda value: calls.append(value),
+    )
+
+    assert probe_local_caddy_ingress(ids) is None
+    assert calls == [
+        temporal_worker_module.caddy_topology.ProvisioningSubmissionIds(**ids.__dict__)
+    ]
+
+
+def test_success_finalizer_v2_returns_only_operation_and_confirmed_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = _v2_ids()
+    calls: list[tuple[UUID, UUID, UUID]] = []
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_success",
+        lambda runtime_id, ingress_id, operation_id: calls.append(
+            (runtime_id, ingress_id, operation_id)
+        ),
+    )
+
+    result = finalize_local_crusher_ingress_success_v2(ids)
+
+    assert result == ProvisionCrusherV2Result(operation_id=ids.operation_id, state="confirmed")
+    assert set(result.__dict__) == {"operation_id", "state"}
+    assert calls == [
+        (
+            UUID(ids.runtime_submission_id),
+            UUID(ids.ingress_submission_id),
+            UUID(ids.operation_id),
+        )
+    ]
+
+
+def test_failure_finalizer_v2_resolves_submissions_from_operation_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operation_id = "11111111-1111-4111-8111-111111111111"
+    calls: list[tuple[UUID, str, str]] = []
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_failure",
+        lambda operation, scope, code: calls.append((operation, scope, code)),
+    )
+    failure = ProvisioningFailureV2(
+        operation_id=operation_id,
+        scope="ingress",
+        error_code="caddy_route_id_conflict",
+    )
+
+    result = finalize_local_crusher_ingress_failure_v2(failure)
+
+    assert result == ProvisionCrusherV2Result(operation_id=operation_id, state="failed")
+    assert set(failure.__dict__) == {"operation_id", "scope", "error_code"}
+    assert calls == [(UUID(operation_id), "ingress", "caddy_route_id_conflict")]
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda: prepare_local_crusher_ingress_v2(
+            ProvisionCrusherV2Input(operation_id="11111111-1111-4111-8111-111111111111 ")
+        ),
+        lambda: apply_local_crusher_runtime_v2(
+            ProvisioningSubmissionIds(
+                **{
+                    **_v2_ids().__dict__,
+                    "runtime_submission_id": "22222222222242228222222222222222",
+                }
+            )
+        ),
+        lambda: preflight_local_caddy_topology_activity(
+            ProvisioningSubmissionIds(
+                **{
+                    **_v2_ids().__dict__,
+                    "ingress_submission_id": "33333333-3333-4333-8333-333333333333 ",
+                }
+            )
+        ),
+        lambda: reconcile_local_caddy_ingress(
+            ProvisioningSubmissionIds(
+                **{**_v2_ids().__dict__, "operation_id": "11111111-1111-4111-8111-111111111111 "}
+            )
+        ),
+        lambda: probe_local_caddy_ingress(
+            ProvisioningSubmissionIds(
+                **{
+                    **_v2_ids().__dict__,
+                    "runtime_submission_id": "22222222-2222-4222-8222-222222222222 ",
+                }
+            )
+        ),
+        lambda: finalize_local_crusher_ingress_success_v2(
+            ProvisioningSubmissionIds(
+                **{
+                    **_v2_ids().__dict__,
+                    "ingress_submission_id": "33333333333343338333333333333333",
+                }
+            )
+        ),
+        lambda: finalize_local_crusher_ingress_failure_v2(
+            ProvisioningFailureV2(
+                operation_id="11111111-1111-4111-8111-111111111111 ",
+                scope="runtime",
+                error_code="docker_spec_conflict",
+            )
+        ),
+    ],
+)
+def test_v2_activities_reject_noncanonical_uuid_payloads_before_dependencies(invoke) -> None:
+    with pytest.raises(ApplicationError) as caught:
+        invoke()
+
+    assert caught.value.non_retryable is True
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        lambda marker: prepare_local_crusher_ingress_v2(
+            ProvisionCrusherV2Input(operation_id=marker)
+        ),
+        lambda marker: apply_local_crusher_runtime_v2(
+            ProvisioningSubmissionIds(
+                operation_id=marker,
+                runtime_submission_id=_v2_ids().runtime_submission_id,
+                ingress_submission_id=_v2_ids().ingress_submission_id,
+            )
+        ),
+        lambda marker: preflight_local_caddy_topology_activity(
+            ProvisioningSubmissionIds(
+                operation_id=marker,
+                runtime_submission_id=_v2_ids().runtime_submission_id,
+                ingress_submission_id=_v2_ids().ingress_submission_id,
+            )
+        ),
+        lambda marker: reconcile_local_caddy_ingress(
+            ProvisioningSubmissionIds(
+                operation_id=marker,
+                runtime_submission_id=_v2_ids().runtime_submission_id,
+                ingress_submission_id=_v2_ids().ingress_submission_id,
+            )
+        ),
+        lambda marker: probe_local_caddy_ingress(
+            ProvisioningSubmissionIds(
+                operation_id=marker,
+                runtime_submission_id=_v2_ids().runtime_submission_id,
+                ingress_submission_id=_v2_ids().ingress_submission_id,
+            )
+        ),
+        lambda marker: finalize_local_crusher_ingress_success_v2(
+            ProvisioningSubmissionIds(
+                operation_id=marker,
+                runtime_submission_id=_v2_ids().runtime_submission_id,
+                ingress_submission_id=_v2_ids().ingress_submission_id,
+            )
+        ),
+        lambda marker: finalize_local_crusher_ingress_failure_v2(
+            ProvisioningFailureV2(
+                operation_id=marker,
+                scope="runtime",
+                error_code="docker_spec_conflict",
+            )
+        ),
+    ],
+)
+def test_v2_invalid_uuid_payloads_are_absent_from_worker_traceback_locals(invoke) -> None:
+    marker = "secret-marker://provider/token"
+
+    with pytest.raises(ApplicationError) as caught:
+        invoke(marker)
+
+    _assert_no_exception_marker(caught.value, marker)
+    _assert_no_traceback_local_marker(caught.value, marker)
+
+
+@pytest.mark.parametrize(
+    ("dependency", "invoke"),
+    [
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.runtime_state, "mark_running", fail
+            ),
+            lambda: apply_local_crusher_runtime_v2(_v2_ids()),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.ingress_state, "finalize_provisioning_success", fail
+            ),
+            lambda: finalize_local_crusher_ingress_success_v2(_v2_ids()),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.ingress_state, "finalize_provisioning_failure", fail
+            ),
+            lambda: finalize_local_crusher_ingress_failure_v2(
+                ProvisioningFailureV2(
+                    operation_id=_v2_ids().operation_id,
+                    scope="runtime",
+                    error_code="docker_spec_conflict",
+                )
+            ),
+        ),
+    ],
+)
+def test_v2_runtime_and_finalizers_sanitize_unexpected_infrastructure_failure(
+    monkeypatch: pytest.MonkeyPatch, dependency, invoke
+) -> None:
+    marker = "secret-marker://provider/network/path/fingerprint"
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(marker)
+
+    dependency(monkeypatch, fail)
+
+    with pytest.raises(ApplicationError) as caught:
+        invoke()
+
+    _assert_sanitized_retryable_activity_error(caught.value, marker)
+
+
+@pytest.mark.parametrize(
+    ("dependency", "invoke", "code"),
+    [
+        (
+            "finalize_provisioning_success",
+            lambda: finalize_local_crusher_ingress_success_v2(_v2_ids()),
+            "provisioning_success_state_invalid",
+        ),
+        (
+            "finalize_provisioning_failure",
+            lambda: finalize_local_crusher_ingress_failure_v2(
+                ProvisioningFailureV2(
+                    operation_id=_v2_ids().operation_id,
+                    scope="ingress",
+                    error_code="caddy_route_id_conflict",
+                )
+            ),
+            "provisioning_failure_conflict",
+        ),
+    ],
+)
+def test_v2_finalizer_state_conflicts_are_sanitized_nonretryable(
+    monkeypatch: pytest.MonkeyPatch, dependency: str, invoke, code: str
+) -> None:
+    marker = "secret-marker://state/provider/path"
+
+    def conflict(*_args: object) -> None:
+        try:
+            raise RuntimeError(marker)
+        except RuntimeError as exc:
+            raise temporal_worker_module.ingress_state.IngressStateError(code) from exc
+
+    monkeypatch.setattr(temporal_worker_module.ingress_state, dependency, conflict)
+
+    with pytest.raises(ApplicationError) as caught:
+        invoke()
+
+    assert caught.value.non_retryable is True
+    assert caught.value.message == code
+    assert list(caught.value.details) == [code]
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    _assert_no_exception_marker(caught.value, marker)
+
+
+def test_v2_failure_finalizer_maps_state_resolution_to_retryable_infrastructure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_failure",
+        lambda *_args: (_ for _ in ()).throw(
+            temporal_worker_module.ingress_state.IngressStateError(
+                "provisioning_failure_state_resolution"
+            )
+        ),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        finalize_local_crusher_ingress_failure_v2(
+            ProvisioningFailureV2(
+                operation_id=_v2_ids().operation_id,
+                scope="runtime",
+                error_code="docker_spec_conflict",
+            )
+        )
+
+    _assert_sanitized_retryable_activity_error(
+        caught.value, "provisioning_failure_state_resolution"
+    )
+
+
+@pytest.mark.parametrize(
+    ("dependency", "invoke"),
+    [
+        (
+            "finalize_provisioning_success",
+            lambda: finalize_local_crusher_ingress_success_v2(_v2_ids()),
+        ),
+        (
+            "finalize_provisioning_failure",
+            lambda: finalize_local_crusher_ingress_failure_v2(
+                ProvisioningFailureV2(
+                    operation_id=_v2_ids().operation_id,
+                    scope="runtime",
+                    error_code="docker_spec_conflict",
+                )
+            ),
+        ),
+    ],
+)
+def test_v2_finalizers_map_unknown_state_codes_to_sanitized_retryable_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, dependency: str, invoke
+) -> None:
+    marker = "secret-marker://provider/endpoint/path"
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        dependency,
+        lambda *_args: (_ for _ in ()).throw(
+            temporal_worker_module.ingress_state.IngressStateError(marker)
+        ),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        invoke()
+
+    _assert_sanitized_retryable_activity_error(caught.value, marker)
+
+
+def test_reconcile_v2_rejects_foreign_caddy_error_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "secret-marker://foreign-caddy/provider/endpoint"
+
+    class ForeignCode(StrEnum):
+        MARKER = marker
+
+    desired = temporal_worker_module.caddy_topology.DesiredCaddyTopology(
+        deployment_id=UUID("44444444-4444-4444-8444-444444444444"),
+        crusher_container_name="fstack-crusher-44444444444444448444444444444444",
+        public_domain="crusher.example.test",
+        docker_network="fstack-local",
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "_load_desired_state",
+        lambda _ids: desired,
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_admin.CaddyAdminConfig,
+        "from_environ",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_admin,
+        "CaddyAdminTransport",
+        lambda _config: object(),
+    )
+
+    class Admin:
+        def __init__(self, _transport: object) -> None:
+            pass
+
+        def reconcile_submission(self, *_args: object) -> None:
+            raise temporal_worker_module.caddy_admin.CaddyAdminError(
+                cast(temporal_worker_module.caddy_admin.CaddyAdminErrorCode, ForeignCode.MARKER)
+            )
+
+    monkeypatch.setattr(temporal_worker_module.caddy_admin, "CaddyAdmin", Admin)
+
+    with pytest.raises(ApplicationError) as caught:
+        reconcile_local_caddy_ingress(_v2_ids())
+
+    assert caught.value.message == "caddy_unavailable"
+    assert caught.value.non_retryable is False
+    _assert_no_exception_marker(caught.value, marker)
+    _assert_no_traceback_local_marker(caught.value, marker)
+
+
+def test_failure_finalizer_v2_bounds_error_code_and_discards_payload_locals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "secret_provider_token_123"
+    calls: list[str] = []
+
+    def fail(_operation_id: UUID, _scope: str, error_code: str) -> None:
+        calls.append(error_code)
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_failure",
+        fail,
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        finalize_local_crusher_ingress_failure_v2(
+            ProvisioningFailureV2(
+                operation_id=_v2_ids().operation_id,
+                scope="runtime",
+                error_code=marker,
+            )
+        )
+
+    assert calls == ["provisioning_failed"]
+    _assert_sanitized_retryable_activity_error(caught.value, marker)
+    _assert_no_traceback_local_marker(caught.value, marker)
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["secret_source_not_configured", "provider_identity_conflict"],
+)
+def test_failure_finalizer_v2_preserves_known_runtime_state_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_failure",
+        lambda _operation_id, _scope, received: calls.append(received),
+    )
+
+    result = finalize_local_crusher_ingress_failure_v2(
+        ProvisioningFailureV2(
+            operation_id=_v2_ids().operation_id,
+            scope="runtime",
+            error_code=error_code,
+        )
+    )
+
+    assert calls == [error_code]
+    assert result.state == "failed"
+
+
+@pytest.mark.parametrize(
+    ("dependency", "invoke", "exception_factory"),
+    [
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.ingress_submission, "prepare_operation_bundle", fail
+            ),
+            lambda: prepare_local_crusher_ingress_v2(
+                ProvisionCrusherV2Input(operation_id=_v2_ids().operation_id)
+            ),
+            lambda marker: (
+                temporal_worker_module.ingress_submission.ProvisioningSubmissionConflictError(
+                    marker
+                )
+            ),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.runtime_state, "mark_running", fail
+            ),
+            lambda: apply_local_crusher_runtime_v2(_v2_ids()),
+            lambda marker: temporal_worker_module.runtime_state.RuntimeStateError(marker),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.caddy_topology, "preflight_local_caddy_topology", fail
+            ),
+            lambda: preflight_local_caddy_topology_activity(_v2_ids()),
+            lambda marker: temporal_worker_module.caddy_topology.CaddyTopologyError(marker, False),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.caddy_topology, "_load_desired_state", fail
+            ),
+            lambda: reconcile_local_caddy_ingress(_v2_ids()),
+            lambda marker: temporal_worker_module.caddy_topology.CaddyTopologyError(marker, False),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.ingress_probe, "probe_ingress", fail
+            ),
+            lambda: probe_local_caddy_ingress(_v2_ids()),
+            lambda marker: temporal_worker_module.ingress_probe.IngressProbeError(marker, False),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.ingress_state, "finalize_provisioning_success", fail
+            ),
+            lambda: finalize_local_crusher_ingress_success_v2(_v2_ids()),
+            lambda marker: temporal_worker_module.ingress_state.IngressStateError(marker),
+        ),
+        (
+            lambda monkeypatch, fail: monkeypatch.setattr(
+                temporal_worker_module.ingress_state, "finalize_provisioning_failure", fail
+            ),
+            lambda: finalize_local_crusher_ingress_failure_v2(
+                ProvisioningFailureV2(
+                    operation_id=_v2_ids().operation_id,
+                    scope="runtime",
+                    error_code="docker_spec_conflict",
+                )
+            ),
+            lambda marker: temporal_worker_module.ingress_state.IngressStateError(marker),
+        ),
+    ],
+)
+def test_v2_unknown_domain_codes_become_generic_retryable_failures(
+    monkeypatch: pytest.MonkeyPatch, dependency, invoke, exception_factory
+) -> None:
+    marker = "secret-marker://unknown/provider/endpoint"
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise exception_factory(marker)
+
+    dependency(monkeypatch, fail)
+
+    with pytest.raises(ApplicationError) as caught:
+        invoke()
+
+    assert caught.value.non_retryable is False
+    assert marker not in str(caught.value)
+    assert marker not in repr(list(caught.value.details))
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    _assert_no_traceback_local_marker(caught.value, marker)
+
+
+@pytest.mark.parametrize(
+    ("setup", "invoke", "expected_type", "expected_code"),
+    [
+        (
+            lambda monkeypatch, marker: monkeypatch.setattr(
+                temporal_worker_module.ingress_submission,
+                "prepare_operation_bundle",
+                lambda *_args: (_ for _ in ()).throw(
+                    temporal_worker_module.ingress_submission.ProvisioningSubmissionConflictError(
+                        marker
+                    )
+                ),
+            ),
+            lambda: prepare_local_crusher_ingress_v2(
+                ProvisionCrusherV2Input(operation_id=_v2_ids().operation_id)
+            ),
+            "ActivityInfrastructureFailure",
+            "activity_infrastructure_failure",
+        ),
+        (
+            lambda monkeypatch, marker: monkeypatch.setattr(
+                temporal_worker_module.caddy_topology,
+                "preflight_local_caddy_topology",
+                lambda *_args: (_ for _ in ()).throw(
+                    temporal_worker_module.caddy_topology.CaddyTopologyError(marker, False)
+                ),
+            ),
+            lambda: preflight_local_caddy_topology_activity(_v2_ids()),
+            "CaddyTopologyFailed",
+            "caddy_unavailable",
+        ),
+        (
+            lambda monkeypatch, marker: monkeypatch.setattr(
+                temporal_worker_module.ingress_probe,
+                "probe_ingress",
+                lambda *_args: (_ for _ in ()).throw(
+                    temporal_worker_module.ingress_probe.IngressProbeError(marker, False)
+                ),
+            ),
+            lambda: probe_local_caddy_ingress(_v2_ids()),
+            "CaddyIngressProbeFailed",
+            "ingress_readiness_unavailable",
+        ),
+        (
+            lambda monkeypatch, marker: monkeypatch.setattr(
+                temporal_worker_module.runtime_state,
+                "mark_running",
+                lambda *_args: (_ for _ in ()).throw(
+                    temporal_worker_module.runtime_state.RuntimeStateError(marker)
+                ),
+            ),
+            lambda: apply_local_crusher_runtime_v2(_v2_ids()),
+            "ActivityInfrastructureFailure",
+            "activity_infrastructure_failure",
+        ),
+        (
+            lambda monkeypatch, marker: (
+                monkeypatch.setattr(
+                    temporal_worker_module.runtime_state, "mark_running", lambda *_args: None
+                ),
+                monkeypatch.setattr(
+                    temporal_worker_module.runtime_state, "load_plan", lambda *_args: object()
+                ),
+                monkeypatch.setattr(
+                    temporal_worker_module,
+                    "apply_runtime_plan",
+                    lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        temporal_worker_module.RuntimeApplicationError(marker, retryable=False)
+                    ),
+                ),
+            ),
+            lambda: apply_local_crusher_runtime_v2(_v2_ids()),
+            "ActivityInfrastructureFailure",
+            "activity_infrastructure_failure",
+        ),
+    ],
+)
+def test_v2_activities_map_unknown_domain_codes_to_generic_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    setup,
+    invoke,
+    expected_type: str,
+    expected_code: str,
+) -> None:
+    marker = "secret-marker://unknown/provider/endpoint"
+    setup(monkeypatch, marker)
+
+    with pytest.raises(ApplicationError) as caught:
+        invoke()
+
+    assert caught.value.non_retryable is False
+    assert caught.value.type == expected_type
+    assert caught.value.message == expected_code
+    assert list(caught.value.details) == [expected_code]
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    _assert_no_exception_marker(caught.value, marker)
+    _assert_no_traceback_local_marker(caught.value, marker)
+
+
+@pytest.mark.parametrize(
+    ("code", "reported_retryable", "expected_nonretryable"),
+    [
+        ("docker_spec_conflict", True, True),
+        ("docker_unavailable", False, False),
+    ],
+)
+def test_runtime_v2_uses_closed_retryability_for_known_provider_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    reported_retryable: bool,
+    expected_nonretryable: bool,
+) -> None:
+    monkeypatch.setattr(temporal_worker_module.runtime_state, "mark_running", lambda *_args: None)
+    monkeypatch.setattr(temporal_worker_module.runtime_state, "load_plan", lambda *_args: object())
+    monkeypatch.setattr(
+        temporal_worker_module,
+        "apply_runtime_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            temporal_worker_module.RuntimeApplicationError(code, retryable=reported_retryable)
+        ),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        apply_local_crusher_runtime_v2(_v2_ids())
+
+    assert caught.value.message == code
+    assert list(caught.value.details) == [code]
+    assert caught.value.non_retryable is expected_nonretryable
+
+
+def _assert_no_traceback_local_marker(exc: BaseException, marker: str) -> None:
+    traceback = exc.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename.endswith("fstack/temporal_worker.py"):
+            assert marker not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+class _MarkerPlan:
+    def __repr__(self) -> str:
+        return "secret-marker://container/network/fingerprint/provider"
+
+
+def test_v2_runtime_failure_discards_provider_plan_from_traceback_locals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "secret-marker://container/network/fingerprint/provider"
+    monkeypatch.setattr(temporal_worker_module.runtime_state, "mark_running", lambda *_args: None)
+    monkeypatch.setattr(
+        temporal_worker_module.runtime_state, "load_plan", lambda *_args: _MarkerPlan()
+    )
+    monkeypatch.setattr(
+        temporal_worker_module,
+        "apply_runtime_plan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            temporal_worker_module.RuntimeApplicationError("docker_spec_conflict", retryable=False)
+        ),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        apply_local_crusher_runtime_v2(_v2_ids())
+
+    _assert_no_traceback_local_marker(caught.value, marker)
+
+
+def test_v2_reconcile_failure_discards_route_and_host_from_traceback_locals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "secret-marker.example.test"
+    desired = temporal_worker_module.caddy_topology.DesiredCaddyTopology(
+        deployment_id=UUID("44444444-4444-4444-8444-444444444444"),
+        crusher_container_name="fstack-crusher-44444444444444448444444444444444",
+        public_domain=marker,
+        docker_network="fstack-local",
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "_load_desired_state",
+        lambda _ids: desired,
+    )
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_admin.CaddyAdminConfig,
+        "from_environ",
+        lambda: (_ for _ in ()).throw(RuntimeError(marker)),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        reconcile_local_caddy_ingress(_v2_ids())
+
+    _assert_no_traceback_local_marker(caught.value, marker)
 
 
 def _submission(operation_id: UUID, *, state: str = "prepared") -> RuntimeSubmission:

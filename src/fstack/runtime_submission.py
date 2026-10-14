@@ -57,6 +57,14 @@ class OperationNotClaimableError(RuntimeError):
     """The exact operation cannot produce or replay a runtime submission."""
 
 
+class RuntimeSubmissionConflictError(OperationNotClaimableError):
+    """A durable runtime submission disagrees with the exact desired execution spec."""
+
+
+class RuntimeSubmissionStateError(RuntimeError):
+    """Runtime submission preparation could not establish a safe durable state."""
+
+
 MIGRATION_LAUNCHER_V1 = """import json, os, subprocess, sys
 with open('/run/secrets/fstack/owner.json', encoding='utf-8') as stream:
     bundle = json.load(stream)
@@ -324,7 +332,12 @@ def _result(row: Mapping[str, Any]) -> PreparedRuntimeSubmission:
     )
 
 
-def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmission:
+def _prepare(
+    connection: Connection,
+    operation_id: UUID,
+    *,
+    reject_confirmed_drift: bool = False,
+) -> PreparedRuntimeSubmission:
     operation = (
         connection.execute(
             text(
@@ -379,7 +392,7 @@ def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmi
         .one_or_none()
     )
     if existing is not None:
-        if existing["state"] != "confirmed" and (
+        if (existing["state"] != "confirmed" or reject_confirmed_drift) and (
             existing["provider"] != PROVIDER
             or existing["generation"] != GENERATION
             or existing["submission_key"] != key
@@ -387,7 +400,7 @@ def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmi
             or existing["api_container_name"] != api_name
             or existing["migration_container_name"] != migration_name
         ):
-            raise OperationNotClaimableError(
+            raise RuntimeSubmissionConflictError(
                 "sealed runtime submission does not match desired execution spec"
             )
         return _result(dict(existing))
@@ -395,7 +408,7 @@ def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmi
         raise OperationNotClaimableError("operation has no replayable runtime submission")
 
     submission_id = uuid4()
-    connection.execute(
+    inserted_submission_id = connection.execute(
         text(
             """
             INSERT INTO runtime_submissions (
@@ -407,6 +420,7 @@ def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmi
                 :generation, :submission_key, :spec_fingerprint, :api_container_name,
                 :migration_container_name, 'prepared'
             )
+            RETURNING id
             """
         ),
         {
@@ -421,7 +435,9 @@ def _prepare(connection: Connection, operation_id: UUID) -> PreparedRuntimeSubmi
             "api_container_name": api_name,
             "migration_container_name": migration_name,
         },
-    )
+    ).scalar_one_or_none()
+    if inserted_submission_id != submission_id:
+        raise RuntimeSubmissionStateError("runtime_submission_prepare_failed")
     return PreparedRuntimeSubmission(
         submission_id=submission_id,
         operation_id=operation_id,
