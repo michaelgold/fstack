@@ -468,3 +468,291 @@ def finalize_provisioning_success(
         error_code = "provisioning_success_infrastructure"
     if error_code is not None:
         raise IngressStateError(error_code) from None
+
+
+def _failure_bundle_valid(
+    operation: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    ingress: Mapping[str, Any],
+    desired: Mapping[str, Any],
+) -> bool:
+    operation_id = operation["id"]
+    organization_id = operation["organization_id"]
+    deployment_id = operation["deployment_id"]
+    identities = (
+        operation_id,
+        organization_id,
+        deployment_id,
+        runtime["id"],
+        runtime["operation_id"],
+        runtime["organization_id"],
+        runtime["deployment_id"],
+        ingress["id"],
+        ingress["operation_id"],
+        ingress["organization_id"],
+        ingress["deployment_id"],
+        desired["deployment_id"],
+        desired["deployment_organization_id"],
+    )
+    if any(type(value) is not UUID for value in identities):
+        return False
+    if (
+        runtime["operation_id"] != operation_id
+        or ingress["operation_id"] != operation_id
+        or runtime["organization_id"] != organization_id
+        or ingress["organization_id"] != organization_id
+        or runtime["deployment_id"] != deployment_id
+        or ingress["deployment_id"] != deployment_id
+        or desired["deployment_id"] != deployment_id
+        or desired["deployment_organization_id"] != organization_id
+    ):
+        return False
+    api_name, migration_name = runtime_submission._container_names(deployment_id)
+    route = ingress_submission._canonical_route(deployment_id, desired["public_domain"])
+    return bool(
+        runtime["provider"] == runtime_submission.PROVIDER
+        and runtime["generation"] == runtime_submission.GENERATION
+        and runtime["submission_key"] == runtime_submission._submission_key(operation_id)
+        and type(runtime["spec_fingerprint"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", runtime["spec_fingerprint"]) is not None
+        and runtime["api_container_name"] == api_name
+        and runtime["migration_container_name"] == migration_name
+        and ingress["provider"] == ingress_submission.PROVIDER
+        and ingress["generation"] == ingress_submission.GENERATION
+        and ingress["submission_key"] == ingress_submission._submission_key(operation_id)
+        and ingress["route_id"] == ingress_submission._route_id(deployment_id)
+        and ingress["route_fingerprint"] == ingress_submission._route_fingerprint(route)
+    )
+
+
+def _finalize_provisioning_failure(operation_id: UUID, scope: str, error_code: str) -> None:
+    engine = _engine()
+    try:
+        with engine.begin() as connection:
+            operation_selected = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT id, organization_id, deployment_id, state, actor_principal,
+                               completed_at, updated_at, last_error_code
+                        FROM provisioning_operations
+                        WHERE id=:operation_id
+                        FOR UPDATE
+                        """
+                    ),
+                    {"operation_id": operation_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if operation_selected is None:
+                raise IngressStateError("provisioning_failure_state_resolution")
+            operation: dict[str, Any] = dict(operation_selected)
+            runtime_selected = (
+                connection.execute(
+                    text(
+                        "SELECT * FROM runtime_submissions "
+                        "WHERE operation_id=:operation_id FOR UPDATE"
+                    ),
+                    {"operation_id": operation_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if runtime_selected is None:
+                raise IngressStateError("provisioning_failure_state_resolution")
+            runtime: dict[str, Any] = dict(runtime_selected)
+            ingress_selected = (
+                connection.execute(
+                    text(
+                        "SELECT * FROM ingress_submissions "
+                        "WHERE operation_id=:operation_id FOR UPDATE"
+                    ),
+                    {"operation_id": operation_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if ingress_selected is None:
+                raise IngressStateError("provisioning_failure_state_resolution")
+            ingress: dict[str, Any] = dict(ingress_selected)
+            desired_selected = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT deployment.id AS deployment_id,
+                               deployment.organization_id AS deployment_organization_id,
+                               deployment.public_domain
+                        FROM deployments AS deployment
+                        WHERE deployment.id=:deployment_id
+                        FOR SHARE OF deployment
+                        """
+                    ),
+                    {"deployment_id": operation["deployment_id"]},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if desired_selected is None:
+                raise IngressStateError("provisioning_failure_state_resolution")
+            desired: dict[str, Any] = dict(desired_selected)
+            if not _failure_bundle_valid(operation, runtime, ingress, desired):
+                raise IngressStateError("provisioning_failure_state_resolution")
+            expected_payload = {
+                "runtime_submission_id": str(runtime["id"]),
+                "ingress_submission_id": str(ingress["id"]),
+                "error_code": error_code,
+            }
+            audits = (
+                connection.execute(
+                    text(
+                        "SELECT payload FROM audit_events "
+                        "WHERE operation_id=:operation_id "
+                        "AND event_type='provisioning.failed' FOR SHARE"
+                    ),
+                    {"operation_id": operation_id},
+                )
+                .mappings()
+                .all()
+            )
+            terminal_runtime_scope = (
+                operation["state"] == "failed"
+                and operation["last_error_code"] == error_code
+                and runtime["state"] == "failed"
+                and runtime["failure_code"] == error_code
+                and ingress["state"] == "failed"
+                and ingress["failure_code"] == error_code
+            )
+            terminal_ingress_scope = (
+                operation["state"] == "failed"
+                and operation["last_error_code"] == error_code
+                and runtime["state"] == "submitted"
+                and ingress["state"] == "failed"
+                and ingress["failure_code"] == error_code
+            )
+            if terminal_runtime_scope or terminal_ingress_scope:
+                exact_scope = (scope == "runtime" and terminal_runtime_scope) or (
+                    scope == "ingress" and terminal_ingress_scope
+                )
+                if not exact_scope or len(audits) != 1 or audits[0]["payload"] != expected_payload:
+                    raise IngressStateError("provisioning_failure_conflict")
+                return
+            if operation["state"] != "running" or audits:
+                raise IngressStateError("provisioning_failure_conflict")
+            if scope == "runtime":
+                if (
+                    runtime["state"] not in {"prepared", "submitted"}
+                    or ingress["state"] != "prepared"
+                ):
+                    raise IngressStateError("provisioning_failure_conflict")
+                runtime_updated = connection.execute(
+                    text(
+                        """
+                        WITH boundary AS (SELECT clock_timestamp() AS now)
+                        UPDATE runtime_submissions
+                        SET state='failed', failed_at=boundary.now, failure_code=:error_code
+                        FROM boundary
+                        WHERE id=:submission_id AND state IN ('prepared', 'submitted')
+                        RETURNING runtime_submissions.id
+                        """
+                    ),
+                    {"submission_id": runtime["id"], "error_code": error_code},
+                ).scalar_one_or_none()
+                if runtime_updated != runtime["id"]:
+                    raise IngressStateError("provisioning_failure_state_resolution")
+                ingress_update = text(
+                    """
+                    WITH boundary AS (SELECT clock_timestamp() AS now)
+                    UPDATE ingress_submissions
+                    SET state='failed', failed_at=boundary.now, failure_code=:error_code
+                    FROM boundary
+                    WHERE id=:submission_id AND state='prepared'
+                    RETURNING ingress_submissions.id
+                    """
+                )
+            else:
+                if runtime["state"] != "submitted" or ingress["state"] not in {
+                    "prepared",
+                    "submitted",
+                }:
+                    raise IngressStateError("provisioning_failure_conflict")
+                ingress_update = text(
+                    """
+                    WITH boundary AS (SELECT clock_timestamp() AS now)
+                    UPDATE ingress_submissions
+                    SET state='failed', failed_at=boundary.now, failure_code=:error_code
+                    FROM boundary
+                    WHERE id=:submission_id AND state IN ('prepared', 'submitted')
+                    RETURNING ingress_submissions.id
+                    """
+                )
+            ingress_updated = connection.execute(
+                ingress_update,
+                {"submission_id": ingress["id"], "error_code": error_code},
+            ).scalar_one_or_none()
+            if ingress_updated != ingress["id"]:
+                raise IngressStateError("provisioning_failure_state_resolution")
+            operation_updated = connection.execute(
+                text(
+                    """
+                    WITH boundary AS (SELECT clock_timestamp() AS now)
+                    UPDATE provisioning_operations
+                    SET state='failed', completed_at=boundary.now, updated_at=boundary.now,
+                        last_error_code=:error_code
+                    FROM boundary
+                    WHERE id=:operation_id AND state='running'
+                    RETURNING provisioning_operations.id
+                    """
+                ),
+                {"operation_id": operation_id, "error_code": error_code},
+            ).scalar_one_or_none()
+            if operation_updated != operation_id:
+                raise IngressStateError("provisioning_failure_state_resolution")
+            audit_id = uuid4()
+            audit_inserted = connection.execute(
+                text(
+                    """
+                    INSERT INTO audit_events (
+                        id, organization_id, operation_id, event_type, actor_principal, payload
+                    ) VALUES (
+                        :id, :organization_id, :operation_id, 'provisioning.failed',
+                        :actor_principal, CAST(:payload AS jsonb)
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "id": audit_id,
+                    "organization_id": operation["organization_id"],
+                    "operation_id": operation_id,
+                    "actor_principal": operation["actor_principal"],
+                    "payload": json.dumps(expected_payload, sort_keys=True, separators=(",", ":")),
+                },
+            ).scalar_one_or_none()
+            if audit_inserted != audit_id:
+                raise IngressStateError("provisioning_failure_state_resolution")
+    finally:
+        engine.dispose()
+
+
+def finalize_provisioning_failure(operation_id: UUID, scope: str, error_code: str) -> None:
+    """Fail one exact v2 bundle by canonical operation identity and durable scope."""
+    if type(operation_id) is not UUID or type(scope) is not str or scope not in {
+        "runtime",
+        "ingress",
+    }:
+        operation_id = None  # type: ignore[assignment]
+        scope = ""  # avoid retaining caller-controlled text in traceback locals
+        error_code = ""  # avoid retaining caller-controlled text in traceback locals
+        raise IngressStateError("provisioning_failure_invalid_request") from None
+    if type(error_code) is not str or _ERROR_CODE.fullmatch(error_code) is None:
+        error_code = "provisioning_failed"
+    final_error: str | None = None
+    try:
+        _finalize_provisioning_failure(operation_id, scope, error_code)
+    except IngressStateError as error:
+        final_error = error.code
+    except Exception:
+        final_error = "provisioning_failure_infrastructure"
+    if final_error is not None:
+        raise IngressStateError(final_error) from None

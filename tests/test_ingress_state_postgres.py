@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect as pyinspect
 import logging
 import queue
 import threading
@@ -47,18 +48,17 @@ def _wait_for_postgres_lock_wait(engine: Engine, application_name: str) -> None:
     raise AssertionError(f"{application_name} did not reach a PostgreSQL lock wait")
 
 
-def _prepared_bundle(
+def _operation_id(
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
     *,
     idempotency_key: str,
-):
-    from fstack import api
-    from fstack.ingress_submission import prepare_operation_bundle
-
+) -> UUID:
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
+    from fstack import api
+
     monkeypatch.setattr(api, "create_engine", lambda *_args, **_kwargs: engine)
     with TestClient(create_app()) as client:
         response = client.post(
@@ -70,7 +70,20 @@ def _prepared_bundle(
             json=VALID_BODY,
         )
     response.raise_for_status()
-    return prepare_operation_bundle(response.json()["operation_id"])
+    return UUID(response.json()["operation_id"])
+
+
+def _prepared_bundle(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    idempotency_key: str,
+):
+    from fstack.ingress_submission import prepare_operation_bundle
+
+    return prepare_operation_bundle(
+        _operation_id(engine, monkeypatch, idempotency_key=idempotency_key)
+    )
 
 
 def _ingress_row(engine: Engine, submission_id: UUID) -> dict[str, object]:
@@ -127,6 +140,53 @@ def _joint_success_snapshot(engine: Engine, operation_id: UUID) -> dict[str, obj
             {"operation_id": operation_id},
         ).scalar_one()
     return {**dict(row), "success_audit_count": audit_count}
+
+
+def _joint_failure_snapshot(engine: Engine, operation_id: UUID) -> dict[str, object]:
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text(
+                    """
+                    SELECT operation.state AS operation_state,
+                           operation.completed_at, operation.updated_at,
+                           operation.last_error_code,
+                           runtime.id AS runtime_submission_id,
+                           runtime.state AS runtime_state,
+                           runtime.external_id AS runtime_external_id,
+                           runtime.submitted_at AS runtime_submitted_at,
+                           runtime.failed_at AS runtime_failed_at,
+                           runtime.failure_code AS runtime_failure_code,
+                           ingress.id AS ingress_submission_id,
+                           ingress.state AS ingress_state,
+                           ingress.submitted_at AS ingress_submitted_at,
+                           ingress.failed_at AS ingress_failed_at,
+                           ingress.failure_code AS ingress_failure_code
+                    FROM provisioning_operations AS operation
+                    LEFT JOIN runtime_submissions AS runtime
+                      ON runtime.operation_id=operation.id
+                    LEFT JOIN ingress_submissions AS ingress
+                      ON ingress.operation_id=operation.id
+                    WHERE operation.id=:operation_id
+                    """
+                ),
+                {"operation_id": operation_id},
+            )
+            .mappings()
+            .one()
+        )
+        audits = (
+            connection.execute(
+                text(
+                    "SELECT payload FROM audit_events WHERE operation_id=:operation_id "
+                    "AND event_type='provisioning.failed'"
+                ),
+                {"operation_id": operation_id},
+            )
+            .mappings()
+            .all()
+        )
+    return {**dict(row), "failure_audits": [dict(audit) for audit in audits]}
 
 
 def _assert_error(
@@ -392,6 +452,16 @@ class _HostileIdentifier:
         return self._marker
 
 
+def test_finalize_provisioning_failure_public_api_accepts_only_operation_scope_and_code() -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+
+    assert tuple(pyinspect.signature(finalize_provisioning_failure).parameters) == (
+        "operation_id",
+        "scope",
+        "error_code",
+    )
+
+
 @pytest.mark.parametrize("argument", ["submission", "operation"])
 @pytest.mark.parametrize("kind", ["non-uuid", "uuid-subclass", "hostile"])
 def test_runtime_identifiers_require_exact_uuid_before_engine_creation(
@@ -592,6 +662,608 @@ def test_finalize_provisioning_success_confirms_joint_bundle_atomically(
             }
         }
     ]
+
+
+@pytest.mark.postgres
+def test_finalize_provisioning_failure_runtime_scope_fails_complete_bundle_atomically(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="joint-failure-runtime-happy-path",
+    )
+
+    finalize_provisioning_failure(prepared.operation_id, "runtime", "runtime_unavailable")
+
+    snapshot = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    assert snapshot["runtime_state"] == "failed"
+    assert snapshot["runtime_failed_at"] is not None
+    assert snapshot["runtime_failure_code"] == "runtime_unavailable"
+    assert snapshot["ingress_state"] == "failed"
+    assert snapshot["ingress_failed_at"] is not None
+    assert snapshot["ingress_failure_code"] == "runtime_unavailable"
+    assert snapshot["operation_state"] == "failed"
+    assert snapshot["completed_at"] is not None
+    assert snapshot["last_error_code"] == "runtime_unavailable"
+    assert snapshot["failure_audits"] == [
+        {
+            "payload": {
+                "runtime_submission_id": str(prepared.runtime_submission_id),
+                "ingress_submission_id": str(prepared.ingress_submission_id),
+                "error_code": "runtime_unavailable",
+            }
+        }
+    ]
+
+
+@pytest.mark.postgres
+def test_finalize_provisioning_failure_ingress_scope_preserves_submitted_runtime(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+    from fstack.runtime_state import persist_submitted
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="joint-failure-ingress-happy-path",
+    )
+    persist_submitted(prepared.runtime_submission_id, "docker-api-ingress-failure")
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+
+    finalize_provisioning_failure(prepared.operation_id, "ingress", "ingress_unavailable")
+
+    snapshot = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    assert snapshot["runtime_state"] == "submitted"
+    assert snapshot["runtime_external_id"] == before["runtime_external_id"]
+    assert snapshot["runtime_submitted_at"] == before["runtime_submitted_at"]
+    assert snapshot["runtime_failed_at"] is None
+    assert snapshot["runtime_failure_code"] is None
+    assert snapshot["ingress_state"] == "failed"
+    assert snapshot["ingress_failed_at"] is not None
+    assert snapshot["ingress_failure_code"] == "ingress_unavailable"
+    assert snapshot["operation_state"] == "failed"
+    assert snapshot["last_error_code"] == "ingress_unavailable"
+    assert snapshot["failure_audits"] == [
+        {
+            "payload": {
+                "runtime_submission_id": str(prepared.runtime_submission_id),
+                "ingress_submission_id": str(prepared.ingress_submission_id),
+                "error_code": "ingress_unavailable",
+            }
+        }
+    ]
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("scope", ["runtime", "ingress"])
+def test_finalize_provisioning_failure_exact_replay_has_no_timestamp_or_audit_drift(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+    from fstack.runtime_state import persist_submitted
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=f"joint-failure-replay-{scope}",
+    )
+    if scope == "ingress":
+        persist_submitted(prepared.runtime_submission_id, "docker-api-failure-replay")
+    finalize_provisioning_failure(prepared.operation_id, scope, "provider_failed")
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+
+    finalize_provisioning_failure(prepared.operation_id, scope, "provider_failed")
+
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    ("first_scope", "replay_scope", "replay_code"),
+    [
+        ("runtime", "runtime", "different_code"),
+        ("runtime", "ingress", "provider_failed"),
+        ("ingress", "ingress", "different_code"),
+        ("ingress", "runtime", "provider_failed"),
+    ],
+)
+def test_finalize_provisioning_failure_rejects_different_terminal_scope_or_code(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    first_scope: str,
+    replay_scope: str,
+    replay_code: str,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+    from fstack.runtime_state import persist_submitted
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=f"joint-failure-conflict-{first_scope}-{replay_scope}-{replay_code}",
+    )
+    if first_scope == "ingress":
+        persist_submitted(prepared.runtime_submission_id, "docker-api-failure-conflict")
+    finalize_provisioning_failure(prepared.operation_id, first_scope, "provider_failed")
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+
+    _assert_error(
+        lambda: finalize_provisioning_failure(
+            prepared.operation_id,
+            replay_scope,
+            replay_code,
+        ),
+        "provisioning_failure_conflict",
+    )
+
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("bundle_shape", ["none", "runtime-only"])
+def test_finalize_provisioning_failure_requires_complete_durable_bundle(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    bundle_shape: str,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+    from fstack.runtime_submission import prepare_operation
+
+    operation_id = _operation_id(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=f"joint-failure-partial-{bundle_shape}",
+    )
+    if bundle_shape == "runtime-only":
+        prepare_operation(operation_id)
+    with migrated_database.connect() as connection:
+        before = dict(
+            connection.execute(
+                text(
+                    "SELECT state, started_at, completed_at, updated_at, last_error_code "
+                    "FROM provisioning_operations WHERE id=:operation_id"
+                ),
+                {"operation_id": operation_id},
+            )
+            .mappings()
+            .one()
+        )
+
+    _assert_error(
+        lambda: finalize_provisioning_failure(operation_id, "runtime", "prepare_conflict"),
+        "provisioning_failure_state_resolution",
+    )
+
+    with migrated_database.connect() as connection:
+        after = dict(
+            connection.execute(
+                text(
+                    "SELECT state, started_at, completed_at, updated_at, last_error_code "
+                    "FROM provisioning_operations WHERE id=:operation_id"
+                ),
+                {"operation_id": operation_id},
+            )
+            .mappings()
+            .one()
+        )
+        failed_audits = connection.execute(
+            text(
+                "SELECT count(*) FROM audit_events WHERE operation_id=:operation_id "
+                "AND event_type='provisioning.failed'"
+            ),
+            {"operation_id": operation_id},
+        ).scalar_one()
+    assert after == before
+    assert failed_audits == 0
+
+
+@pytest.mark.postgres
+def test_finalize_provisioning_failure_rejects_relationship_mismatch_without_mutation(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="joint-failure-relationship-mismatch",
+    )
+    with migrated_database.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE ingress_submissions DROP CONSTRAINT "
+                "fk_ingress_submissions_exact_operation"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE ingress_submissions DROP CONSTRAINT "
+                "fk_ingress_submissions_deployment_org"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE ingress_submissions DISABLE TRIGGER "
+                "tr_ingress_submissions_lifecycle_guard"
+            )
+        )
+        connection.execute(
+            text("UPDATE ingress_submissions SET organization_id=:organization_id WHERE id=:id"),
+            {"organization_id": uuid4(), "id": prepared.ingress_submission_id},
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE ingress_submissions ENABLE TRIGGER "
+                "tr_ingress_submissions_lifecycle_guard"
+            )
+        )
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+
+    _assert_error(
+        lambda: finalize_provisioning_failure(
+            prepared.operation_id,
+            "runtime",
+            "provider_failed",
+        ),
+        "provisioning_failure_state_resolution",
+    )
+
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
+
+
+@pytest.mark.postgres
+def test_finalize_provisioning_failure_invalid_error_uses_bounded_fallback(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+
+    provider_marker = "Provider said secret://vault/customer and route.example"
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="joint-failure-error-fallback",
+    )
+
+    finalize_provisioning_failure(prepared.operation_id, "runtime", provider_marker)
+
+    snapshot = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    assert snapshot["runtime_failure_code"] == "provisioning_failed"
+    assert snapshot["ingress_failure_code"] == "provisioning_failed"
+    assert snapshot["last_error_code"] == "provisioning_failed"
+    assert snapshot["failure_audits"] == [
+        {
+            "payload": {
+                "runtime_submission_id": str(prepared.runtime_submission_id),
+                "ingress_submission_id": str(prepared.ingress_submission_id),
+                "error_code": "provisioning_failed",
+            }
+        }
+    ]
+    assert provider_marker not in repr(snapshot)
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("fail_statement", range(1, 10))
+def test_finalize_provisioning_failure_statement_failure_rolls_back_everything(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_statement: int,
+) -> None:
+    from fstack import ingress_state
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=f"joint-failure-rollback-{fail_statement}",
+    )
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    injected_engine = create_engine(
+        ingress_state.runtime_submission._database_url(),
+        pool_pre_ping=True,
+        hide_parameters=True,
+    )
+    calls = 0
+
+    @event.listens_for(injected_engine, "before_cursor_execute")
+    def fail_boundary(*_args: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == fail_statement:
+            raise OperationalError("statement", {}, RuntimeError("joint-failure-secret-marker"))
+
+    monkeypatch.setattr(ingress_state, "_engine", lambda: injected_engine)
+
+    _assert_sanitized_error(
+        lambda: ingress_state.finalize_provisioning_failure(
+            prepared.operation_id,
+            "runtime",
+            "provider_failed",
+        ),
+        "provisioning_failure_infrastructure",
+        marker="joint-failure-secret-marker",
+        module_name=ingress_state.__name__,
+    )
+
+    assert calls == fail_statement
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    ("target", "target_sql"),
+    [
+        ("runtime", "UPDATE runtime_submissions SET state='failed'"),
+        ("ingress", "UPDATE ingress_submissions SET state='failed'"),
+        ("operation", "UPDATE provisioning_operations SET state='failed'"),
+        (
+            "failure-audit",
+            "INSERT INTO audit_events ( id, organization_id, operation_id, event_type,",
+        ),
+    ],
+)
+def test_finalize_provisioning_failure_requires_exact_returning_identity(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    target_sql: str,
+) -> None:
+    from fstack import ingress_state
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=f"joint-failure-wrong-returning-{target}",
+    )
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    injected_engine = create_engine(
+        ingress_state.runtime_submission._database_url(),
+        pool_pre_ping=True,
+        hide_parameters=True,
+    )
+    proxy = _ReturningIdentityEngine(injected_engine, target_sql, UUID(int=0))
+    monkeypatch.setattr(ingress_state, "_engine", lambda: proxy)
+
+    _assert_error(
+        lambda: ingress_state.finalize_provisioning_failure(
+            prepared.operation_id,
+            "runtime",
+            "provider_failed",
+        ),
+        "provisioning_failure_state_resolution",
+    )
+
+    assert proxy.connection is not None
+    assert proxy.connection.matches == 1
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
+
+
+@pytest.mark.postgres
+def test_finalize_provisioning_failure_requires_failure_audit_insert(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="joint-failure-suppressed-audit",
+    )
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    with migrated_database.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE FUNCTION skip_provisioning_failed_insert() RETURNS trigger
+                LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF NEW.event_type = 'provisioning.failed' THEN RETURN NULL; END IF;
+                    RETURN NEW;
+                END
+                $$
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                CREATE TRIGGER aaa_skip_provisioning_failed_insert
+                BEFORE INSERT ON audit_events
+                FOR EACH ROW EXECUTE FUNCTION skip_provisioning_failed_insert()
+                """
+            )
+        )
+
+    try:
+        _assert_error(
+            lambda: finalize_provisioning_failure(
+                prepared.operation_id,
+                "runtime",
+                "provider_failed",
+            ),
+            "provisioning_failure_state_resolution",
+        )
+    finally:
+        with migrated_database.begin() as connection:
+            connection.execute(
+                text("DROP TRIGGER aaa_skip_provisioning_failed_insert ON audit_events")
+            )
+            connection.execute(text("DROP FUNCTION skip_provisioning_failed_insert()"))
+
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
+
+
+@pytest.mark.postgres
+def test_permanent_prepare_conflict_terminalizes_existing_exact_bundle_and_replays(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+    from fstack.ingress_submission import (
+        ProvisioningSubmissionConflictError,
+        prepare_operation_bundle,
+    )
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="joint-failure-prepare-conflict",
+    )
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "changed-after-durable-prepare")
+    with pytest.raises(ProvisioningSubmissionConflictError):
+        prepare_operation_bundle(prepared.operation_id)
+
+    finalize_provisioning_failure(prepared.operation_id, "runtime", "prepare_conflict")
+    before_replay = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    finalize_provisioning_failure(prepared.operation_id, "runtime", "prepare_conflict")
+
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before_replay
+    assert before_replay["runtime_state"] == "failed"
+    assert before_replay["ingress_state"] == "failed"
+    assert len(before_replay["failure_audits"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("operation_id", "scope"),
+    [
+        ("00000000-0000-0000-0000-000000000000", "runtime"),
+        (_UUIDSubclass(int=0), "runtime"),
+        (_HostileIdentifier("hostile-operation-marker"), "runtime"),
+        (UUID(int=0), "other"),
+        (UUID(int=0), _HostileIdentifier("hostile-scope-marker")),
+    ],
+)
+def test_finalize_provisioning_failure_requires_exact_public_identifiers_before_engine_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    operation_id: object,
+    scope: object,
+) -> None:
+    from fstack import ingress_state
+
+    def fail_engine() -> Engine:
+        raise AssertionError("engine must not be created")
+
+    monkeypatch.setattr(ingress_state, "_engine", fail_engine)
+    marker = "hostile" if isinstance(operation_id, _HostileIdentifier) or isinstance(
+        scope, _HostileIdentifier
+    ) else "not-present"
+
+    _assert_sanitized_error(
+        lambda: ingress_state.finalize_provisioning_failure(  # type: ignore[arg-type]
+            operation_id,
+            scope,
+            "provider_failed",
+        ),
+        "provisioning_failure_invalid_request",
+        marker=marker,
+        module_name=ingress_state.__name__,
+    )
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    ("target", "table_name"),
+    [
+        ("runtime", "runtime_submissions"),
+        ("ingress", "ingress_submissions"),
+        ("operation", "provisioning_operations"),
+    ],
+)
+def test_finalize_provisioning_failure_requires_each_update_to_change_one_row(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    table_name: str,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=f"joint-failure-zero-row-{target}",
+    )
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+    with migrated_database.begin() as connection:
+        connection.execute(
+            text(
+                f"""
+                CREATE FUNCTION skip_failure_{target}_update() RETURNS trigger
+                LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$
+                """
+            )
+        )
+        connection.execute(
+            text(
+                f"""
+                CREATE TRIGGER aaa_skip_failure_{target}_update
+                BEFORE UPDATE ON {table_name}
+                FOR EACH ROW EXECUTE FUNCTION skip_failure_{target}_update()
+                """
+            )
+        )
+
+    _assert_error(
+        lambda: finalize_provisioning_failure(
+            prepared.operation_id,
+            "runtime",
+            "provider_failed",
+        ),
+        "provisioning_failure_state_resolution",
+    )
+
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("target", ["runtime", "ingress"])
+def test_finalize_provisioning_failure_rejects_sealed_bundle_drift(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=f"joint-failure-sealed-drift-{target}",
+    )
+    table = f"{target}_submissions"
+    trigger = (
+        "tr_runtime_submissions_lifecycle_guard"
+        if target == "runtime"
+        else "tr_ingress_submissions_lifecycle_guard"
+    )
+    column = "submission_key" if target == "runtime" else "route_fingerprint"
+    with migrated_database.begin() as connection:
+        connection.execute(text(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}"))
+        connection.execute(
+            text(f"UPDATE {table} SET {column}=:value WHERE operation_id=:operation_id"),
+            {"value": "0" * 64, "operation_id": prepared.operation_id},
+        )
+        connection.execute(text(f"ALTER TABLE {table} ENABLE TRIGGER {trigger}"))
+    before = _joint_failure_snapshot(migrated_database, prepared.operation_id)
+
+    _assert_error(
+        lambda: finalize_provisioning_failure(
+            prepared.operation_id,
+            "runtime",
+            "provider_failed",
+        ),
+        "provisioning_failure_state_resolution",
+    )
+
+    assert _joint_failure_snapshot(migrated_database, prepared.operation_id) == before
 
 
 @pytest.mark.postgres
