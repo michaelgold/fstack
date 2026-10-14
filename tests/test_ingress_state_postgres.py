@@ -1154,9 +1154,11 @@ def test_finalize_provisioning_failure_requires_exact_public_identifiers_before_
         raise AssertionError("engine must not be created")
 
     monkeypatch.setattr(ingress_state, "_engine", fail_engine)
-    marker = "hostile" if isinstance(operation_id, _HostileIdentifier) or isinstance(
-        scope, _HostileIdentifier
-    ) else "not-present"
+    marker = (
+        "hostile"
+        if isinstance(operation_id, _HostileIdentifier) or isinstance(scope, _HostileIdentifier)
+        else "not-present"
+    )
 
     _assert_sanitized_error(
         lambda: ingress_state.finalize_provisioning_failure(  # type: ignore[arg-type]

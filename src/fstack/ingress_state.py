@@ -737,10 +737,15 @@ def _finalize_provisioning_failure(operation_id: UUID, scope: str, error_code: s
 
 def finalize_provisioning_failure(operation_id: UUID, scope: str, error_code: str) -> None:
     """Fail one exact v2 bundle by canonical operation identity and durable scope."""
-    if type(operation_id) is not UUID or type(scope) is not str or scope not in {
-        "runtime",
-        "ingress",
-    }:
+    if (
+        type(operation_id) is not UUID
+        or type(scope) is not str
+        or scope
+        not in {
+            "runtime",
+            "ingress",
+        }
+    ):
         operation_id = None  # type: ignore[assignment]
         scope = ""  # avoid retaining caller-controlled text in traceback locals
         error_code = ""  # avoid retaining caller-controlled text in traceback locals
