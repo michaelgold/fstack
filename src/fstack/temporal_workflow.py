@@ -17,6 +17,17 @@ APPLY_LOCAL_CRUSHER_ACTIVITY = "fstack.apply_local_crusher.v1"
 FINALIZE_LOCAL_CRUSHER_SUCCESS_ACTIVITY = "fstack.finalize_local_crusher_success.v1"
 FINALIZE_LOCAL_CRUSHER_FAILURE_ACTIVITY = "fstack.finalize_local_crusher_failure.v1"
 FINALIZE_LOCAL_CRUSHER_PREPARE_FAILURE_ACTIVITY = "fstack.finalize_local_crusher_prepare_failure.v1"
+PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY = "fstack.prepare_local_crusher_ingress.v2"
+APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY = "fstack.apply_local_crusher_runtime.v2"
+PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY = "fstack.preflight_local_caddy_topology.v1"
+RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY = "fstack.reconcile_local_caddy_ingress.v1"
+PROBE_LOCAL_CADDY_INGRESS_ACTIVITY = "fstack.probe_local_caddy_ingress.v1"
+FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY = (
+    "fstack.finalize_local_crusher_ingress_success.v2"
+)
+FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY = (
+    "fstack.finalize_local_crusher_ingress_failure.v2"
+)
 APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=30)
 
 if APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT <= APPLY_DOCKER_TIMEOUT_BUDGET:
@@ -26,6 +37,31 @@ if APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT <= APPLY_DOCKER_TIMEOUT_BUDGET:
 @dataclass(frozen=True)
 class ProvisionCrusherInput:
     operation_id: str
+
+
+@dataclass(frozen=True)
+class ProvisionCrusherV2Input:
+    operation_id: str
+
+
+@dataclass(frozen=True)
+class ProvisioningSubmissionIds:
+    operation_id: str
+    runtime_submission_id: str
+    ingress_submission_id: str
+
+
+@dataclass(frozen=True)
+class ProvisioningFailureV2:
+    operation_id: str
+    scope: Literal["runtime", "ingress"]
+    error_code: str
+
+
+@dataclass(frozen=True)
+class ProvisionCrusherV2Result:
+    operation_id: str
+    state: Literal["confirmed", "failed"]
 
 
 @dataclass(frozen=True)

@@ -13,6 +13,29 @@ from uuid import UUID
 import pytest
 
 import fstack.runtime_submission as runtime_submission
+import fstack.temporal_worker as temporal_worker
+
+
+def test_worker_registers_released_v1_and_all_sanitized_v2_activities() -> None:
+    names = [
+        function.__temporal_activity_definition.name
+        for function in temporal_worker.TEMPORAL_ACTIVITIES
+    ]
+
+    assert names == [
+        "fstack.prepare_local_crusher.v1",
+        "fstack.apply_local_crusher.v1",
+        "fstack.finalize_local_crusher_success.v1",
+        "fstack.finalize_local_crusher_prepare_failure.v1",
+        "fstack.finalize_local_crusher_failure.v1",
+        "fstack.prepare_local_crusher_ingress.v2",
+        "fstack.apply_local_crusher_runtime.v2",
+        "fstack.preflight_local_caddy_topology.v1",
+        "fstack.reconcile_local_caddy_ingress.v1",
+        "fstack.probe_local_caddy_ingress.v1",
+        "fstack.finalize_local_crusher_ingress_success.v2",
+        "fstack.finalize_local_crusher_ingress_failure.v2",
+    ]
 
 
 class _ProbeCursor:
