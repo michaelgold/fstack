@@ -555,6 +555,65 @@ def test_resolve_exact_operation_bundle_rejects_drift_and_partial_state(
 
 
 @pytest.mark.postgres
+def test_prepare_v2_runtime_only_drift_remains_retryable(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from temporalio.exceptions import ApplicationError
+
+    from fstack.runtime_submission import prepare_operation
+    from fstack.temporal_worker import prepare_local_crusher_ingress_v2
+    from fstack.temporal_workflow import ProvisionCrusherV2Input
+
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
+    monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
+    created = _create_v2_operation(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="prepare-v2-runtime-only-drift",
+    )
+    prepare_operation(created["operation_id"])
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-drifted")
+
+    with pytest.raises(ApplicationError) as caught:
+        prepare_local_crusher_ingress_v2(
+            ProvisionCrusherV2Input(operation_id=created["operation_id"])
+        )
+
+    assert caught.value.non_retryable is False
+    assert caught.value.message == "activity_infrastructure_failure"
+    assert list(caught.value.details) == ["activity_infrastructure_failure"]
+    with migrated_database.connect() as connection:
+        operation_state = connection.execute(
+            text("SELECT state FROM provisioning_operations WHERE id=:operation_id"),
+            {"operation_id": created["operation_id"]},
+        ).scalar_one()
+        runtime_count = connection.execute(
+            text("SELECT count(*) FROM runtime_submissions WHERE operation_id=:operation_id"),
+            {"operation_id": created["operation_id"]},
+        ).scalar_one()
+        ingress_count = connection.execute(
+            text("SELECT count(*) FROM ingress_submissions WHERE operation_id=:operation_id"),
+            {"operation_id": created["operation_id"]},
+        ).scalar_one()
+        audit_types = (
+            connection.execute(
+                text(
+                    "SELECT event_type FROM audit_events WHERE operation_id=:operation_id "
+                    "ORDER BY created_at, id"
+                ),
+                {"operation_id": created["operation_id"]},
+            )
+            .scalars()
+            .all()
+        )
+    assert operation_state == "pending"
+    assert runtime_count == 1
+    assert ingress_count == 0
+    assert audit_types == ["provisioning.requested"]
+
+
+@pytest.mark.postgres
 def test_prepare_operation_requires_runtime_submission_insert_to_create_one_row(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,
