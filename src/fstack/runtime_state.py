@@ -30,6 +30,18 @@ def _engine() -> Engine:
 
 
 def _submission(connection: Connection, submission_id: UUID) -> Mapping[str, Any]:
+    operation_id = connection.execute(
+        text("SELECT operation_id FROM runtime_submissions WHERE id=:submission_id"),
+        {"submission_id": submission_id},
+    ).scalar_one_or_none()
+    if operation_id is None:
+        raise RuntimeStateError("runtime_submission_not_found")
+    operation_locked = connection.execute(
+        text("SELECT id FROM provisioning_operations WHERE id=:operation_id FOR UPDATE"),
+        {"operation_id": operation_id},
+    ).scalar_one_or_none()
+    if operation_locked is None:
+        raise RuntimeStateError("runtime_submission_not_found")
     row = (
         connection.execute(
             text(
@@ -54,7 +66,7 @@ def _submission(connection: Connection, submission_id: UUID) -> Mapping[str, Any
                   ON storage_binding.deployment_id = submission.deployment_id
                  AND storage_binding.organization_id = submission.organization_id
                 WHERE submission.id = :submission_id
-                FOR UPDATE OF submission, operation
+                FOR UPDATE OF submission
                 FOR SHARE OF deployment, database_binding, storage_binding
                 """
             ),
