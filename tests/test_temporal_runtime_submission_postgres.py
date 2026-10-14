@@ -176,6 +176,42 @@ def _create_operation(
     return response.json()
 
 
+def _create_v2_operation(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    idempotency_key: str,
+    body: dict[str, str] | None = None,
+) -> dict:
+    created = _create_operation(
+        migrated_database,
+        monkeypatch,
+        idempotency_key=idempotency_key,
+        body=body,
+    )
+    with migrated_database.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches DISABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE workflow_dispatches SET workflow_type='fstack.provision_crusher.v2' "
+                "WHERE operation_id=:operation_id"
+            ),
+            {"operation_id": created["operation_id"]},
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches ENABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+    return created
+
+
 def _create_v1_operation(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,
@@ -391,7 +427,7 @@ def test_prepare_operation_bundle_creates_and_replays_atomic_started_bundle(
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-runtime-ingress-bundle",
@@ -474,6 +510,51 @@ def test_prepare_operation_bundle_creates_and_replays_atomic_started_bundle(
 
 
 @pytest.mark.postgres
+def test_resolve_exact_operation_bundle_rejects_drift_and_partial_state(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_submission import (
+        prepare_operation_bundle,
+        resolve_exact_operation_bundle,
+    )
+
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
+    monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
+    created = _create_v2_operation(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="resolve-exact-operation-bundle",
+    )
+    prepared = prepare_operation_bundle(created["operation_id"])
+
+    assert resolve_exact_operation_bundle(prepared.operation_id) == prepared
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-drifted")
+    assert resolve_exact_operation_bundle(prepared.operation_id) is None
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
+
+    with migrated_database.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE ingress_submissions DISABLE TRIGGER "
+                "tr_ingress_submissions_lifecycle_guard"
+            )
+        )
+        connection.execute(
+            text("DELETE FROM ingress_submissions WHERE operation_id=:operation_id"),
+            {"operation_id": prepared.operation_id},
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE ingress_submissions ENABLE TRIGGER "
+                "tr_ingress_submissions_lifecycle_guard"
+            )
+        )
+
+    assert resolve_exact_operation_bundle(prepared.operation_id) is None
+
+
+@pytest.mark.postgres
 def test_prepare_operation_requires_runtime_submission_insert_to_create_one_row(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,
@@ -492,7 +573,7 @@ def test_prepare_operation_requires_runtime_submission_insert_to_create_one_row(
         monkeypatch,
         idempotency_key="prepare-zero-row-runtime-insert",
     )
-    bundle_created = _create_operation(
+    bundle_created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-zero-row-runtime-insert",
@@ -580,7 +661,7 @@ def test_prepare_ingress_requires_ingress_submission_insert_to_create_one_row(
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-zero-row-ingress-insert",
@@ -670,7 +751,7 @@ def test_prepare_operation_bundle_requires_pending_operation_update_to_change_on
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-zero-row-operation-update",
@@ -757,7 +838,7 @@ def test_prepare_operation_bundle_requires_started_audit_insert_to_create_one_ro
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-zero-row-started-audit",
@@ -854,7 +935,7 @@ def test_prepare_operation_bundle_requires_exact_returning_identity(
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key=f"prepare-bundle-wrong-returning-{target}",
@@ -894,7 +975,7 @@ def test_prepare_operation_bundle_replay_rejects_missing_started_audit(
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-missing-started-audit",
@@ -947,7 +1028,7 @@ def test_prepare_operation_bundle_reports_durable_drift_without_second_rows(
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-drift",
@@ -1014,7 +1095,7 @@ def test_prepare_operation_bundle_preserves_nonclaimable_operation_errors(
     if operation_state == "missing":
         operation_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     else:
-        created = _create_operation(
+        created = _create_v2_operation(
             migrated_database,
             monkeypatch,
             idempotency_key=f"prepare-bundle-not-claimable-{operation_state}",
@@ -1071,7 +1152,7 @@ def test_prepare_operation_bundle_does_not_classify_infrastructure_failure_as_co
     from fstack.ingress_submission import ProvisioningSubmissionStateError
 
     monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-infrastructure-failure",
@@ -1127,7 +1208,7 @@ def test_prepare_operation_bundle_rolls_back_after_every_statement(
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
     engine = migrated_database.execution_options()
     monkeypatch.setattr(ingress_submission, "create_engine", lambda *_args, **_kwargs: engine)
-    inventory_created = _create_operation(
+    inventory_created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-statement-inventory",
@@ -1158,7 +1239,7 @@ def test_prepare_operation_bundle_rolls_back_after_every_statement(
     assert execute_boundary_count == 9
 
     for failure_statement in range(1, execute_boundary_count + 1):
-        created = _create_operation(
+        created = _create_v2_operation(
             migrated_database,
             monkeypatch,
             idempotency_key=f"prepare-bundle-rollback-{failure_statement}",
@@ -1242,7 +1323,7 @@ def test_prepare_operation_bundle_hides_sealed_parameters_on_database_failure(
     }
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key="prepare-bundle-hidden-parameters",
@@ -1467,7 +1548,7 @@ def test_v2_success_audit_rejects_every_extra_field(
 
     monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
     monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
-    created = _create_operation(
+    created = _create_v2_operation(
         migrated_database,
         monkeypatch,
         idempotency_key=f"v2-success-audit-extra-{extra_key}",

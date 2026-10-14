@@ -136,8 +136,10 @@ def test_prepare_v2_returns_only_durable_submission_ids(monkeypatch: pytest.Monk
     }
 
 
-def test_prepare_v2_classifies_durable_bundle_conflict_without_finalizing(
+@pytest.mark.parametrize("exact_bundle", [False, True])
+def test_prepare_v2_only_makes_conflict_permanent_for_exact_durable_bundle(
     monkeypatch: pytest.MonkeyPatch,
+    exact_bundle: bool,
 ) -> None:
     calls: list[str] = []
 
@@ -151,6 +153,20 @@ def test_prepare_v2_classifies_durable_bundle_conflict_without_finalizing(
         temporal_worker_module.ingress_submission, "prepare_operation_bundle", conflict
     )
     monkeypatch.setattr(
+        temporal_worker_module.ingress_submission,
+        "resolve_exact_operation_bundle",
+        lambda _operation_id: (
+            temporal_worker_module.ingress_submission.PreparedProvisioningSubmissions(
+                operation_id=UUID(_v2_ids().operation_id),
+                runtime_submission_id=UUID(_v2_ids().runtime_submission_id),
+                ingress_submission_id=UUID(_v2_ids().ingress_submission_id),
+            )
+            if exact_bundle
+            else None
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
         temporal_worker_module.ingress_state,
         "finalize_provisioning_failure",
         lambda *_args: calls.append("finalize"),
@@ -162,9 +178,12 @@ def test_prepare_v2_classifies_durable_bundle_conflict_without_finalizing(
         )
 
     assert calls == ["prepare"]
-    assert caught.value.non_retryable is True
-    assert caught.value.message == "runtime_submission_conflict"
-    assert list(caught.value.details) == ["runtime_submission_conflict"]
+    assert caught.value.non_retryable is exact_bundle
+    expected_code = (
+        "runtime_submission_conflict" if exact_bundle else "activity_infrastructure_failure"
+    )
+    assert caught.value.message == expected_code
+    assert list(caught.value.details) == [expected_code]
 
 
 def test_prepare_v2_pre_durable_infrastructure_failure_is_retryable_without_finalizing(
@@ -848,6 +867,33 @@ def test_failure_finalizer_v2_bounds_error_code_and_discards_payload_locals(
     assert calls == ["provisioning_failed"]
     _assert_sanitized_retryable_activity_error(caught.value, marker)
     _assert_no_traceback_local_marker(caught.value, marker)
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["secret_source_not_configured", "provider_identity_conflict"],
+)
+def test_failure_finalizer_v2_preserves_known_runtime_state_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_failure",
+        lambda _operation_id, _scope, received: calls.append(received),
+    )
+
+    result = finalize_local_crusher_ingress_failure_v2(
+        ProvisioningFailureV2(
+            operation_id=_v2_ids().operation_id,
+            scope="runtime",
+            error_code=error_code,
+        )
+    )
+
+    assert calls == [error_code]
+    assert result.state == "failed"
 
 
 @pytest.mark.parametrize(

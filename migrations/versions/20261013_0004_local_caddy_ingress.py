@@ -337,7 +337,7 @@ def upgrade() -> None:
             ) VALUES (
                 NEW.id,
                 'provisioning/' || NEW.id::text,
-                '{WORKFLOW_TYPE_V2}',
+                '{WORKFLOW_TYPE_V1}',
                 'pending',
                 NEW.created_at
             );

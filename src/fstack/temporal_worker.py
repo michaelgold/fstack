@@ -140,6 +140,7 @@ _FAILURE_V2_FINALIZER_CONFLICTS = {
 }
 _PROVISIONING_FAILURE_CODES = (
     _PREPARE_V2_CONFLICTS
+    | _APPLY_STATE_CONFLICTS
     | set(_RUNTIME_APPLICATION_FAILURES)
     | set(_TOPOLOGY_FAILURES)
     | set(_PROBE_FAILURES)
@@ -282,6 +283,7 @@ def prepare_local_crusher_ingress_v2(
     )
     prepared = None
     conflict_code: str | None = None
+    exact_bundle = False
     infrastructure_failure = False
     try:
         prepared = ingress_submission.prepare_operation_bundle(operation_id)
@@ -293,6 +295,15 @@ def prepare_local_crusher_ingress_v2(
     except Exception:
         infrastructure_failure = True
     if conflict_code is not None:
+        try:
+            exact_bundle = (
+                ingress_submission.resolve_exact_operation_bundle(operation_id) is not None
+            )
+        except Exception:
+            infrastructure_failure = True
+        if not exact_bundle:
+            infrastructure_failure = True
+    if conflict_code is not None and exact_bundle:
         _raise_state_conflict(conflict_code)
     if infrastructure_failure or prepared is None:
         _raise_infrastructure_failure()

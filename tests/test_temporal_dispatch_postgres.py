@@ -76,7 +76,7 @@ def test_dispatch_pending_once_starts_and_marks_exact_workflow(
             .one()
         )
     assert row["workflow_id"] == f"provisioning/{operation_id}"
-    assert row["workflow_type"] == "fstack.provision_crusher.v2"
+    assert row["workflow_type"] == "fstack.provision_crusher.v1"
     assert row["state"] == "dispatched"
     assert row["dispatched_at"] is not None
 

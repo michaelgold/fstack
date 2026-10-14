@@ -81,9 +81,28 @@ def _prepared_bundle(
 ):
     from fstack.ingress_submission import prepare_operation_bundle
 
-    return prepare_operation_bundle(
-        _operation_id(engine, monkeypatch, idempotency_key=idempotency_key)
-    )
+    operation_id = _operation_id(engine, monkeypatch, idempotency_key=idempotency_key)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches DISABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE workflow_dispatches SET workflow_type='fstack.provision_crusher.v2' "
+                "WHERE operation_id=:operation_id"
+            ),
+            {"operation_id": operation_id},
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches ENABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+    return prepare_operation_bundle(operation_id)
 
 
 def _ingress_row(engine: Engine, submission_id: UUID) -> dict[str, object]:

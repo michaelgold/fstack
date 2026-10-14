@@ -283,3 +283,131 @@ def prepare_operation_bundle(operation_id: UUID | str) -> PreparedProvisioningSu
     if result is None:
         raise AssertionError("submission preparation completed without a result")
     return result
+
+
+def resolve_exact_operation_bundle(
+    operation_id: UUID,
+) -> PreparedProvisioningSubmissions | None:
+    """Resolve an already-durable exact runtime/ingress identity bundle."""
+    engine = create_engine(runtime_submission._database_url(), hide_parameters=True)
+    try:
+        with engine.connect() as connection:
+            existing = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT operation.id AS operation_id,
+                               operation.organization_id AS operation_organization_id,
+                               operation.deployment_id AS operation_deployment_id,
+                               deployment.organization_id AS deployment_organization_id,
+                               deployment.crusher_image, deployment.public_domain,
+                               database_binding.secret_ref AS database_secret_ref,
+                               storage_binding.secret_ref AS object_storage_secret_ref,
+                               runtime.id AS runtime_submission_id,
+                               runtime.organization_id AS runtime_organization_id,
+                               runtime.deployment_id AS runtime_deployment_id,
+                               runtime.provider AS runtime_provider,
+                               runtime.generation AS runtime_generation,
+                               runtime.submission_key AS runtime_submission_key,
+                               runtime.spec_fingerprint,
+                               runtime.api_container_name,
+                               runtime.migration_container_name,
+                               ingress.id AS ingress_submission_id,
+                               ingress.organization_id AS ingress_organization_id,
+                               ingress.deployment_id AS ingress_deployment_id,
+                               ingress.provider AS ingress_provider,
+                               ingress.generation AS ingress_generation,
+                               ingress.submission_key AS ingress_submission_key,
+                               ingress.route_fingerprint, ingress.route_id
+                        FROM provisioning_operations AS operation
+                        JOIN deployments AS deployment
+                          ON deployment.id = operation.deployment_id
+                         AND deployment.organization_id = operation.organization_id
+                        JOIN database_bindings AS database_binding
+                          ON database_binding.deployment_id = deployment.id
+                         AND database_binding.organization_id = deployment.organization_id
+                        JOIN storage_bindings AS storage_binding
+                          ON storage_binding.deployment_id = deployment.id
+                         AND storage_binding.organization_id = deployment.organization_id
+                        JOIN runtime_submissions AS runtime
+                          ON runtime.operation_id = operation.id
+                        JOIN ingress_submissions AS ingress
+                          ON ingress.operation_id = operation.id
+                        WHERE operation.id = :operation_id
+                        """
+                    ),
+                    {"operation_id": operation_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if existing is None:
+            return None
+        row = dict(existing)
+        identity = (
+            row["operation_id"],
+            row["operation_organization_id"],
+            row["operation_deployment_id"],
+            row["deployment_organization_id"],
+            row["runtime_submission_id"],
+            row["runtime_organization_id"],
+            row["runtime_deployment_id"],
+            row["ingress_submission_id"],
+            row["ingress_organization_id"],
+            row["ingress_deployment_id"],
+        )
+        if any(type(value) is not UUID for value in identity):
+            return None
+        organization_id = row["operation_organization_id"]
+        deployment_id = row["operation_deployment_id"]
+        if not (
+            row["operation_id"] == operation_id
+            and row["deployment_organization_id"] == organization_id
+            and row["runtime_organization_id"] == organization_id
+            and row["ingress_organization_id"] == organization_id
+            and row["runtime_deployment_id"] == deployment_id
+            and row["ingress_deployment_id"] == deployment_id
+        ):
+            return None
+        api_name, migration_name = runtime_submission._container_names(deployment_id)
+        operation = {
+            "operation_id": operation_id,
+            "organization_id": organization_id,
+            "deployment_id": deployment_id,
+            "crusher_image": row["crusher_image"],
+            "public_domain": row["public_domain"],
+            "database_secret_ref": row["database_secret_ref"],
+            "object_storage_secret_ref": row["object_storage_secret_ref"],
+        }
+        runtime_spec = runtime_submission._canonical_spec(
+            operation,
+            api_container_name=api_name,
+            migration_container_name=migration_name,
+            docker_network=runtime_submission._docker_network(),
+            secret_stage_root=runtime_submission._secret_stage_root(),
+        )
+        route = _canonical_route(deployment_id, row["public_domain"])
+        exact = (
+            row["runtime_provider"] == runtime_submission.PROVIDER
+            and row["runtime_generation"] == runtime_submission.GENERATION
+            and row["runtime_submission_key"] == runtime_submission._submission_key(operation_id)
+            and row["spec_fingerprint"] == runtime_submission._spec_fingerprint(runtime_spec)
+            and row["api_container_name"] == api_name
+            and row["migration_container_name"] == migration_name
+            and row["ingress_provider"] == PROVIDER
+            and row["ingress_generation"] == GENERATION
+            and row["ingress_submission_key"] == _submission_key(operation_id)
+            and row["route_fingerprint"] == _route_fingerprint(route)
+            and row["route_id"] == _route_id(deployment_id)
+        )
+        if not exact:
+            return None
+        return PreparedProvisioningSubmissions(
+            operation_id=operation_id,
+            runtime_submission_id=row["runtime_submission_id"],
+            ingress_submission_id=row["ingress_submission_id"],
+        )
+    except SQLAlchemyError:
+        raise ProvisioningSubmissionStateError("submission_bundle_resolution_failed") from None
+    finally:
+        engine.dispose()

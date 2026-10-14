@@ -54,10 +54,11 @@ Python SDK, Docker CLI/Engine, Caddy native JSON admin API, pytest, Ruff and myp
   fingerprint or deterministic-container values into APIs, logs or telemetry.
 - Every commit named below is a future implementation boundary. Do not combine unrelated
   RED/GREEN cycles inside one commit.
-- Upgrade in maintenance mode within this one release: stop/quiesce API, dispatchers and
-  workers; prove all old processes and pollers exited; apply `0004`; start the v2-capable
-  worker and dispatcher; prove v1/v2 registration and polling; only then enable API traffic.
-  A v2 row must never be visible to old code.
+- Keep `0004` assigning new operations to v1 while Tasks 12 and 13 merge independently. Task
+  14 performs the workflow-type cutover in maintenance mode: stop/quiesce API, dispatchers and
+  workers; prove all old processes and pollers exited; apply the cutover migration; start the
+  v2-capable worker and dispatcher; prove v1/v2 registration and polling; only then enable API
+  traffic. A v2 row must never be visible to old code.
 - Do not change CI credentials or weaken CI. Redacted reviewer output is not evidence of a
   credential failure. Canonical GitHub Actions run `38330810746` on merge SHA
   `2169276635c545b1bbc53fb2d523833cbc888899` passed 497 PostgreSQL tests. Runtime gates may
@@ -1043,6 +1044,8 @@ Run focused workflow tests; expected: GREEN.
 v1 replay compatibility.
 
 **Files:**
+- Create: successor migration changing only the enqueue trigger's new workflow type to v2
+- Modify: `tests/test_postgres_schema.py`
 - Modify: `src/fstack/workflow_dispatch.py`
 - Modify: `src/fstack/temporal_client.py`
 - Modify: `src/fstack/temporal_worker.py`
@@ -1054,6 +1057,8 @@ v1 replay compatibility.
 
 Test:
 
+- `0004` still permits both workflow-type values but assigns new operations to v1;
+- the Task 14 successor migration preserves existing rows and assigns only new operations v2;
 - pending selection returns `(operation_id, workflow_type)`;
 - v1 rows start `ProvisionCrusherWorkflow` with v1 input;
 - v2 rows start `ProvisionCrusherV2Workflow` with v2 input;

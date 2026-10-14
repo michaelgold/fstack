@@ -56,6 +56,29 @@ def _create_operation(monkeypatch: pytest.MonkeyPatch, suffix: str | None = None
     return response.json()
 
 
+def _mark_dispatch_v2(engine: Engine, operation_id: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches DISABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE workflow_dispatches SET workflow_type='fstack.provision_crusher.v2' "
+                "WHERE operation_id=:operation_id"
+            ),
+            {"operation_id": operation_id},
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches ENABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+
+
 _POSTGRES_SQL_TOKEN = re.compile(
     r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|::|>=|<=|<>|!=|\|\||[(),=~]|"
     r"[A-Za-z_][A-Za-z0-9_]*|\d+|\S"
@@ -379,7 +402,7 @@ def test_local_caddy_ingress_schema_is_exact(migrated_database: Engine) -> None:
 
 
 @pytest.mark.postgres
-def test_workflow_dispatch_v2_cutover_preserves_v1_history_and_identity(
+def test_workflow_dispatch_v2_schema_preserves_v1_dispatch_until_cutover(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -403,7 +426,7 @@ def test_workflow_dispatch_v2_cutover_preserves_v1_history_and_identity(
     assert before["workflow_type"] == "fstack.provision_crusher.v1"
 
     command.upgrade(configuration, "head")
-    current = _create_operation(monkeypatch, "current-v2")
+    current = _create_operation(monkeypatch, "current-v1")
 
     with migrated_database.connect() as connection:
         after = (
@@ -431,7 +454,7 @@ def test_workflow_dispatch_v2_cutover_preserves_v1_history_and_identity(
 
     assert after == before
     assert current_dispatch["workflow_id"] == f"provisioning/{current['operation_id']}"
-    assert current_dispatch["workflow_type"] == "fstack.provision_crusher.v2"
+    assert current_dispatch["workflow_type"] == "fstack.provision_crusher.v1"
     assert current_dispatch["state"] == "pending"
     assert current_dispatch["dispatched_at"] is None
 
@@ -502,8 +525,27 @@ def test_local_caddy_downgrade_rejects_any_v2_workflow_dispatch_history(
 ) -> None:
     configuration = Config("alembic.ini")
     created = _create_operation(monkeypatch, f"v2-{dispatch_state}")
-    if dispatch_state == "dispatched":
-        with migrated_database.begin() as connection:
+    with migrated_database.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches DISABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE workflow_dispatches SET workflow_type='fstack.provision_crusher.v2' "
+                "WHERE operation_id=:operation_id"
+            ),
+            {"operation_id": created["operation_id"]},
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches ENABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+        if dispatch_state == "dispatched":
             connection.execute(
                 text(
                     "UPDATE workflow_dispatches SET state = 'dispatched', "
@@ -671,7 +713,7 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
         "20261013_0004",
         has_ingress_submissions=True,
         workflow_types={"fstack.provision_crusher.v1", "fstack.provision_crusher.v2"},
-        enqueued_workflow_type="fstack.provision_crusher.v2",
+        enqueued_workflow_type="fstack.provision_crusher.v1",
     )
     for _ in range(2):
         command.downgrade(configuration, "20261006_0003")
@@ -686,10 +728,10 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
             "20261013_0004",
             has_ingress_submissions=True,
             workflow_types={"fstack.provision_crusher.v1", "fstack.provision_crusher.v2"},
-            enqueued_workflow_type="fstack.provision_crusher.v2",
+            enqueued_workflow_type="fstack.provision_crusher.v1",
         )
 
-    created = _create_operation(monkeypatch, "roundtrip-v2")
+    created = _create_operation(monkeypatch, "roundtrip-v1")
     with migrated_database.connect() as connection:
         dispatch = (
             connection.execute(
@@ -704,7 +746,7 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
         )
     assert dispatch == {
         "workflow_id": f"provisioning/{created['operation_id']}",
-        "workflow_type": "fstack.provision_crusher.v2",
+        "workflow_type": "fstack.provision_crusher.v1",
         "state": "pending",
         "dispatched_at": None,
     }
@@ -1507,6 +1549,7 @@ def test_audit_payload_generation_accepts_only_its_persisted_workflow_shapes(
     )
     for index, (event_type, extra_payload) in enumerate(v2_cases):
         created = _create_operation(monkeypatch, f"audit-v2-accepted-{index}")
+        _mark_dispatch_v2(migrated_database, created["operation_id"])
         runtime = _runtime_values(created, f"audit-v2-accepted-{index}")
         ingress = _ingress_values(created, f"audit-v2-accepted-{index}")
         with migrated_database.begin() as connection:
@@ -1580,6 +1623,7 @@ def test_audit_payload_generation_rejects_cross_generation_shapes_without_histor
 
     for index, event_type in enumerate(event_types):
         created = _create_operation(monkeypatch, f"audit-v2-cross-{index}")
+        _mark_dispatch_v2(migrated_database, created["operation_id"])
         runtime = _runtime_values(created, f"audit-v2-cross-{index}")
         ingress = _ingress_values(created, f"audit-v2-cross-{index}")
         with migrated_database.begin() as connection:

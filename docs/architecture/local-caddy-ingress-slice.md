@@ -491,7 +491,11 @@ fail-closed rather than a partially concurrent migration.
 Temporal remains the sole retry and workflow-progress authority. PostgreSQL gains no
 scheduler or attempt authority.
 
-New operations use workflow type:
+Migration `0004` admits both workflow types but continues assigning new operations to the
+released v1 workflow while the v2 workflow and version-aware dispatcher are not yet present.
+This keeps independently merged schema/activity work deployable without sending a v2 audit
+shape through the v1 workflow. The Task 14 cutover migration changes only operations inserted
+after that migration to workflow type:
 
 ```text
 fstack.provision_crusher.v2
@@ -503,18 +507,16 @@ and retain deterministic Workflow ID:
 provisioning/<operation UUID>
 ```
 
-The worker registers both `fstack.provision_crusher.v1` and
+The cutover worker registers both `fstack.provision_crusher.v1` and
 `fstack.provision_crusher.v2`. Existing v1 dispatch rows and histories continue to start,
-replay and complete with their released workflow/activity names and payloads. The successor
-migration changes only the workflow type assigned to operations inserted after the migration;
-it does not rewrite existing dispatch history.
+replay and complete with their released workflow/activity names and payloads. The cutover
+migration does not rewrite existing dispatch history.
 
-Upgrade is a maintenance-mode operation in this one-release implementation. Before applying
-`0004`, stop or quiesce the API, every dispatcher, and every worker, then verify process exit
-and that no old dispatcher/poller remains. Apply `0004`, start the v2-capable worker and
-dispatcher, verify both workflow versions are registered and polling, and only then enable
-API traffic. This gate prevents an old dispatcher from consuming a newly inserted v2 row;
-there is no mixed-version serving window and no invented second release.
+The Task 14 workflow-type cutover is a maintenance-mode operation. Stop or quiesce the API,
+every dispatcher, and every worker, then verify process exit and that no old dispatcher/poller
+remains. Apply the cutover migration, start the v2-capable worker and dispatcher, verify both
+workflow versions are registered and polling, and only then enable API traffic. This gate
+prevents an old dispatcher from consuming a newly inserted v2 row.
 
 The v2 workflow payloads contain only canonical UUID strings, bounded state names and
 sanitized error codes. They contain no secret references or values, socket/listener paths,

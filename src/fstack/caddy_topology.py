@@ -518,7 +518,7 @@ def _database_load_outcome(
                                    operation.state AS operation_state,
                                    operation.started_at AS operation_started_at,
                                    operation.completed_at AS operation_completed_at,
-                                   operation.failure_code AS operation_failure_code,
+                                   operation.last_error_code AS operation_failure_code,
                                    runtime.id AS runtime_id,
                                    runtime.organization_id AS runtime_organization_id,
                                    runtime.deployment_id AS runtime_deployment_id,
@@ -685,7 +685,8 @@ def _database_load_outcome(
             and row["spec_fingerprint"] == runtime_submission._spec_fingerprint(canonical_spec)
             and row["api_container_name"] == api_name
             and row["migration_container_name"] == migration_name
-            and row["runtime_external_id"] == api_name
+            and type(row["runtime_external_id"]) is str
+            and _HEX_ID.fullmatch(row["runtime_external_id"]) is not None
             and row["ingress_provider"] == ingress_submission.PROVIDER
             and row["ingress_generation"] == ingress_submission.GENERATION
             and row["ingress_submission_key"]

@@ -913,6 +913,7 @@ def test_topology_failure_sanitizes_exception_logs_and_traceback_locals(
 @pytest.mark.parametrize(
     ("external_id", "failure_stage", "expected_code"),
     [
+        (None, None, "success"),
         ("wrong-container", None, "caddy_topology_invalid"),
         (None, "begin", "caddy_unavailable"),
         (None, "enter", "caddy_unavailable"),
@@ -972,7 +973,7 @@ def test_production_loader_validates_identity_and_disposal(
         "api_container_name": api_name,
         "migration_container_name": migration_name,
         "runtime_state": "submitted",
-        "runtime_external_id": api_name if external_id is None else external_id,
+        "runtime_external_id": "b" * 64 if external_id is None else external_id,
         "runtime_prepared_at": now,
         "runtime_submitted_at": now,
         "runtime_confirmed_at": None,
@@ -1017,9 +1018,11 @@ def test_production_loader_validates_identity_and_disposal(
 
     class Connection:
         calls = 0
+        statements: list[object] = []
 
-        def execute(self, *_args: object, **_kwargs: object) -> Result:
+        def execute(self, statement: object, *_args: object, **_kwargs: object) -> Result:
             self.calls += 1
+            self.statements.append(statement)
             if failure_stage == "statement" and self.calls == 1:
                 raise RuntimeError("database-statement-secret-marker")
             if failure_stage == "query" and self.calls == 2:
@@ -1062,27 +1065,44 @@ def test_production_loader_validates_identity_and_disposal(
     monkeypatch.setattr(caddy_topology, "create_engine", create)
     monkeypatch.setattr(runtime_submission, "_database_url", lambda: "postgresql://redacted")
 
-    with pytest.raises(CaddyTopologyError) as caught:
-        caddy_topology._load_desired_state(
-            _IDS,
-            require_ingress_submitted=True,
-            environ={
-                "FSTACK_DOCKER_NETWORK": "fstack-local",
-                "FSTACK_SECRET_STAGE_ROOT": "/var/lib/fstack/secrets",
-            },
+    if expected_code == "success":
+        assert (
+            caddy_topology._load_desired_state(
+                _IDS,
+                require_ingress_submitted=True,
+                environ={
+                    "FSTACK_DOCKER_NETWORK": "fstack-local",
+                    "FSTACK_SECRET_STAGE_ROOT": "/var/lib/fstack/secrets",
+                },
+            )
+            == _DESIRED
         )
-    assert caught.value.code == expected_code
+    else:
+        with pytest.raises(CaddyTopologyError) as caught:
+            caddy_topology._load_desired_state(
+                _IDS,
+                require_ingress_submitted=True,
+                environ={
+                    "FSTACK_DOCKER_NETWORK": "fstack-local",
+                    "FSTACK_SECRET_STAGE_ROOT": "/var/lib/fstack/secrets",
+                },
+            )
+        assert caught.value.code == expected_code
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        rendered = str(caught.value) + repr(caught.value)
+        current = caught.value.__traceback__
+        while current is not None:
+            if current.tb_frame.f_globals.get("__name__") == caddy_topology.__name__:
+                rendered += repr(current.tb_frame.f_locals)
+            current = current.tb_next
+        assert "secret-marker" not in rendered
     assert options == [{"pool_pre_ping": True, "hide_parameters": True}]
     assert engine.dispose_calls == 1
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-    rendered = str(caught.value) + repr(caught.value)
-    current = caught.value.__traceback__
-    while current is not None:
-        if current.tb_frame.f_globals.get("__name__") == caddy_topology.__name__:
-            rendered += repr(current.tb_frame.f_locals)
-        current = current.tb_next
-    assert "secret-marker" not in rendered
+    if len(connection.statements) > 1:
+        assert "operation.last_error_code AS operation_failure_code" in str(
+            connection.statements[1]
+        )
 
 
 @pytest.mark.parametrize("failure_stage", ["database_url", "create"])
