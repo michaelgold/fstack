@@ -159,7 +159,9 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         outputs[("docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image)] = (
             '["example.invalid/image@sha256:' + image.rsplit(":", 1)[-1] + '"]'
         )
-    outputs[("docker", "run", "--rm", inputs.caddy_image, "caddy", "version")] = "v2.11.7"
+    outputs[("docker", "run", "--rm", inputs.caddy_image, "caddy", "version")] = (
+        "v2.11.7 h1:acceptance-build-hash"
+    )
     executor = FakeExecutor(outputs)
 
     verified = verify_images(inputs, executor)

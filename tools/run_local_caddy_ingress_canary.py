@@ -522,7 +522,8 @@ def verify_images(inputs: CanaryInputs, executor: CommandExecutor) -> dict[str, 
             raise CanaryContractError("pulled image does not expose the requested digest")
         verified[name] = expected
     version = executor.run(("docker", "run", "--rm", inputs.caddy_image, "caddy", "version"))
-    if version.strip() != "v2.11.7":
+    version_fields = version.strip().split()
+    if not version_fields or version_fields[0] != "v2.11.7":
         raise CanaryContractError("Caddy image is not exactly v2.11.7")
     return verified
 
