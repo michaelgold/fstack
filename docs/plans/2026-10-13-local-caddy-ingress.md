@@ -1340,9 +1340,12 @@ Preflight must:
 
 From that exact source and digest set:
 
-1. create unique `fstack-caddy-canary-<nonce>` names for PostgreSQL database/container,
-   Temporal namespace/task queue/container, one Docker network, Crusher containers, Caddy
-   container/config/volume/socket directory and Fstack worker/API containers;
+1. create unique `fstack-caddy-canary-<nonce>` names for the PostgreSQL database/container,
+   Temporal namespace/task queue/container, Docker network, Caddy container/config/volume/socket
+   directory and Fstack worker/API containers; production-generated Crusher containers retain
+   the required deterministic `fstack-crusher[-migrate]-<deployment hex>` names, but must use
+   fresh canary deployment IDs, the isolated canary network, exact selected Crusher image, and
+   exact managed operation/deployment ownership labels;
 2. assign Caddy a fixed isolated IP on that network; attach Crusher, API and worker to the
    same isolated network; configure the worker probe as
    `<fixed-caddy-ip>:<listener-port>` rather than `127.0.0.1` or worker loopback;
