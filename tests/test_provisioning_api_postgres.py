@@ -187,6 +187,254 @@ def test_pending_operation_can_be_read_after_creation(
 
 
 @pytest.mark.postgres
+def test_operation_status_reports_success_only_after_joint_finalization(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_success, mark_submitted
+    from fstack.ingress_submission import prepare_operation_bundle
+    from fstack.runtime_state import persist_submitted
+
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
+    monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
+    client = TestClient(create_app())
+    created = client.post(
+        "/v1/provisioning/operations",
+        headers={
+            "Authorization": "Bearer test-operator-token",
+            "Idempotency-Key": "joint-success-api-contract",
+        },
+        json=VALID_BODY,
+    )
+    created_payload = created.json()
+    operation_id = UUID(created_payload["operation_id"])
+    prepared = prepare_operation_bundle(operation_id)
+
+    def get_status():
+        response = client.get(
+            f"/v1/provisioning/operations/{operation_id}",
+            headers={"Authorization": "Bearer test-operator-token"},
+        )
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        return response
+
+    prepared_response = get_status()
+    prepared_status = prepared_response.json()
+    assert prepared_status["state"] == "running"
+    assert prepared_status["started_at"] is not None
+    assert prepared_status["completed_at"] is None
+    assert prepared_status["last_error"] is None
+    for identity in (
+        "operation_id",
+        "organization_id",
+        "business_id",
+        "environment_id",
+        "workload_id",
+        "deployment_id",
+    ):
+        assert prepared_status[identity] == created_payload[identity]
+
+    persist_submitted(prepared.runtime_submission_id, "d" * 64)
+    mark_submitted(prepared.ingress_submission_id, prepared.operation_id)
+    submitted_response = get_status()
+    submitted_status = submitted_response.json()
+    assert submitted_status["state"] == "running"
+    assert submitted_status["started_at"] == prepared_status["started_at"]
+    assert submitted_status["completed_at"] is None
+    assert submitted_status["last_error"] is None
+
+    finalize_provisioning_success(
+        prepared.runtime_submission_id,
+        prepared.ingress_submission_id,
+        prepared.operation_id,
+    )
+    succeeded_response = get_status()
+    succeeded = succeeded_response.json()
+    assert set(succeeded) == {
+        "operation_id",
+        "organization_id",
+        "business_id",
+        "environment_id",
+        "workload_id",
+        "deployment_id",
+        "state",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "last_error",
+    }
+    assert succeeded["state"] == "succeeded"
+    assert succeeded["started_at"] is not None
+    assert succeeded["completed_at"] is not None
+    assert succeeded["last_error"] is None
+    for forbidden in (
+        "provider",
+        "generation",
+        "submission_key",
+        "spec_fingerprint",
+        "api_container_name",
+        "migration_container_name",
+        "runtime_submission_id",
+        "ingress_submission_id",
+        "route_id",
+        "route_fingerprint",
+    ):
+        assert forbidden not in succeeded_response.text
+
+    with migrated_database.connect() as connection:
+        runtime_details = (
+            connection.execute(
+                text(
+                    "SELECT provider, submission_key, spec_fingerprint, "
+                    "api_container_name, migration_container_name "
+                    "FROM runtime_submissions WHERE id=:submission_id"
+                ),
+                {"submission_id": prepared.runtime_submission_id},
+            )
+            .mappings()
+            .one()
+        )
+        ingress_details = (
+            connection.execute(
+                text(
+                    "SELECT provider, submission_key, route_fingerprint, route_id "
+                    "FROM ingress_submissions WHERE id=:submission_id"
+                ),
+                {"submission_id": prepared.ingress_submission_id},
+            )
+            .mappings()
+            .one()
+        )
+        audits = (
+            connection.execute(
+                text(
+                    "SELECT event_type, actor_principal, organization_id, operation_id, "
+                    "payload, created_at FROM audit_events "
+                    "WHERE operation_id=:operation_id ORDER BY created_at, id"
+                ),
+                {"operation_id": operation_id},
+            )
+            .mappings()
+            .all()
+        )
+    for internal_value in (
+        *runtime_details.values(),
+        *ingress_details.values(),
+        prepared.runtime_submission_id,
+        prepared.ingress_submission_id,
+    ):
+        assert str(internal_value) not in succeeded_response.text
+    assert [audit["event_type"] for audit in audits] == [
+        "provisioning.requested",
+        "provisioning.started",
+        "provisioning.succeeded",
+    ]
+    assert all(audit["actor_principal"] == "installation-operator" for audit in audits)
+    assert all(
+        audit["organization_id"] == UUID(created_payload["organization_id"]) for audit in audits
+    )
+    assert all(audit["operation_id"] == operation_id for audit in audits)
+    assert all(audit["created_at"].utcoffset() is not None for audit in audits)
+    assert [audit["payload"] for audit in audits] == [
+        {},
+        {
+            "runtime_submission_id": str(prepared.runtime_submission_id),
+            "ingress_submission_id": str(prepared.ingress_submission_id),
+        },
+        {
+            "runtime_submission_id": str(prepared.runtime_submission_id),
+            "ingress_submission_id": str(prepared.ingress_submission_id),
+        },
+    ]
+
+
+@pytest.mark.postgres
+def test_failed_operation_status_exposes_only_sanitized_error_code(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_failure
+    from fstack.ingress_submission import prepare_operation_bundle
+
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
+    monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
+    client = TestClient(create_app())
+    created = client.post(
+        "/v1/provisioning/operations",
+        headers={
+            "Authorization": "Bearer test-operator-token",
+            "Idempotency-Key": "failed-api-contract",
+        },
+        json=VALID_BODY,
+    )
+    created_payload = created.json()
+    operation_id = UUID(created_payload["operation_id"])
+    prepared = prepare_operation_bundle(operation_id)
+    finalize_provisioning_failure(operation_id, "runtime", "docker_unavailable")
+
+    response = client.get(
+        f"/v1/provisioning/operations/{operation_id}",
+        headers={"Authorization": "Bearer test-operator-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    payload = response.json()
+    assert payload["state"] == "failed"
+    assert payload["started_at"] is not None
+    assert payload["completed_at"] is not None
+    assert payload["last_error"] == {"code": "docker_unavailable"}
+    assert set(payload) == {
+        "operation_id",
+        "organization_id",
+        "business_id",
+        "environment_id",
+        "workload_id",
+        "deployment_id",
+        "state",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "last_error",
+    }
+    for identity in (
+        "operation_id",
+        "organization_id",
+        "business_id",
+        "environment_id",
+        "workload_id",
+        "deployment_id",
+    ):
+        assert payload[identity] == created_payload[identity]
+
+    with migrated_database.connect() as connection:
+        failure_audit = (
+            connection.execute(
+                text(
+                    "SELECT actor_principal, organization_id, operation_id, payload, created_at "
+                    "FROM audit_events WHERE operation_id=:operation_id "
+                    "AND event_type='provisioning.failed'"
+                ),
+                {"operation_id": operation_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert failure_audit["actor_principal"] == "installation-operator"
+    assert failure_audit["organization_id"] == UUID(created_payload["organization_id"])
+    assert failure_audit["operation_id"] == operation_id
+    assert failure_audit["created_at"].utcoffset() is not None
+    assert failure_audit["payload"] == {
+        "runtime_submission_id": str(prepared.runtime_submission_id),
+        "ingress_submission_id": str(prepared.ingress_submission_id),
+        "error_code": "docker_unavailable",
+    }
+
+
+@pytest.mark.postgres
 def test_operation_status_authenticates_before_lookup(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,

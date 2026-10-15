@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import os
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 from uuid import UUID
 
@@ -91,6 +92,25 @@ def _validate_idempotency_key(value: str) -> str:
 def create_app() -> FastAPI:
     app = FastAPI(title="Fstack")
     engine = _database_engine()
+
+    @app.middleware("http")
+    async def operation_status_no_store(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if request.method != "GET" or not request.url.path.startswith(
+            "/v1/provisioning/operations/"
+        ):
+            return await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            response = JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"code": "internal_error", "message": "request failed"},
+            )
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.exception_handler(ProvisioningConflictError)
     async def provisioning_conflict_handler(
