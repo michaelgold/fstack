@@ -1057,7 +1057,7 @@ def build_runtime_commands(
         "POSTGRES_USER": "fstack",
         "POSTGRES_PWD": secrets_bundle.postgres_password,
         "POSTGRES_SEEDS": plan.postgres_container,
-        "DYNAMIC_CONFIG_FILE_PATH": "config/dynamicconfig/development-sql.yaml",
+        "DYNAMIC_CONFIG_FILE_PATH": "config/dynamicconfig/docker.yaml",
         "DEFAULT_NAMESPACE": plan.temporal_namespace,
         "DBNAME": plan.temporal_database_name,
         "VISIBILITY_DBNAME": plan.temporal_visibility_database_name,

@@ -562,6 +562,9 @@ def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: 
     )
     for key, value in plan.worker_environment.items():
         assert commands["worker"].environment[key] == value
+    assert commands["temporal"].environment["DYNAMIC_CONFIG_FILE_PATH"] == (
+        "config/dynamicconfig/docker.yaml"
+    )
     assert ("--group-add", str(plan.worker_supplemental_gid)) in list(
         zip(commands["worker"].argv, commands["worker"].argv[1:], strict=False)
     )
