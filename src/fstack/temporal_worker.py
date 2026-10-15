@@ -38,6 +38,7 @@ from fstack.temporal_workflow import (
     ProvisionCrusherInput,
     ProvisionCrusherV2Input,
     ProvisionCrusherV2Result,
+    ProvisionCrusherV2Workflow,
     ProvisionCrusherWorkflow,
     ProvisioningFailureV2,
     ProvisioningSubmissionIds,
@@ -765,6 +766,7 @@ TEMPORAL_ACTIVITIES = (
     finalize_local_crusher_ingress_success_v2,
     finalize_local_crusher_ingress_failure_v2,
 )
+TEMPORAL_WORKFLOWS = (ProvisionCrusherWorkflow, ProvisionCrusherV2Workflow)
 
 
 async def run_worker_services(
@@ -797,7 +799,7 @@ async def run_temporal_worker() -> None:
             worker = Worker(
                 client,
                 task_queue=task_queue,
-                workflows=[ProvisionCrusherWorkflow],
+                workflows=list(TEMPORAL_WORKFLOWS),
                 activities=list(TEMPORAL_ACTIVITIES),
                 activity_executor=executor,
             )

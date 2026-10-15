@@ -14,6 +14,14 @@ import pytest
 
 import fstack.runtime_submission as runtime_submission
 import fstack.temporal_worker as temporal_worker
+from fstack.temporal_workflow import ProvisionCrusherV2Workflow, ProvisionCrusherWorkflow
+
+
+def test_worker_registers_both_provisioning_workflow_generations() -> None:
+    assert (
+        ProvisionCrusherWorkflow,
+        ProvisionCrusherV2Workflow,
+    ) == temporal_worker.TEMPORAL_WORKFLOWS
 
 
 def test_worker_registers_released_v1_and_all_sanitized_v2_activities() -> None:

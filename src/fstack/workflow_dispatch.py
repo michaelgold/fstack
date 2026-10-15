@@ -25,15 +25,16 @@ class DispatchBatchResult:
     failed: int
 
 
-def _load_pending_operation_ids(engine: Engine, *, limit: int) -> list[UUID]:
+def _load_pending_dispatches(engine: Engine, *, limit: int) -> list[tuple[UUID, str]]:
     if limit < 1:
         raise ValueError("dispatch limit must be positive")
     with engine.connect() as connection:
-        return list(
-            connection.execute(
+        return [
+            (row.operation_id, row.workflow_type)
+            for row in connection.execute(
                 text(
                     """
-                    SELECT operation_id
+                    SELECT operation_id, workflow_type
                     FROM workflow_dispatches
                     WHERE state = 'pending'
                     ORDER BY created_at, operation_id
@@ -41,8 +42,8 @@ def _load_pending_operation_ids(engine: Engine, *, limit: int) -> list[UUID]:
                     """
                 ),
                 {"limit": limit},
-            ).scalars()
-        )
+            )
+        ]
 
 
 def _mark_dispatched(engine: Engine, *, operation_id: UUID) -> None:
@@ -69,12 +70,12 @@ async def dispatch_pending_once(
     start_workflow: StartWorkflow = start_provision_crusher_workflow,
 ) -> DispatchBatchResult:
     """Attempt one at-least-once outbox batch without holding database locks over I/O."""
-    operation_ids = await asyncio.to_thread(_load_pending_operation_ids, engine, limit=limit)
+    dispatches = await asyncio.to_thread(_load_pending_dispatches, engine, limit=limit)
     dispatched = 0
     failed = 0
-    for operation_id in operation_ids:
+    for operation_id, workflow_type in dispatches:
         try:
-            await start_workflow(client, operation_id, task_queue=task_queue)
+            await start_workflow(client, workflow_type, operation_id, task_queue=task_queue)
         except Exception as exc:
             LOGGER.warning(
                 "workflow dispatch start failed operation_id=%s error_type=%s",
@@ -86,7 +87,7 @@ async def dispatch_pending_once(
         await asyncio.to_thread(_mark_dispatched, engine, operation_id=operation_id)
         dispatched += 1
     return DispatchBatchResult(
-        selected=len(operation_ids),
+        selected=len(dispatches),
         dispatched=dispatched,
         failed=failed,
     )

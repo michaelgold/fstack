@@ -494,14 +494,18 @@ scheduler or attempt authority.
 Migration `0004` admits both workflow types but continues assigning new operations to the
 released v1 workflow while the v2 workflow and version-aware dispatcher are not yet present.
 This keeps independently merged schema/activity work deployable without sending a v2 audit
-shape through the v1 workflow. The Task 14 cutover migration changes only operations inserted
-after that migration to workflow type:
+shape through the v1 workflow. Migration `20261015_0005` is the Task 14 cutover: under
+`ACCESS EXCLUSIVE MODE NOWAIT` locks on `provisioning_operations` and
+`workflow_dispatches`, it replaces only the enqueue function so operations inserted after
+that migration use workflow type:
 
 ```text
 fstack.provision_crusher.v2
 ```
 
-and retain deterministic Workflow ID:
+Existing dispatch rows are not updated. Downgrading `0005` takes the same locks, restores v1
+only for future inserts, and leaves already-persisted v2 rows unchanged. Both directions retain
+the deterministic Workflow ID:
 
 ```text
 provisioning/<operation UUID>

@@ -378,7 +378,7 @@ def test_local_caddy_ingress_schema_is_exact(migrated_database: Engine) -> None:
         )
         assert trigger_names == {"tr_ingress_submissions_lifecycle_guard"}
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261013_0004"
+            "20261015_0005"
         )
 
     forbidden_authority_terms = (
@@ -402,7 +402,7 @@ def test_local_caddy_ingress_schema_is_exact(migrated_database: Engine) -> None:
 
 
 @pytest.mark.postgres
-def test_workflow_dispatch_v2_schema_preserves_v1_dispatch_until_cutover(
+def test_workflow_dispatch_v2_cutover_preserves_existing_rows_and_changes_only_new_rows(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -425,8 +425,24 @@ def test_workflow_dispatch_v2_schema_preserves_v1_dispatch_until_cutover(
     assert before["workflow_id"] == f"provisioning/{legacy['operation_id']}"
     assert before["workflow_type"] == "fstack.provision_crusher.v1"
 
+    command.upgrade(configuration, "20261013_0004")
+    admitted = _create_operation(monkeypatch, "admitted-v1")
+    with migrated_database.connect() as connection:
+        admitted_before_cutover = (
+            connection.execute(
+                text(
+                    "SELECT operation_id, workflow_id, workflow_type, state, created_at, "
+                    "dispatched_at FROM workflow_dispatches WHERE operation_id = :operation_id"
+                ),
+                {"operation_id": admitted["operation_id"]},
+            )
+            .mappings()
+            .one()
+        )
+    assert admitted_before_cutover["workflow_type"] == "fstack.provision_crusher.v1"
+
     command.upgrade(configuration, "head")
-    current = _create_operation(monkeypatch, "current-v1")
+    current = _create_operation(monkeypatch, "current-v2")
 
     with migrated_database.connect() as connection:
         after = (
@@ -436,6 +452,17 @@ def test_workflow_dispatch_v2_schema_preserves_v1_dispatch_until_cutover(
                     "dispatched_at FROM workflow_dispatches WHERE operation_id = :operation_id"
                 ),
                 {"operation_id": legacy["operation_id"]},
+            )
+            .mappings()
+            .one()
+        )
+        admitted_after_cutover = (
+            connection.execute(
+                text(
+                    "SELECT operation_id, workflow_id, workflow_type, state, created_at, "
+                    "dispatched_at FROM workflow_dispatches WHERE operation_id = :operation_id"
+                ),
+                {"operation_id": admitted["operation_id"]},
             )
             .mappings()
             .one()
@@ -453,13 +480,15 @@ def test_workflow_dispatch_v2_schema_preserves_v1_dispatch_until_cutover(
         )
 
     assert after == before
+    assert admitted_after_cutover == admitted_before_cutover
     assert current_dispatch["workflow_id"] == f"provisioning/{current['operation_id']}"
-    assert current_dispatch["workflow_type"] == "fstack.provision_crusher.v1"
+    assert current_dispatch["workflow_type"] == "fstack.provision_crusher.v2"
     assert current_dispatch["state"] == "pending"
     assert current_dispatch["dispatched_at"] is None
 
     dispatches = {
         legacy["operation_id"]: before,
+        admitted["operation_id"]: admitted_before_cutover,
         current["operation_id"]: current_dispatch,
     }
     for operation_id, original in dispatches.items():
@@ -515,6 +544,41 @@ def test_workflow_dispatch_v2_schema_preserves_v1_dispatch_until_cutover(
             )
         assert getattr(exc_info.value.orig, "sqlstate", None) == "23000"
 
+    command.downgrade(configuration, "20261013_0004")
+    rollback_operation = _create_operation(monkeypatch, "rollback-v1")
+    with migrated_database.connect() as connection:
+        retained_v2 = (
+            connection.execute(
+                text(
+                    "SELECT operation_id, workflow_id, workflow_type, state, created_at, "
+                    "dispatched_at FROM workflow_dispatches WHERE operation_id = :operation_id"
+                ),
+                {"operation_id": current["operation_id"]},
+            )
+            .mappings()
+            .one()
+        )
+        rollback_dispatch = (
+            connection.execute(
+                text(
+                    "SELECT workflow_id, workflow_type, state, dispatched_at "
+                    "FROM workflow_dispatches WHERE operation_id = :operation_id"
+                ),
+                {"operation_id": rollback_operation["operation_id"]},
+            )
+            .mappings()
+            .one()
+        )
+    assert retained_v2 == current_dispatch
+    assert rollback_dispatch == {
+        "workflow_id": f"provisioning/{rollback_operation['operation_id']}",
+        "workflow_type": "fstack.provision_crusher.v1",
+        "state": "pending",
+        "dispatched_at": None,
+    }
+
+    command.upgrade(configuration, "head")
+
 
 @pytest.mark.postgres
 @pytest.mark.parametrize("dispatch_state", ["pending", "dispatched"])
@@ -560,7 +624,7 @@ def test_local_caddy_downgrade_rejects_any_v2_workflow_dispatch_history(
 
     with migrated_database.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261013_0004"
+            "20261015_0005"
         )
         row = (
             connection.execute(
@@ -621,7 +685,7 @@ def test_local_caddy_downgrade_rejects_ingress_history(
 
     with migrated_database.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261013_0004"
+            "20261015_0005"
         )
         assert "ingress_submissions" in inspect(migrated_database).get_table_names()
         assert (
@@ -710,12 +774,19 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
         )
 
     assert_pristine_revision(
-        "20261013_0004",
+        "20261015_0005",
         has_ingress_submissions=True,
         workflow_types={"fstack.provision_crusher.v1", "fstack.provision_crusher.v2"},
-        enqueued_workflow_type="fstack.provision_crusher.v1",
+        enqueued_workflow_type="fstack.provision_crusher.v2",
     )
     for _ in range(2):
+        command.downgrade(configuration, "20261013_0004")
+        assert_pristine_revision(
+            "20261013_0004",
+            has_ingress_submissions=True,
+            workflow_types={"fstack.provision_crusher.v1", "fstack.provision_crusher.v2"},
+            enqueued_workflow_type="fstack.provision_crusher.v1",
+        )
         command.downgrade(configuration, "20261006_0003")
         assert_pristine_revision(
             "20261006_0003",
@@ -725,13 +796,13 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
         )
         command.upgrade(configuration, "head")
         assert_pristine_revision(
-            "20261013_0004",
+            "20261015_0005",
             has_ingress_submissions=True,
             workflow_types={"fstack.provision_crusher.v1", "fstack.provision_crusher.v2"},
-            enqueued_workflow_type="fstack.provision_crusher.v1",
+            enqueued_workflow_type="fstack.provision_crusher.v2",
         )
 
-    created = _create_operation(monkeypatch, "roundtrip-v1")
+    created = _create_operation(monkeypatch, "roundtrip-v2")
     with migrated_database.connect() as connection:
         dispatch = (
             connection.execute(
@@ -746,7 +817,7 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
         )
     assert dispatch == {
         "workflow_id": f"provisioning/{created['operation_id']}",
-        "workflow_type": "fstack.provision_crusher.v1",
+        "workflow_type": "fstack.provision_crusher.v2",
         "state": "pending",
         "dispatched_at": None,
     }
@@ -765,6 +836,44 @@ def test_local_caddy_migration_uses_fail_fast_complete_lock_sets() -> None:
         "workflow_dispatches, audit_events, ingress_submissions "
         "IN ACCESS EXCLUSIVE MODE NOWAIT"
     )
+
+
+def test_v2_cutover_migration_uses_fail_fast_complete_lock_set() -> None:
+    migration_path = Path("migrations/versions/20261015_0005_provisioning_workflow_v2_cutover.py")
+    namespace = runpy.run_path(str(migration_path))
+
+    assert namespace["CUTOVER_LOCK_SQL"] == (
+        "LOCK TABLE provisioning_operations, workflow_dispatches IN ACCESS EXCLUSIVE MODE NOWAIT"
+    )
+
+
+@pytest.mark.postgres
+def test_v2_cutover_upgrade_fails_fast_when_operation_writer_is_live(
+    migrated_database: Engine,
+) -> None:
+    configuration = Config("alembic.ini")
+    command.downgrade(configuration, "20261013_0004")
+
+    with migrated_database.connect() as writer_connection:
+        writer_transaction = writer_connection.begin()
+        writer_connection.execute(text("LOCK TABLE provisioning_operations IN ROW EXCLUSIVE MODE"))
+        try:
+            with pytest.raises(DBAPIError) as exc_info:
+                command.upgrade(configuration, "head")
+            assert getattr(exc_info.value.orig, "sqlstate", None) == "55P03"
+        finally:
+            writer_transaction.rollback()
+
+    with migrated_database.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20261013_0004"
+        )
+
+    command.upgrade(configuration, "head")
+    with migrated_database.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "20261015_0005"
+        )
 
 
 @pytest.mark.postgres
@@ -810,7 +919,7 @@ def test_local_caddy_downgrade_fails_fast_when_ingress_writer_is_live(
     assert "ingress_submissions" in inspect(migrated_database).get_table_names()
     with migrated_database.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261013_0004"
+            "20261015_0005"
         )
 
 
