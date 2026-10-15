@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -12,11 +14,12 @@ import pytest
 from sqlalchemy.exc import SQLAlchemyError
 from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
-from temporalio.client import WorkflowFailureError
+from temporalio.client import WorkflowFailureError, WorkflowHistory
 from temporalio.common import RetryPolicy
+from temporalio.converter import DataConverter
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 
 import fstack.runtime_submission as runtime_submission_module
 import fstack.temporal_worker as temporal_worker_module
@@ -83,6 +86,26 @@ class _SanitizedActivityHistoryWorkflow:
         except ActivityError:
             return "failed"
         return "unexpected-success"
+
+
+def _history_fixture_content(value: object) -> str:
+    observed: list[str] = []
+
+    def inspect(nested: object) -> None:
+        if isinstance(nested, dict):
+            for key, item in nested.items():
+                observed.append(str(key))
+                if key == "data" and isinstance(item, str):
+                    observed.append(base64.b64decode(item, validate=True).decode(errors="replace"))
+                inspect(item)
+        elif isinstance(nested, list):
+            for item in nested:
+                inspect(item)
+        elif isinstance(nested, str):
+            observed.append(nested)
+
+    inspect(value)
+    return "\n".join(observed)
 
 
 def test_v2_activity_contract_names_and_payloads_are_sanitized() -> None:
@@ -1313,6 +1336,141 @@ def test_provision_crusher_workflow_prepares_applies_and_finalizes_in_order() ->
         assert apply_scheduled.start_to_close_timeout.ToTimedelta() > APPLY_DOCKER_TIMEOUT_BUDGET
 
     asyncio.run(run())
+
+
+def test_history_fixture_scan_includes_keys_list_strings_and_decoded_data() -> None:
+    encoded = base64.b64encode(b"provider_exception").decode()
+
+    fixture_content = _history_fixture_content(
+        {
+            "secret://dictionary-key": "safe",
+            "list": ["/home/list-value"],
+            "payload": {"data": encoded},
+        }
+    )
+
+    assert "secret://dictionary-key" in fixture_content
+    assert "/home/list-value" in fixture_content
+    assert "provider_exception" in fixture_content
+
+
+def test_released_v1_history_replays_with_v1_and_v2_registered() -> None:
+    fixture_path = (
+        Path(__file__).parent / "fixtures" / "temporal" / "provision-crusher-v1-history.json"
+    )
+    fixture_text = fixture_path.read_text()
+    fixture_document = json.loads(fixture_text)
+    identities: set[str] = set()
+    run_ids: set[str] = set()
+
+    def inspect_fixture_metadata(value: object) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key == "identity" and isinstance(nested, str):
+                    identities.add(nested)
+                elif key in {"firstExecutionRunId", "originalExecutionRunId"} and isinstance(
+                    nested, str
+                ):
+                    run_ids.add(nested)
+                inspect_fixture_metadata(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                inspect_fixture_metadata(nested)
+
+    inspect_fixture_metadata(fixture_document)
+    history = WorkflowHistory.from_json(
+        "provisioning/11111111-1111-4111-8111-111111111111",
+        fixture_document,
+    )
+
+    async def run() -> list[object]:
+        replay = await Replayer(
+            workflows=[ProvisionCrusherWorkflow, ProvisionCrusherV2Workflow]
+        ).replay_workflow(history, raise_on_replay_failure=False)
+        assert replay.replay_failure is None
+
+        converter = DataConverter.default
+        decoded: list[object] = []
+        for event in history.events:
+            if event.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED:
+                decoded.extend(
+                    await converter.decode(
+                        event.workflow_execution_started_event_attributes.input.payloads
+                    )
+                )
+            elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+                decoded.extend(
+                    await converter.decode(
+                        event.activity_task_scheduled_event_attributes.input.payloads
+                    )
+                )
+            elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
+                decoded.extend(
+                    await converter.decode(
+                        event.activity_task_completed_event_attributes.result.payloads
+                    )
+                )
+            elif event.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:
+                decoded.extend(
+                    await converter.decode(
+                        event.workflow_execution_completed_event_attributes.result.payloads
+                    )
+                )
+        return decoded
+
+    decoded = asyncio.run(run())
+    operation = {"operation_id": "11111111-1111-4111-8111-111111111111"}
+    submission = {
+        "submission_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "operation_id": operation["operation_id"],
+        "provider": "local_docker",
+        "generation": 1,
+        "submission_key": "fixture-v1-submission",
+        "spec_fingerprint": "b" * 64,
+        "api_container_name": "fstack-fixture-api",
+        "migration_container_name": "fstack-fixture-migration",
+    }
+    assert decoded == [
+        operation,
+        operation,
+        submission | {"state": "prepared"},
+        submission | {"state": "prepared"},
+        submission | {"state": "submitted"},
+        submission | {"state": "submitted"},
+        submission | {"state": "confirmed"},
+        {
+            "operation_id": operation["operation_id"],
+            "state": "confirmed",
+            "runtime_submission": submission | {"state": "confirmed"},
+        },
+    ]
+    assert [
+        event.activity_task_scheduled_event_attributes.activity_type.name
+        for event in history.events
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ] == [
+        PREPARE_LOCAL_CRUSHER_ACTIVITY,
+        APPLY_LOCAL_CRUSHER_ACTIVITY,
+        FINALIZE_LOCAL_CRUSHER_SUCCESS_ACTIVITY,
+    ]
+    assert history.events[0].workflow_execution_started_event_attributes.workflow_type.name == (
+        "fstack.provision_crusher.v1"
+    )
+    assert identities == {"fstack-v1-fixture-worker"}
+    assert run_ids == {"44444444-4444-4444-8444-444444444444"}
+    fixture_content = _history_fixture_content(fixture_document)
+    for forbidden in (
+        "579234@spark",
+        "secret://",
+        "/home/",
+        "/run/",
+        "/var/",
+        "container_id",
+        "provider_body",
+        "provider_exception",
+    ):
+        assert forbidden not in fixture_content
+        assert forbidden not in repr(decoded)
 
 
 def test_provision_crusher_v2_workflow_orders_sanitized_activities_and_policies() -> None:
