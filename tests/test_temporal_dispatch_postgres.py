@@ -39,16 +39,17 @@ def test_dispatch_pending_once_starts_and_marks_exact_workflow(
         json=VALID_BODY,
     )
     operation_id = UUID(created.json()["operation_id"])
-    calls: list[tuple[object, UUID, str]] = []
+    calls: list[tuple[object, str, UUID, str]] = []
     client = object()
 
     async def start_workflow(
         received_client: object,
+        workflow_type: str,
         received_operation_id: UUID,
         *,
         task_queue: str,
     ) -> object:
-        calls.append((received_client, received_operation_id, task_queue))
+        calls.append((received_client, workflow_type, received_operation_id, task_queue))
         return object()
 
     result = asyncio.run(
@@ -62,7 +63,7 @@ def test_dispatch_pending_once_starts_and_marks_exact_workflow(
     )
 
     assert result == DispatchBatchResult(selected=1, dispatched=1, failed=0)
-    assert calls == [(client, operation_id, "test-provisioning")]
+    assert calls == [(client, "fstack.provision_crusher.v2", operation_id, "test-provisioning")]
     with migrated_database.connect() as connection:
         row = (
             connection.execute(
@@ -76,7 +77,7 @@ def test_dispatch_pending_once_starts_and_marks_exact_workflow(
             .one()
         )
     assert row["workflow_id"] == f"provisioning/{operation_id}"
-    assert row["workflow_type"] == "fstack.provision_crusher.v1"
+    assert row["workflow_type"] == "fstack.provision_crusher.v2"
     assert row["state"] == "dispatched"
     assert row["dispatched_at"] is not None
 
@@ -106,12 +107,14 @@ def test_transient_start_failure_leaves_intent_pending_for_replay(
 
     async def start_workflow(
         _client: object,
+        workflow_type: str,
         received_operation_id: UUID,
         *,
         task_queue: str,
     ) -> object:
         nonlocal calls
         assert received_operation_id == operation_id
+        assert workflow_type == "fstack.provision_crusher.v2"
         assert task_queue == "test-provisioning"
         calls += 1
         if calls == 1:

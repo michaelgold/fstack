@@ -116,7 +116,7 @@ def test_create_operation_persists_complete_pending_desired_state(
     assert dispatch == {
         "operation_id": UUID(payload["operation_id"]),
         "workflow_id": f"provisioning/{payload['operation_id']}",
-        "workflow_type": "fstack.provision_crusher.v1",
+        "workflow_type": "fstack.provision_crusher.v2",
         "state": "pending",
         "dispatched_at": None,
     }

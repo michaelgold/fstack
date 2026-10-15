@@ -23,7 +23,7 @@ import fstack.temporal_worker as temporal_worker_module
 import fstack.temporal_workflow as temporal_workflow_module
 from fstack.docker_cli import APPLY_DOCKER_TIMEOUT_BUDGET
 from fstack.runtime_submission import OperationNotClaimableError, PreparedRuntimeSubmission
-from fstack.temporal_client import start_provision_crusher_workflow
+from fstack.temporal_client import WORKFLOW_TYPE_V1, start_provision_crusher_workflow
 from fstack.temporal_worker import (
     apply_local_crusher,
     apply_local_crusher_runtime_v2,
@@ -2678,6 +2678,7 @@ def test_start_provision_crusher_workflow_uses_deterministic_identity() -> None:
         ):
             handle = await start_provision_crusher_workflow(
                 environment.client,
+                WORKFLOW_TYPE_V1,
                 operation_id,
                 task_queue="test-temporal-dispatch",
             )
