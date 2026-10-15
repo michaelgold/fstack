@@ -125,6 +125,77 @@ workflow progress. Runtime application, readiness, and terminal PostgreSQL final
 are now Temporal activities; PostgreSQL still contains no attempts, leases, heartbeats,
 retry scheduler, or polling claims.
 
+## Installation-managed Caddy ingress
+
+Fstack manages only its deterministic route inside an installation-owned Caddy
+configuration. It does not install, upgrade, restart, or otherwise own Caddy. The supported
+production topology is one explicitly configured Docker container with:
+
+- Caddy v2.11.7 at the exact immutable image digest certified by the release canary;
+- an existing `apps.http.servers.fstack` object and `routes` array;
+- at least one installation-owned listener reachable at the configured probe address;
+- attachment to the exact `FSTACK_DOCKER_NETWORK` used by Crusher;
+- a separately shared, confined Unix admin-socket volume.
+
+Compatibility is limited to the canary-certified version/digest pair until another pair is
+re-certified. A mutable tag, matching major version, or nominally compatible admin API is
+not evidence of support. The digest is recorded from the canary; documentation must not
+invent one.
+
+The worker requires these fixed installation values, not request fields:
+
+- `FSTACK_CADDY_ADMIN_ROOT`: normalized absolute trusted socket root;
+- `FSTACK_CADDY_ADMIN_UID`: expected numeric socket owner;
+- `FSTACK_CADDY_ADMIN_GID`: expected numeric socket group and a required worker supplemental
+  group;
+- `FSTACK_CADDY_PROBE_ADDRESS`: canonical IP literal and listener port on the installation
+  Docker network;
+- `FSTACK_CADDY_CONTAINER_NAME`: canonical fixed Caddy container name.
+
+The only socket entry is `caddy-admin.sock`. Before every admin request, Fstack opens the
+trusted root without following symlinks, requires it to be owned by root or the worker EUID,
+and rejects it if group/other writable. It accepts only a Unix socket with the configured
+owner/group and mode exactly `0220`; every other mode is invalid. The worker connects
+descriptor-relative and revalidates the socket after connection. This boundary requires
+Linux directory-descriptor and inotify primitives plus `/proc/self/fd` and fails closed when
+they are unavailable. An unauthenticated TCP admin endpoint is never supported.
+
+Caddy must resolve deterministic Crusher API names and reach port `8000`. The worker reaches
+the configured listener over `FSTACK_DOCKER_NETWORK`, not through worker loopback; the admin
+socket remains a separate control-plane mount. After runtime readiness and before route
+reconciliation, bounded topology inspection proves that the configured Caddy container and
+deterministic Crusher API container are running on the exact network, Caddy's network IP
+matches the probe IP, the Crusher endpoint advertises its deterministic name or alias, and
+the listener accepts TCP. Structurally valid but unsupported topology, network/IP/alias
+mismatch, or a missing or non-running Crusher container is permanent
+`caddy_topology_invalid`. Unavailable or malformed Docker/provider inspection,
+missing/non-running Caddy, or an unavailable listener is retryable `caddy_unavailable`.
+
+The v2 workflow order is:
+
+1. atomically prepare or replay the exact runtime and ingress submission identities,
+   transition the operation from `pending` to `running`, and insert or replay the exact v2
+   `provisioning.started` audit;
+2. apply and prove the runtime internally ready;
+3. preflight the exact Dockerized-Caddy topology and listener without mutating Caddy;
+4. reconcile or adopt the exact route;
+5. probe the installation-managed listener with the exact Host header;
+6. atomically finalize runtime submission, ingress submission, operation, and audit.
+
+Public `succeeded` therefore means both runtime and ingress are durably complete. The
+released v1 workflow remains registered and its frozen histories remain replayable; old rows
+continue to select v1 from their persisted workflow type.
+
+Routed HTTP readiness is deliberately narrower than external availability. It does not prove
+or manage DNS, DNS ownership, ACME, TLS, HTTPS, certificates, load balancers, firewalls, or
+Internet reachability. The slice also excludes Caddy installation/startup/supervision or
+listener creation; creation/replacement of the `fstack` server or routes array; generic
+ingress/provider adapter frameworks; route update, delete, reorder, domain change, rollback,
+or compensation; container supervision or replacement; object-storage resolution; and
+portal/UI, billing, or Remesher support. Host-process Caddy, Kubernetes, Podman, remote Caddy,
+implicit Caddy discovery, arbitrary server selection, and per-request Caddy configuration
+are unsupported.
+
 ## Test boundary
 
 The public repository includes:

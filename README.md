@@ -59,6 +59,48 @@ the Temporal architecture. Object-storage references remain sealed desired state
 See [`docs/architecture/temporal-provisioning.md`](docs/architecture/temporal-provisioning.md)
 for the durability and ownership boundary.
 
+### Installation-managed local Caddy ingress
+
+Fstack does not install, upgrade, or own Caddy. The installation must provide one Docker
+container running the release-certified Caddy image, an existing `fstack` HTTP server with a
+`routes` array and installation-owned listener, a shared Unix admin socket, and network
+connectivity. Configure the following fixed worker environment values; none is deployment
+request data:
+
+```bash
+export FSTACK_CADDY_ADMIN_ROOT=/replace/with/trusted-caddy-admin-root
+export FSTACK_CADDY_ADMIN_UID=replace-with-socket-owner-uid
+export FSTACK_CADDY_ADMIN_GID=replace-with-socket-group-gid
+export FSTACK_CADDY_PROBE_ADDRESS=replace-with-fixed-caddy-network-ip:replace-with-listener-port
+export FSTACK_CADDY_CONTAINER_NAME=replace-with-canonical-caddy-container-name
+```
+
+The socket entry is fixed as `caddy-admin.sock`. It must be a Unix socket owned by the
+configured UID/GID with mode exactly `0220`; every other mode is rejected. The worker must
+have the configured GID as a supplemental group. The trusted admin root must be owned by
+root or the worker EUID and must never be writable by group or other. Caddy admin access
+requires Linux descriptor/inotify primitives and `/proc/self/fd`; unsupported hosts fail
+closed. Do not expose an unauthenticated Caddy TCP admin endpoint.
+
+Caddy and deterministic Crusher containers must join the exact `FSTACK_DOCKER_NETWORK`.
+Caddy must resolve the Crusher container name and reach port `8000`; the worker must reach
+`FSTACK_CADDY_PROBE_ADDRESS` over the installation network, not worker loopback. Share the
+admin socket separately through a confined volume. Before reconciliation, Fstack verifies
+that both containers are running on the expected network, the Caddy network IP equals the
+probe IP, the Crusher endpoint exposes its deterministic name or alias, and the listener
+accepts TCP connections.
+
+The first compatibility baseline is Caddy **v2.11.7 at the exact image digest recorded by
+the release canary**. Use that certified version/digest until another pair is re-certified.
+Do not infer support from a tag or major version, and do not copy a guessed digest from
+documentation.
+
+A successful operation means both runtime and ingress were durably finalized. Routed HTTP
+readiness proves only the configured Caddy-to-Crusher path; it does not prove DNS, TLS,
+certificate lifecycle, or Internet reachability. See
+[`docs/architecture/local-caddy-ingress-slice.md`](docs/architecture/local-caddy-ingress-slice.md)
+for the complete contract and exclusions.
+
 Persistence tests require an explicit PostgreSQL URL; they never fall back to SQLite:
 
 ```bash
