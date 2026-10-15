@@ -88,6 +88,26 @@ class _SanitizedActivityHistoryWorkflow:
         return "unexpected-success"
 
 
+def _history_fixture_content(value: object) -> str:
+    observed: list[str] = []
+
+    def inspect(nested: object) -> None:
+        if isinstance(nested, dict):
+            for key, item in nested.items():
+                observed.append(str(key))
+                if key == "data" and isinstance(item, str):
+                    observed.append(base64.b64decode(item, validate=True).decode(errors="replace"))
+                inspect(item)
+        elif isinstance(nested, list):
+            for item in nested:
+                inspect(item)
+        elif isinstance(nested, str):
+            observed.append(nested)
+
+    inspect(value)
+    return "\n".join(observed)
+
+
 def test_v2_activity_contract_names_and_payloads_are_sanitized() -> None:
     assert PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY == "fstack.prepare_local_crusher_ingress.v2"
     assert APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY == "fstack.apply_local_crusher_runtime.v2"
@@ -1318,35 +1338,46 @@ def test_provision_crusher_workflow_prepares_applies_and_finalizes_in_order() ->
     asyncio.run(run())
 
 
+def test_history_fixture_scan_includes_keys_list_strings_and_decoded_data() -> None:
+    encoded = base64.b64encode(b"provider_exception").decode()
+
+    fixture_content = _history_fixture_content(
+        {
+            "secret://dictionary-key": "safe",
+            "list": ["/home/list-value"],
+            "payload": {"data": encoded},
+        }
+    )
+
+    assert "secret://dictionary-key" in fixture_content
+    assert "/home/list-value" in fixture_content
+    assert "provider_exception" in fixture_content
+
+
 def test_released_v1_history_replays_with_v1_and_v2_registered() -> None:
     fixture_path = (
         Path(__file__).parent / "fixtures" / "temporal" / "provision-crusher-v1-history.json"
     )
     fixture_text = fixture_path.read_text()
     fixture_document = json.loads(fixture_text)
-    all_fixture_text: list[str] = []
     identities: set[str] = set()
     run_ids: set[str] = set()
 
-    def inspect_fixture(value: object) -> None:
+    def inspect_fixture_metadata(value: object) -> None:
         if isinstance(value, dict):
             for key, nested in value.items():
-                if isinstance(nested, str):
-                    all_fixture_text.append(nested)
-                    if key == "identity":
-                        identities.add(nested)
-                    elif key in {"firstExecutionRunId", "originalExecutionRunId"}:
-                        run_ids.add(nested)
-                    elif key == "data":
-                        all_fixture_text.append(
-                            base64.b64decode(nested, validate=True).decode(errors="replace")
-                        )
-                inspect_fixture(nested)
+                if key == "identity" and isinstance(nested, str):
+                    identities.add(nested)
+                elif key in {"firstExecutionRunId", "originalExecutionRunId"} and isinstance(
+                    nested, str
+                ):
+                    run_ids.add(nested)
+                inspect_fixture_metadata(nested)
         elif isinstance(value, list):
             for nested in value:
-                inspect_fixture(nested)
+                inspect_fixture_metadata(nested)
 
-    inspect_fixture(fixture_document)
+    inspect_fixture_metadata(fixture_document)
     history = WorkflowHistory.from_json(
         "provisioning/11111111-1111-4111-8111-111111111111",
         fixture_document,
@@ -1427,7 +1458,7 @@ def test_released_v1_history_replays_with_v1_and_v2_registered() -> None:
     )
     assert identities == {"fstack-v1-fixture-worker"}
     assert run_ids == {"44444444-4444-4444-8444-444444444444"}
-    fixture_content = "\n".join(all_fixture_text)
+    fixture_content = _history_fixture_content(fixture_document)
     for forbidden in (
         "579234@spark",
         "secret://",
