@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Literal
+from typing import Literal, cast
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -29,6 +29,80 @@ FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY = (
     "fstack.finalize_local_crusher_ingress_failure.v2"
 )
 APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=30)
+PREPARE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=2)
+PREFLIGHT_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=1)
+RECONCILE_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=2)
+PROBE_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=1)
+FINALIZE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT = timedelta(minutes=2)
+
+_STANDARD_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=1),
+    maximum_interval=timedelta(seconds=10),
+)
+_APPLY_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    maximum_interval=timedelta(seconds=30),
+)
+_V2_FAILURE_CODES = {
+    "caddy_admin_config_invalid",
+    "caddy_admin_forbidden",
+    "caddy_admin_incompatible",
+    "caddy_admin_primitives_unavailable",
+    "caddy_admin_response_invalid",
+    "caddy_admin_root_unsafe",
+    "caddy_admin_socket_unsafe",
+    "caddy_admin_timeout",
+    "caddy_admin_transport",
+    "caddy_config_changed",
+    "caddy_host_conflict",
+    "caddy_mutation_ambiguous",
+    "caddy_prerequisite_missing",
+    "caddy_route_id_conflict",
+    "caddy_route_rejected",
+    "caddy_routes_ambiguous",
+    "caddy_topology_invalid",
+    "caddy_unavailable",
+    "container_exited",
+    "docker_name_conflict",
+    "docker_spec_conflict",
+    "docker_unavailable",
+    "image_digest_mismatch",
+    "image_unavailable",
+    "ingress_readiness_unavailable",
+    "ingress_state_infrastructure",
+    "ingress_submission_agreement_invalid",
+    "ingress_submission_conflict",
+    "ingress_submission_identity_invalid",
+    "ingress_submission_not_found",
+    "ingress_submission_operation_mismatch",
+    "ingress_submission_operation_not_running",
+    "ingress_submission_state_invalid",
+    "ingress_submission_terminal",
+    "invalid_caddy_probe_configuration",
+    "invalid_image_digest",
+    "invalid_provider_identity",
+    "invalid_secret_bundle",
+    "migration_failed",
+    "migration_unavailable",
+    "operation_not_found",
+    "operation_not_running",
+    "provider_identity_conflict",
+    "provisioning_failed",
+    "readiness_unavailable",
+    "runtime_submission_conflict",
+    "runtime_submission_not_found",
+    "runtime_submission_not_submittable",
+    "runtime_submission_operation_mismatch",
+    "runtime_submission_terminal",
+    "sealed_spec_mismatch",
+    "secret_source_not_configured",
+    "secret_unavailable",
+    "started_audit_conflict",
+    "started_audit_missing",
+    "started_audit_unexpected",
+    "unsafe_secret_file",
+    "unsupported_secret_reference",
+}
 
 if APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT <= APPLY_DOCKER_TIMEOUT_BUDGET:
     raise RuntimeError("apply activity timeout must exceed the declared Docker timeout budget")
@@ -102,6 +176,32 @@ def _nonretryable_code(exc: ActivityError, fallback: str) -> str | None:
         return None
     details = list(cause.details)
     return details[0] if details and isinstance(details[0], str) else fallback
+
+
+def _v2_nonretryable_code(exc: ActivityError) -> str | None:
+    code = _nonretryable_code(exc, "provisioning_failed")
+    return code if code is None or code in _V2_FAILURE_CODES else "provisioning_failed"
+
+
+async def _finalize_v2_failure(
+    operation_id: str,
+    scope: Literal["runtime", "ingress"],
+    error_code: str,
+) -> ProvisionCrusherV2Result:
+    return cast(
+        ProvisionCrusherV2Result,
+        await workflow.execute_activity(
+            FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY,
+            ProvisioningFailureV2(
+                operation_id=operation_id,
+                scope=scope,
+                error_code=error_code,
+            ),
+            result_type=ProvisionCrusherV2Result,
+            start_to_close_timeout=FINALIZE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+            retry_policy=_STANDARD_RETRY_POLICY,
+        ),
+    )
 
 
 @workflow.defn(name="fstack.provision_crusher.v1")
@@ -186,4 +286,70 @@ class ProvisionCrusherWorkflow:
             operation_id=request.operation_id,
             state=confirmed.state,
             runtime_submission=confirmed,
+        )
+
+
+@workflow.defn(name="fstack.provision_crusher.v2")
+class ProvisionCrusherV2Workflow:
+    """Publish one prepared Crusher runtime through the local Caddy ingress."""
+
+    @workflow.run
+    async def run(self, request: ProvisionCrusherV2Input) -> ProvisionCrusherV2Result:
+        try:
+            ids = await workflow.execute_activity(
+                PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY,
+                request,
+                result_type=ProvisioningSubmissionIds,
+                start_to_close_timeout=PREPARE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+                retry_policy=_STANDARD_RETRY_POLICY,
+            )
+        except ActivityError as exc:
+            error_code = _v2_nonretryable_code(exc)
+            if error_code is None:
+                raise
+            return await _finalize_v2_failure(request.operation_id, "runtime", error_code)
+
+        try:
+            await workflow.execute_activity(
+                APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY,
+                ids,
+                start_to_close_timeout=APPLY_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+                retry_policy=_APPLY_RETRY_POLICY,
+            )
+        except ActivityError as exc:
+            error_code = _v2_nonretryable_code(exc)
+            if error_code is None:
+                raise
+            return await _finalize_v2_failure(request.operation_id, "runtime", error_code)
+
+        for activity_name, timeout in (
+            (
+                PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY,
+                PREFLIGHT_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+            ),
+            (RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY, RECONCILE_ACTIVITY_START_TO_CLOSE_TIMEOUT),
+            (PROBE_LOCAL_CADDY_INGRESS_ACTIVITY, PROBE_ACTIVITY_START_TO_CLOSE_TIMEOUT),
+        ):
+            try:
+                await workflow.execute_activity(
+                    activity_name,
+                    ids,
+                    start_to_close_timeout=timeout,
+                    retry_policy=_STANDARD_RETRY_POLICY,
+                )
+            except ActivityError as exc:
+                error_code = _v2_nonretryable_code(exc)
+                if error_code is None:
+                    raise
+                return await _finalize_v2_failure(request.operation_id, "ingress", error_code)
+
+        return cast(
+            ProvisionCrusherV2Result,
+            await workflow.execute_activity(
+                FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY,
+                ids,
+                result_type=ProvisionCrusherV2Result,
+                start_to_close_timeout=FINALIZE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+                retry_policy=_STANDARD_RETRY_POLICY,
+            ),
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from enum import StrEnum
@@ -11,6 +12,7 @@ import pytest
 from sqlalchemy.exc import SQLAlchemyError
 from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
+from temporalio.client import WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.testing import WorkflowEnvironment
@@ -43,16 +45,22 @@ from fstack.temporal_workflow import (
     FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY,
     FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY,
     FINALIZE_LOCAL_CRUSHER_SUCCESS_ACTIVITY,
+    FINALIZE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+    PREFLIGHT_ACTIVITY_START_TO_CLOSE_TIMEOUT,
     PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY,
     PREPARE_LOCAL_CRUSHER_ACTIVITY,
     PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY,
+    PREPARE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+    PROBE_ACTIVITY_START_TO_CLOSE_TIMEOUT,
     PROBE_LOCAL_CADDY_INGRESS_ACTIVITY,
+    RECONCILE_ACTIVITY_START_TO_CLOSE_TIMEOUT,
     RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY,
     OperationFailure,
     ProvisionCrusherInput,
     ProvisionCrusherResult,
     ProvisionCrusherV2Input,
     ProvisionCrusherV2Result,
+    ProvisionCrusherV2Workflow,
     ProvisionCrusherWorkflow,
     ProvisioningFailureV2,
     ProvisioningSubmissionIds,
@@ -103,6 +111,12 @@ def test_v2_activity_contract_names_and_payloads_are_sanitized() -> None:
         "error_code",
     }
     assert set(ProvisionCrusherV2Result.__dataclass_fields__) == {"operation_id", "state"}
+
+
+def test_v2_workflow_and_worker_share_the_same_closed_failure_codes() -> None:
+    assert temporal_workflow_module._V2_FAILURE_CODES == (
+        temporal_worker_module._PROVISIONING_FAILURE_CODES
+    )
 
 
 def test_prepare_v2_returns_only_durable_submission_ids(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -347,6 +361,7 @@ def test_preflight_v2_failure_keeps_markers_out_of_logs_and_temporal_history(
                 result = await handle.result()
                 history = await handle.fetch_history()
         assert marker not in history.to_json()
+        assert base64.b64encode(marker.encode()).decode() not in history.to_json()
         return result
 
     assert asyncio.run(run()) == "failed"
@@ -1296,6 +1311,809 @@ def test_provision_crusher_workflow_prepares_applies_and_finalizes_in_order() ->
         )
         assert apply_scheduled.start_to_close_timeout.ToTimedelta() == timedelta(minutes=30)
         assert apply_scheduled.start_to_close_timeout.ToTimedelta() > APPLY_DOCKER_TIMEOUT_BUDGET
+
+    asyncio.run(run())
+
+
+def test_provision_crusher_v2_workflow_orders_sanitized_activities_and_policies() -> None:
+    ids = _v2_ids()
+    calls: list[tuple[str, object]] = []
+
+    @activity.defn(name=PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY)
+    async def prepare(request: ProvisionCrusherV2Input) -> ProvisioningSubmissionIds:
+        calls.append(("prepare", request))
+        return ids
+
+    @activity.defn(name=APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+    async def apply(payload: ProvisioningSubmissionIds) -> None:
+        calls.append(("apply", payload))
+
+    @activity.defn(name=PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY)
+    async def preflight(payload: ProvisioningSubmissionIds) -> None:
+        calls.append(("preflight", payload))
+
+    @activity.defn(name=RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def reconcile(payload: ProvisioningSubmissionIds) -> None:
+        calls.append(("reconcile", payload))
+
+    @activity.defn(name=PROBE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def probe(payload: ProvisioningSubmissionIds) -> None:
+        calls.append(("probe", payload))
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY)
+    async def finalize(payload: ProvisioningSubmissionIds) -> ProvisionCrusherV2Result:
+        calls.append(("finalize", payload))
+        return ProvisionCrusherV2Result(operation_id=payload.operation_id, state="confirmed")
+
+    async def run() -> None:
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as environment,
+            Worker(
+                environment.client,
+                task_queue="test-provision-crusher-v2",
+                workflows=[ProvisionCrusherV2Workflow],
+                activities=[prepare, apply, preflight, reconcile, probe, finalize],
+            ),
+        ):
+            handle = await environment.client.start_workflow(
+                ProvisionCrusherV2Workflow.run,
+                ProvisionCrusherV2Input(operation_id=ids.operation_id),
+                id=f"provisioning/{ids.operation_id}",
+                task_queue="test-provision-crusher-v2",
+            )
+            result = await handle.result()
+            history = await handle.fetch_history()
+
+        assert result == ProvisionCrusherV2Result(
+            operation_id=ids.operation_id,
+            state="confirmed",
+        )
+        assert calls == [
+            ("prepare", ProvisionCrusherV2Input(operation_id=ids.operation_id)),
+            ("apply", ids),
+            ("preflight", ids),
+            ("reconcile", ids),
+            ("probe", ids),
+            ("finalize", ids),
+        ]
+        scheduled = {
+            attributes.activity_type.name: attributes
+            for event in history.events
+            if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+            for attributes in [event.activity_task_scheduled_event_attributes]
+        }
+        expected_timeouts = {
+            PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY: PREPARE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+            APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY: timedelta(minutes=30),
+            PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY: PREFLIGHT_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+            RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY: RECONCILE_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+            PROBE_LOCAL_CADDY_INGRESS_ACTIVITY: PROBE_ACTIVITY_START_TO_CLOSE_TIMEOUT,
+            FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY: (
+                FINALIZE_V2_ACTIVITY_START_TO_CLOSE_TIMEOUT
+            ),
+        }
+        assert set(scheduled) == set(expected_timeouts)
+        for activity_name, timeout in expected_timeouts.items():
+            attributes = scheduled[activity_name]
+            assert attributes.start_to_close_timeout.ToTimedelta() == timeout
+            is_apply = activity_name == APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY
+            assert attributes.retry_policy.initial_interval.ToTimedelta() == timedelta(
+                seconds=2 if is_apply else 1
+            )
+            assert attributes.retry_policy.maximum_interval.ToTimedelta() == timedelta(
+                seconds=30 if is_apply else 10
+            )
+
+    asyncio.run(run())
+
+
+def test_provision_crusher_v2_history_decodes_to_sanitized_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = _v2_ids()
+    marker = (
+        "secret-marker://route/host/path/fingerprint/container/network/endpoint/"
+        "address/alias/inspection/provider"
+    )
+
+    def fail_preflight(_ids: object) -> None:
+        try:
+            raise RuntimeError(marker)
+        except RuntimeError as exc:
+            raise temporal_worker_module.caddy_topology.CaddyTopologyError(
+                "caddy_topology_invalid", False
+            ) from exc
+
+    monkeypatch.setattr(
+        temporal_worker_module.caddy_topology,
+        "preflight_local_caddy_topology",
+        fail_preflight,
+    )
+
+    @activity.defn(name=PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY)
+    async def prepare(_request: ProvisionCrusherV2Input) -> ProvisioningSubmissionIds:
+        return ids
+
+    @activity.defn(name=APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+    async def apply(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY)
+    async def finalize_failure(failure: ProvisioningFailureV2) -> ProvisionCrusherV2Result:
+        return ProvisionCrusherV2Result(operation_id=failure.operation_id, state="failed")
+
+    async def run() -> None:
+        environment = await WorkflowEnvironment.start_time_skipping()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            async with (
+                environment,
+                Worker(
+                    environment.client,
+                    task_queue="test-provision-crusher-v2-sanitized-history",
+                    workflows=[ProvisionCrusherV2Workflow],
+                    activities=[
+                        prepare,
+                        apply,
+                        preflight_local_caddy_topology_activity,
+                        finalize_failure,
+                    ],
+                    activity_executor=executor,
+                ),
+            ):
+                handle = await environment.client.start_workflow(
+                    ProvisionCrusherV2Workflow.run,
+                    ProvisionCrusherV2Input(operation_id=ids.operation_id),
+                    id=f"provisioning/{ids.operation_id}/sanitized-history",
+                    task_queue="test-provision-crusher-v2-sanitized-history",
+                )
+                result = await handle.result()
+                history = await handle.fetch_history()
+                converter = environment.client.data_converter
+
+        assert result == ProvisionCrusherV2Result(operation_id=ids.operation_id, state="failed")
+        scheduled: dict[int, tuple[str, list[object]]] = {}
+        completed: dict[str, list[object]] = {}
+        failed: dict[str, BaseException] = {}
+        for event in history.events:
+            if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+                attributes = event.activity_task_scheduled_event_attributes
+                scheduled[event.event_id] = (
+                    attributes.activity_type.name,
+                    await converter.decode(attributes.input.payloads),
+                )
+            elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
+                attributes = event.activity_task_completed_event_attributes
+                activity_name = scheduled[attributes.scheduled_event_id][0]
+                completed[activity_name] = await converter.decode(attributes.result.payloads)
+            elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED:
+                attributes = event.activity_task_failed_event_attributes
+                activity_name = scheduled[attributes.scheduled_event_id][0]
+                failed[activity_name] = await converter.decode_failure(attributes.failure)
+
+        ids_payload = {
+            "operation_id": ids.operation_id,
+            "runtime_submission_id": ids.runtime_submission_id,
+            "ingress_submission_id": ids.ingress_submission_id,
+        }
+        scheduled_payloads = {name: payload for name, payload in scheduled.values()}
+        assert scheduled_payloads == {
+            PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY: [{"operation_id": ids.operation_id}],
+            APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY: [ids_payload],
+            PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY: [ids_payload],
+            FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY: [
+                {
+                    "operation_id": ids.operation_id,
+                    "scope": "ingress",
+                    "error_code": "caddy_topology_invalid",
+                }
+            ],
+        }
+        assert completed[PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY] == [ids_payload]
+        assert completed[APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY] in ([], [None])
+        assert completed[FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY] == [
+            {"operation_id": ids.operation_id, "state": "failed"}
+        ]
+        assert set(failed) == {PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY}
+        preflight_error = failed[PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY]
+        assert isinstance(preflight_error, ApplicationError)
+        assert preflight_error.message == "caddy_topology_invalid"
+        assert list(preflight_error.details) == ["caddy_topology_invalid"]
+        assert preflight_error.non_retryable is True
+        serialized_history = history.to_json()
+        assert marker not in serialized_history
+        assert base64.b64encode(marker.encode()).decode() not in serialized_history
+        assert marker not in repr(preflight_error)
+
+    asyncio.run(run())
+
+
+@pytest.mark.postgres
+def test_provision_crusher_v2_prepare_commit_is_visible_before_runtime_apply(
+    migrated_database: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi.testclient import TestClient
+    from sqlalchemy import text
+
+    from fstack import api
+    from fstack.api import create_app
+
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
+    monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
+    monkeypatch.setattr(api, "create_engine", lambda *_args, **_kwargs: migrated_database)
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/v1/provisioning/operations",
+            headers={
+                "Authorization": "Bearer test-operator-token",
+                "Idempotency-Key": "task13-prepare-before-apply",
+            },
+            json={
+                "organization_slug": "task13",
+                "organization_name": "Task 13",
+                "business_slug": "crusher",
+                "business_name": "Crusher",
+                "environment_slug": "production",
+                "public_domain": "task13.example.test",
+                "crusher_image": "ghcr.io/michaelgold/crusher@sha256:" + "a" * 64,
+                "database_secret_ref": "secret://vault/task13/database",
+                "object_storage_secret_ref": "secret://vault/task13/object-storage",
+            },
+        )
+    response.raise_for_status()
+    operation_id = response.json()["operation_id"]
+    with migrated_database.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches DISABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE workflow_dispatches SET workflow_type='fstack.provision_crusher.v2' "
+                "WHERE operation_id=:operation_id"
+            ),
+            {"operation_id": operation_id},
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE workflow_dispatches ENABLE TRIGGER "
+                "tr_workflow_dispatches_lifecycle_guard"
+            )
+        )
+
+    observed_ids: list[ProvisioningSubmissionIds] = []
+
+    @activity.defn(name=APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+    async def apply(ids: ProvisioningSubmissionIds) -> None:
+        with migrated_database.connect() as connection:
+            state = connection.execute(
+                text("SELECT state FROM provisioning_operations WHERE id=:operation_id"),
+                {"operation_id": operation_id},
+            ).scalar_one()
+            events = (
+                connection.execute(
+                    text(
+                        "SELECT event_type, payload FROM audit_events "
+                        "WHERE operation_id=:operation_id ORDER BY created_at, id"
+                    ),
+                    {"operation_id": operation_id},
+                )
+                .mappings()
+                .all()
+            )
+        assert state == "running"
+        assert [event["event_type"] for event in events] == [
+            "provisioning.requested",
+            "provisioning.started",
+        ]
+        assert events[1]["payload"] == {
+            "runtime_submission_id": ids.runtime_submission_id,
+            "ingress_submission_id": ids.ingress_submission_id,
+        }
+        observed_ids.append(ids)
+
+    @activity.defn(name=PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY)
+    async def preflight(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def reconcile(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=PROBE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def probe(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY)
+    async def finalize(ids: ProvisioningSubmissionIds) -> ProvisionCrusherV2Result:
+        return ProvisionCrusherV2Result(operation_id=ids.operation_id, state="confirmed")
+
+    async def run() -> None:
+        environment = await WorkflowEnvironment.start_time_skipping()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            async with (
+                environment,
+                Worker(
+                    environment.client,
+                    task_queue="test-provision-crusher-v2-prepare-ordering",
+                    workflows=[ProvisionCrusherV2Workflow],
+                    activities=[
+                        prepare_local_crusher_ingress_v2,
+                        apply,
+                        preflight,
+                        reconcile,
+                        probe,
+                        finalize,
+                    ],
+                    activity_executor=executor,
+                ),
+            ):
+                result = await environment.client.execute_workflow(
+                    ProvisionCrusherV2Workflow.run,
+                    ProvisionCrusherV2Input(operation_id=operation_id),
+                    id=f"provisioning/{operation_id}/prepare-ordering",
+                    task_queue="test-provision-crusher-v2-prepare-ordering",
+                )
+        assert result == ProvisionCrusherV2Result(operation_id=operation_id, state="confirmed")
+
+    asyncio.run(run())
+    assert len(observed_ids) == 1
+
+
+@pytest.mark.parametrize(
+    ("retrying_activity", "error_code"),
+    [
+        (PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY, "activity_infrastructure_failure"),
+        (APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY, "docker_unavailable"),
+        (PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY, "caddy_unavailable"),
+        (RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY, "caddy_mutation_ambiguous"),
+        (PROBE_LOCAL_CADDY_INGRESS_ACTIVITY, "ingress_readiness_unavailable"),
+    ],
+)
+def test_provision_crusher_v2_workflow_retries_without_scheduling_downstream(
+    retrying_activity: str,
+    error_code: str,
+) -> None:
+    ids = _v2_ids()
+
+    async def run() -> None:
+        calls: list[tuple[str, object]] = []
+        attempts: dict[str, int] = {}
+        second_attempt_started = asyncio.Event()
+        release_second_attempt = asyncio.Event()
+
+        async def record(name: str, payload: object) -> None:
+            calls.append((name, payload))
+            attempts[name] = attempts.get(name, 0) + 1
+            if name != retrying_activity:
+                return
+            if attempts[name] == 1:
+                raise ApplicationError(error_code, error_code, non_retryable=False)
+            if attempts[name] == 2:
+                second_attempt_started.set()
+                await release_second_attempt.wait()
+
+        @activity.defn(name=PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY)
+        async def prepare(request: ProvisionCrusherV2Input) -> ProvisioningSubmissionIds:
+            await record(PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY, request)
+            return ids
+
+        @activity.defn(name=APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+        async def apply(payload: ProvisioningSubmissionIds) -> None:
+            await record(APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY, payload)
+
+        @activity.defn(name=PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY)
+        async def preflight(payload: ProvisioningSubmissionIds) -> None:
+            await record(PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY, payload)
+
+        @activity.defn(name=RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY)
+        async def reconcile(payload: ProvisioningSubmissionIds) -> None:
+            await record(RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY, payload)
+
+        @activity.defn(name=PROBE_LOCAL_CADDY_INGRESS_ACTIVITY)
+        async def probe(payload: ProvisioningSubmissionIds) -> None:
+            await record(PROBE_LOCAL_CADDY_INGRESS_ACTIVITY, payload)
+
+        @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY)
+        async def finalize_success(payload: ProvisioningSubmissionIds) -> ProvisionCrusherV2Result:
+            await record(FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY, payload)
+            return ProvisionCrusherV2Result(operation_id=payload.operation_id, state="confirmed")
+
+        @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY)
+        async def finalize_failure(_failure: ProvisioningFailureV2) -> ProvisionCrusherV2Result:
+            pytest.fail("retryable failures must not schedule failure finalization")
+
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as environment,
+            Worker(
+                environment.client,
+                task_queue="test-provision-crusher-v2-retry",
+                workflows=[ProvisionCrusherV2Workflow],
+                activities=[
+                    prepare,
+                    apply,
+                    preflight,
+                    reconcile,
+                    probe,
+                    finalize_success,
+                    finalize_failure,
+                ],
+            ),
+        ):
+            handle = await environment.client.start_workflow(
+                ProvisionCrusherV2Workflow.run,
+                ProvisionCrusherV2Input(operation_id=ids.operation_id),
+                id=f"provisioning/{ids.operation_id}/retry/{retrying_activity}",
+                task_queue="test-provision-crusher-v2-retry",
+            )
+            await asyncio.wait_for(second_attempt_started.wait(), timeout=5)
+            history_during_retry = await handle.fetch_history()
+            scheduled_during_retry = [
+                event.activity_task_scheduled_event_attributes.activity_type.name
+                for event in history_during_retry.events
+                if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+            ]
+            ordered_activities = [
+                PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY,
+                APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY,
+                PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY,
+                RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY,
+                PROBE_LOCAL_CADDY_INGRESS_ACTIVITY,
+            ]
+            retrying_index = ordered_activities.index(retrying_activity)
+            assert scheduled_during_retry == ordered_activities[: retrying_index + 1]
+            assert attempts[retrying_activity] == 2
+            assert [payload for name, payload in calls if name == retrying_activity] == [
+                calls[-2][1],
+                calls[-1][1],
+            ]
+            assert calls[-2][1] == calls[-1][1]
+            release_second_attempt.set()
+            result = await handle.result()
+
+        assert result == ProvisionCrusherV2Result(operation_id=ids.operation_id, state="confirmed")
+        assert attempts[retrying_activity] == 2
+        assert calls[-1] == (FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY, ids)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure_path", [False, True])
+def test_provision_crusher_v2_workflow_retries_finalization_with_the_same_payload(
+    failure_path: bool,
+) -> None:
+    ids = _v2_ids()
+    finalizer_payloads: list[object] = []
+
+    @activity.defn(name=PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY)
+    async def prepare(_request: ProvisionCrusherV2Input) -> ProvisioningSubmissionIds:
+        return ids
+
+    @activity.defn(name=APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+    async def apply(_ids: ProvisioningSubmissionIds) -> None:
+        if failure_path:
+            raise ApplicationError(
+                "docker_spec_conflict", "docker_spec_conflict", non_retryable=True
+            )
+
+    @activity.defn(name=PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY)
+    async def preflight(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def reconcile(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=PROBE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def probe(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY)
+    async def finalize_success(payload: ProvisioningSubmissionIds) -> ProvisionCrusherV2Result:
+        finalizer_payloads.append(payload)
+        if len(finalizer_payloads) == 1:
+            raise ApplicationError(
+                "activity_infrastructure_failure",
+                "activity_infrastructure_failure",
+                non_retryable=False,
+            )
+        return ProvisionCrusherV2Result(operation_id=payload.operation_id, state="confirmed")
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY)
+    async def finalize_failure(failure: ProvisioningFailureV2) -> ProvisionCrusherV2Result:
+        finalizer_payloads.append(failure)
+        if len(finalizer_payloads) == 1:
+            raise ApplicationError(
+                "activity_infrastructure_failure",
+                "activity_infrastructure_failure",
+                non_retryable=False,
+            )
+        return ProvisionCrusherV2Result(operation_id=failure.operation_id, state="failed")
+
+    async def run() -> None:
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as environment,
+            Worker(
+                environment.client,
+                task_queue="test-provision-crusher-v2-finalizer-retry",
+                workflows=[ProvisionCrusherV2Workflow],
+                activities=[
+                    prepare,
+                    apply,
+                    preflight,
+                    reconcile,
+                    probe,
+                    finalize_success,
+                    finalize_failure,
+                ],
+            ),
+        ):
+            result = await environment.client.execute_workflow(
+                ProvisionCrusherV2Workflow.run,
+                ProvisionCrusherV2Input(operation_id=ids.operation_id),
+                id=f"provisioning/{ids.operation_id}/finalizer-retry/{failure_path}",
+                task_queue="test-provision-crusher-v2-finalizer-retry",
+            )
+
+        assert result.state == ("failed" if failure_path else "confirmed")
+        assert len(finalizer_payloads) == 2
+        assert finalizer_payloads[0] == finalizer_payloads[1]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("failure_path", "expected_finalizer", "expected_code"),
+    [
+        (
+            False,
+            FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY,
+            "provisioning_success_state_invalid",
+        ),
+        (
+            True,
+            FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY,
+            "provisioning_failure_conflict",
+        ),
+    ],
+)
+def test_provision_crusher_v2_workflow_fails_closed_on_finalizer_conflict(
+    failure_path: bool,
+    expected_finalizer: str,
+    expected_code: str,
+) -> None:
+    ids = _v2_ids()
+    finalizer_calls: list[str] = []
+
+    @activity.defn(name=PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY)
+    async def prepare(_request: ProvisionCrusherV2Input) -> ProvisioningSubmissionIds:
+        return ids
+
+    @activity.defn(name=APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+    async def apply(_ids: ProvisioningSubmissionIds) -> None:
+        if failure_path:
+            raise ApplicationError(
+                "docker_spec_conflict", "docker_spec_conflict", non_retryable=True
+            )
+
+    @activity.defn(name=PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY)
+    async def preflight(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def reconcile(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    @activity.defn(name=PROBE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def probe(_ids: ProvisioningSubmissionIds) -> None:
+        return None
+
+    async def reject_finalizer(name: str, code: str) -> None:
+        finalizer_calls.append(name)
+        if name != expected_finalizer:
+            pytest.fail("alternate finalizer must not be scheduled")
+        raise ApplicationError(code, code, non_retryable=True)
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY)
+    async def finalize_success(_ids: ProvisioningSubmissionIds) -> ProvisionCrusherV2Result:
+        await reject_finalizer(
+            FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY,
+            "provisioning_success_state_invalid",
+        )
+        raise AssertionError("unreachable")
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY)
+    async def finalize_failure(_failure: ProvisioningFailureV2) -> ProvisionCrusherV2Result:
+        await reject_finalizer(
+            FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY,
+            "provisioning_failure_conflict",
+        )
+        raise AssertionError("unreachable")
+
+    async def run() -> None:
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as environment,
+            Worker(
+                environment.client,
+                task_queue="test-provision-crusher-v2-finalizer-conflict",
+                workflows=[ProvisionCrusherV2Workflow],
+                activities=[
+                    prepare,
+                    apply,
+                    preflight,
+                    reconcile,
+                    probe,
+                    finalize_success,
+                    finalize_failure,
+                ],
+            ),
+        ):
+            handle = await environment.client.start_workflow(
+                ProvisionCrusherV2Workflow.run,
+                ProvisionCrusherV2Input(operation_id=ids.operation_id),
+                id=f"provisioning/{ids.operation_id}/finalizer-conflict/{failure_path}",
+                task_queue="test-provision-crusher-v2-finalizer-conflict",
+            )
+            with pytest.raises(WorkflowFailureError) as caught:
+                await handle.result()
+            history = await handle.fetch_history()
+
+        assert finalizer_calls == [expected_finalizer]
+        activity_error = caught.value.cause
+        assert isinstance(activity_error, ActivityError)
+        application_error = activity_error.cause
+        assert isinstance(application_error, ApplicationError)
+        assert application_error.message == expected_code
+        assert list(application_error.details) == [expected_code]
+        assert application_error.non_retryable is True
+        scheduled_names = [
+            event.activity_task_scheduled_event_attributes.activity_type.name
+            for event in history.events
+            if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+        ]
+        assert scheduled_names.count(expected_finalizer) == 1
+        alternate_finalizer = (
+            FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY
+            if expected_finalizer == FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY
+            else FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY
+        )
+        assert alternate_finalizer not in scheduled_names
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("failed_activity", "error_code", "expected_scope", "expected_error_code"),
+    [
+        (
+            PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY,
+            "runtime_submission_conflict",
+            "runtime",
+            "runtime_submission_conflict",
+        ),
+        (
+            APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY,
+            "docker_spec_conflict",
+            "runtime",
+            "docker_spec_conflict",
+        ),
+        (
+            PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY,
+            "caddy_topology_invalid",
+            "ingress",
+            "caddy_topology_invalid",
+        ),
+        (
+            RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY,
+            "caddy_host_conflict",
+            "ingress",
+            "caddy_host_conflict",
+        ),
+        (
+            PROBE_LOCAL_CADDY_INGRESS_ACTIVITY,
+            "invalid_caddy_probe_configuration",
+            "ingress",
+            "invalid_caddy_probe_configuration",
+        ),
+        (
+            APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY,
+            "provider-marker://route/host/path/fingerprint",
+            "runtime",
+            "provisioning_failed",
+        ),
+    ],
+)
+def test_provision_crusher_v2_workflow_finalizes_permanent_failures_once(
+    failed_activity: str,
+    error_code: str,
+    expected_scope: str,
+    expected_error_code: str,
+) -> None:
+    ids = _v2_ids()
+    calls: list[str] = []
+    failures: list[ProvisioningFailureV2] = []
+
+    def reject_if_selected(name: str) -> None:
+        calls.append(name)
+        if name == failed_activity:
+            raise ApplicationError(error_code, error_code, non_retryable=True)
+
+    @activity.defn(name=PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY)
+    async def prepare(_request: ProvisionCrusherV2Input) -> ProvisioningSubmissionIds:
+        reject_if_selected(PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY)
+        return ids
+
+    @activity.defn(name=APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+    async def apply(_ids: ProvisioningSubmissionIds) -> None:
+        reject_if_selected(APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY)
+
+    @activity.defn(name=PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY)
+    async def preflight(_ids: ProvisioningSubmissionIds) -> None:
+        reject_if_selected(PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY)
+
+    @activity.defn(name=RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def reconcile(_ids: ProvisioningSubmissionIds) -> None:
+        reject_if_selected(RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY)
+
+    @activity.defn(name=PROBE_LOCAL_CADDY_INGRESS_ACTIVITY)
+    async def probe(_ids: ProvisioningSubmissionIds) -> None:
+        reject_if_selected(PROBE_LOCAL_CADDY_INGRESS_ACTIVITY)
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_SUCCESS_V2_ACTIVITY)
+    async def finalize_success(_ids: ProvisioningSubmissionIds) -> ProvisionCrusherV2Result:
+        pytest.fail("success finalizer must not run after a permanent failure")
+
+    @activity.defn(name=FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY)
+    async def finalize_failure(failure: ProvisioningFailureV2) -> ProvisionCrusherV2Result:
+        calls.append(FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY)
+        failures.append(failure)
+        return ProvisionCrusherV2Result(operation_id=failure.operation_id, state="failed")
+
+    async def run() -> None:
+        async with (
+            await WorkflowEnvironment.start_time_skipping() as environment,
+            Worker(
+                environment.client,
+                task_queue="test-provision-crusher-v2-failure",
+                workflows=[ProvisionCrusherV2Workflow],
+                activities=[
+                    prepare,
+                    apply,
+                    preflight,
+                    reconcile,
+                    probe,
+                    finalize_success,
+                    finalize_failure,
+                ],
+            ),
+        ):
+            result = await environment.client.execute_workflow(
+                ProvisionCrusherV2Workflow.run,
+                ProvisionCrusherV2Input(operation_id=ids.operation_id),
+                id=f"provisioning/{ids.operation_id}/{failed_activity}",
+                task_queue="test-provision-crusher-v2-failure",
+            )
+
+        assert result == ProvisionCrusherV2Result(operation_id=ids.operation_id, state="failed")
+        assert len(failures) == 1
+        assert failures[0].operation_id == ids.operation_id
+        assert failures[0].scope == expected_scope
+        assert failures[0].error_code == expected_error_code
+        ordered_activities = [
+            PREPARE_LOCAL_CRUSHER_INGRESS_V2_ACTIVITY,
+            APPLY_LOCAL_CRUSHER_RUNTIME_V2_ACTIVITY,
+            PREFLIGHT_LOCAL_CADDY_TOPOLOGY_ACTIVITY,
+            RECONCILE_LOCAL_CADDY_INGRESS_ACTIVITY,
+            PROBE_LOCAL_CADDY_INGRESS_ACTIVITY,
+        ]
+        failed_index = ordered_activities.index(failed_activity)
+        assert calls == [
+            *ordered_activities[: failed_index + 1],
+            FINALIZE_LOCAL_CRUSHER_INGRESS_FAILURE_V2_ACTIVITY,
+        ]
 
     asyncio.run(run())
 
