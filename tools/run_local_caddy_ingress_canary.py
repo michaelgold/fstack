@@ -424,6 +424,7 @@ def _finalize_success_evidence(
     forbidden_values: set[str],
     primary_error: Exception | None,
     cleanup_error: Exception | None,
+    postwrite_check: Callable[[], None] | None = None,
 ) -> None:
     if primary_error is not None or cleanup_error is not None:
         return
@@ -433,6 +434,13 @@ def _finalize_success_evidence(
         payload,
         forbidden_values=forbidden_values,
     )
+    if postwrite_check is not None:
+        try:
+            postwrite_check()
+        except Exception:
+            os.unlink("summary.json", dir_fd=evidence.descriptor)
+            os.fsync(evidence.descriptor)
+            raise
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -672,31 +680,6 @@ class DockerResourceRunner:
             self.container_images[name] = self.executor.run(self._container_image_command(identity))
         return identity
 
-    def recover_identity(self, name: str) -> str:
-        kind = self.kinds.get(name)
-        if kind is None or name not in self.creation_attempted:
-            raise CanaryContractError("resource creation was not attempted")
-        identity = ""
-        for attempt in range(10):
-            try:
-                identity = self.executor.run(self._inspect_command(kind, name))
-            except CanaryContractError:
-                identity = ""
-            if identity:
-                break
-            if attempt + 1 < 10:
-                time.sleep(0.1)
-        if not identity:
-            raise CanaryContractError("created Docker resource identity remains unavailable")
-        if name not in self.creation_confirmed:
-            owner = self.executor.run(self._owner_command(kind, identity))
-            if owner != self._expected_owner(name):
-                raise CanaryContractError("ambiguous Docker resource is not canary-owned")
-        self.identities[name] = identity
-        if kind == "container":
-            self.container_images[name] = self.executor.run(self._container_image_command(identity))
-        return identity
-
     def remove(self, name: str, command: tuple[str, ...]) -> None:
         kind = self.kinds.get(name)
         expected = self.identities.get(name)
@@ -729,6 +712,13 @@ class DockerResourceRunner:
             raise CanaryContractError("cleanup left a Docker resource behind")
         if kind == "container" and self.executor.exists(("docker", "container", "inspect", name)):
             raise CanaryContractError("cleanup left the canonical container name occupied")
+
+    def verify_pending_absent(self, name: str) -> None:
+        kind = self.kinds.get(name)
+        if kind is None:
+            raise CanaryContractError("cleanup resource kind is unavailable")
+        if self.executor.exists(("docker", kind, "inspect", name)):
+            raise CanaryContractError("ambiguous pending Docker resource remained")
 
     def register_kind(self, name: str, remove_command: tuple[str, ...]) -> None:
         self.kinds[name] = self._kind_from(remove_command)
@@ -764,30 +754,36 @@ class CleanupRegistry:
 
     def run_and_verify(self) -> None:
         errors: list[Exception] = []
-        if isinstance(self.runner, DockerResourceRunner):
-            for name in tuple(self.pending):
-                try:
-                    self.mark_created(name, self.runner.recover_identity(name))
-                except Exception as exc:
-                    errors.append(exc)
         created_entries = [entry for entry in self.entries if entry[0] in self.created]
         for name, command in reversed(created_entries):
             try:
                 self.runner.remove(name, command)
             except Exception as exc:
                 errors.append(exc)
-        for name, _command in reversed(created_entries):
+        try:
+            self.verify_residue_absent()
+        except Exception as exc:
+            errors.append(exc)
+        if errors:
+            raise CanaryContractError(f"cleanup failed for {len(errors)} operation(s)")
+
+    def verify_residue_absent(self) -> None:
+        errors: list[Exception] = []
+        for name in reversed(tuple(self.created)):
             try:
                 self.runner.verify_absent(name)
             except Exception as exc:
                 errors.append(exc)
         for name in sorted(self.pending):
             try:
-                self.runner.verify_absent(name)
+                if isinstance(self.runner, DockerResourceRunner):
+                    self.runner.verify_pending_absent(name)
+                else:
+                    self.runner.verify_absent(name)
             except Exception as exc:
                 errors.append(exc)
         if errors:
-            raise CanaryContractError(f"cleanup failed for {len(errors)} operation(s)")
+            raise CanaryContractError(f"cleanup residue remained for {len(errors)} resource(s)")
 
 
 @dataclass(frozen=True)
@@ -3120,6 +3116,9 @@ def run_live_canary(inputs: CanaryInputs) -> None:
                     forbidden_values=forbidden,
                     primary_error=primary_error,
                     cleanup_error=cleanup_error,
+                    postwrite_check=(
+                        cleanup.verify_residue_absent if cleanup is not None else None
+                    ),
                 )
         except Exception as exc:
             cleanup_error = cleanup_error or exc

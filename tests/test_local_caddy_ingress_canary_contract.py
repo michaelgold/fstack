@@ -379,46 +379,32 @@ def test_execute_resource_registers_cleanup_before_creation_and_records_identity
     assert cleanup.created[spec.name] == f"created:{spec.name}"
 
 
-def test_nonzero_create_that_materialized_owned_resource_is_cleaned() -> None:
+def test_nonzero_create_never_adopts_materialized_canonical_container() -> None:
     name = "fstack-caddy-canary-abc123-worker"
-    identifier = "c" * 64
     create = ("docker", "run", "-d", "--name", name, "image")
-    inspect_name = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
-    inspect_id = ("docker", "container", "inspect", "--format", "{{.Id}}", identifier)
-    owner_id = (
-        "docker",
-        "container",
-        "inspect",
-        "--format",
-        (
-            '{{index .Config.Labels "io.fstack.canary"}}|'
-            '{{index .Config.Labels "io.fstack.canary.invocation"}}'
-        ),
-        identifier,
-    )
-    image_id = (
-        "docker",
-        "container",
-        "inspect",
-        "--format",
-        "{{.Config.Image}}",
-        identifier,
-    )
-    remove_id = ("docker", "container", "rm", "--force", identifier)
+    remove = ("docker", "container", "rm", "--force", name)
     executor = SequenceExecutor(
         {
             create: [None],
-            inspect_name: [identifier],
-            inspect_id: [identifier],
-            owner_id: [
-                "fstack-caddy-canary-abc123|test-invocation",
-                "fstack-caddy-canary-abc123|test-invocation",
-            ],
-            image_id: ["image", "image"],
-            remove_id: ["removed"],
-            ("docker", "container", "inspect", identifier): [None],
+            ("docker", "container", "inspect", name): ["exists", "exists"],
         }
     )
+    runner = DockerResourceRunner(executor)
+    cleanup = CleanupRegistry(runner)
+    spec = ResourceSpec(name, create, ("docker", "container", "rm", "--force"))
+
+    with pytest.raises(CanaryContractError):
+        execute_resource(spec, runner, cleanup)
+    with pytest.raises(CanaryContractError, match="cleanup failed"):
+        cleanup.run_and_verify()
+
+    assert remove not in executor.calls
+
+
+def test_nonzero_create_with_no_canonical_residue_is_safe() -> None:
+    name = "fstack-caddy-canary-abc123-worker"
+    create = ("docker", "run", "-d", "--name", name, "image")
+    executor = SequenceExecutor({create: [None]})
     runner = DockerResourceRunner(executor)
     cleanup = CleanupRegistry(runner)
     spec = ResourceSpec(name, create, ("docker", "container", "rm", "--force"))
@@ -427,42 +413,7 @@ def test_nonzero_create_that_materialized_owned_resource_is_cleaned() -> None:
         execute_resource(spec, runner, cleanup)
     cleanup.run_and_verify()
 
-    assert executor.calls.count(remove_id) == 1
-
-
-def test_nonzero_create_never_adopts_resource_with_wrong_invocation_token() -> None:
-    name = "fstack-caddy-canary-abc123-worker"
-    identifier = "c" * 64
-    create = ("docker", "run", "-d", "--name", name, "image")
-    inspect = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
-    owner = (
-        "docker",
-        "container",
-        "inspect",
-        "--format",
-        (
-            '{{index .Config.Labels "io.fstack.canary"}}|'
-            '{{index .Config.Labels "io.fstack.canary.invocation"}}'
-        ),
-        identifier,
-    )
-    remove = ("docker", "container", "rm", "--force", identifier)
-    executor = SequenceExecutor(
-        {
-            create: [None],
-            inspect: [identifier],
-            owner: ["fstack-caddy-canary-abc123|raced-token"],
-        }
-    )
-    runner = DockerResourceRunner(executor)
-    cleanup = CleanupRegistry(runner)
-    spec = ResourceSpec(name, create, ("docker", "container", "rm", "--force"))
-
-    with pytest.raises(CanaryContractError):
-        execute_resource(spec, runner, cleanup)
-    with pytest.raises(CanaryContractError):
-        cleanup.run_and_verify()
-    assert remove not in executor.calls
+    assert ("docker", "container", "rm", "--force", name) not in executor.calls
 
 
 def test_real_runner_retries_identity_capture_after_successful_create() -> None:
@@ -1823,6 +1774,25 @@ def test_success_evidence_is_written_only_after_error_free_cleanup(tmp_path: Pat
         assert json.loads((complete.path / "summary.json").read_text())["status"] == "succeeded"
     finally:
         complete.close()
+
+    raced = create_evidence_directory(repo, tmp_path / "raced-evidence")
+    try:
+
+        def reject_residue() -> None:
+            raise CanaryContractError("static residue appeared")
+
+        with pytest.raises(CanaryContractError, match="static residue appeared"):
+            _finalize_success_evidence(
+                raced,
+                {"status": "succeeded"},
+                forbidden_values=set(),
+                primary_error=None,
+                cleanup_error=None,
+                postwrite_check=reject_residue,
+            )
+        assert not (raced.path / "summary.json").exists()
+    finally:
+        raced.close()
 
 
 def test_prepare_source_queries_git_and_rejects_dirty_or_mismatched_head(tmp_path: Path) -> None:
