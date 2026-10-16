@@ -1734,6 +1734,23 @@ def _durable_counts_command(plan: CanaryPlan, operation_id: str) -> tuple[str, .
     )
 
 
+def _migration_head_command(plan: CanaryPlan) -> tuple[str, ...]:
+    return (
+        "docker",
+        "exec",
+        plan.postgres_container,
+        "psql",
+        "--username",
+        "fstack",
+        "--dbname",
+        plan.database_name,
+        "--tuples-only",
+        "--no-align",
+        "--command",
+        "SELECT version_num FROM alembic_version",
+    )
+
+
 def inputs_image(plan: CanaryPlan, name: str) -> str:
     images = {
         "caddy": plan.inputs.caddy_image,
@@ -2906,9 +2923,9 @@ def run_live_canary(inputs: CanaryInputs) -> None:
             maintenance["verify-new-poller"].argv,
             accept=_task_queue_has_pollers,
         )
-        migration_head = executor.run(
-            ("docker", "exec", plan.worker_container, "alembic", "current")
-        )
+        migration_head = executor.run(_migration_head_command(plan))
+        if migration_head != "20261015_0005":
+            raise CanaryContractError("migration head was unexpected")
         versions = {
             "docker": executor.run(("docker", "version", "--format", "{{.Server.Version}}")),
             "git": executor.run(("git", "--version")),

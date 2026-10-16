@@ -32,6 +32,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     _durable_counts_command,
     _finalize_success_evidence,
     _merge_captured_resources,
+    _migration_head_command,
     _quiesce_canary_producers,
     _recover_expected_operations,
     _select_exact_managed_route,
@@ -663,6 +664,10 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
     counts = _durable_counts_command(plan, "12345678-1234-5678-9234-567812345679")
     assert counts[:4] == ("docker", "exec", plan.postgres_container, "psql")
     assert "12345678-1234-5678-9234-567812345679" in counts[-1]
+    migration_head = _migration_head_command(plan)
+    assert migration_head[:4] == ("docker", "exec", plan.postgres_container, "psql")
+    assert migration_head[migration_head.index("--dbname") + 1] == plan.database_name
+    assert migration_head[-1] == "SELECT version_num FROM alembic_version"
     for sql_command in (
         _dispatch_generation_command(plan, "12345678-1234-5678-9234-567812345679"),
         _submission_ids_command(plan, "12345678-1234-5678-9234-567812345679"),
