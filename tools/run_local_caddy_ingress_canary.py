@@ -646,12 +646,17 @@ class DockerResourceRunner:
         if kind is None:
             raise CanaryContractError("resource was not registered before create")
         self.creation_attempted.add(name)
-        self.executor.run(command, timeout=900)
+        created_output = self.executor.run(command, timeout=900)
         self.creation_confirmed.add(name)
+        target = name
+        if kind == "container":
+            target = created_output.strip()
+            if re.fullmatch(r"[0-9a-f]{64}", target) is None:
+                raise CanaryContractError("created Docker container returned an invalid identity")
         identity = ""
         for attempt in range(10):
             try:
-                identity = self.executor.run(self._inspect_command(kind, name))
+                identity = self.executor.run(self._inspect_command(kind, target))
             except CanaryContractError:
                 identity = ""
             if identity:
@@ -660,6 +665,8 @@ class DockerResourceRunner:
                 time.sleep(0.1)
         if not identity:
             raise CanaryContractError("created Docker resource has no immutable identity")
+        if kind == "container" and identity != target:
+            raise CanaryContractError("created Docker container identity did not match")
         self.identities[name] = identity
         if kind == "container":
             self.container_images[name] = self.executor.run(self._container_image_command(identity))
@@ -3156,6 +3163,9 @@ def cli(
         return main(argv, runner=runner)
     except CanaryContractError as exc:
         print(f"canary_error: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print("canary_error: internal failure", file=sys.stderr)
         return 1
 
 
