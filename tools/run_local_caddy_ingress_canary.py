@@ -928,8 +928,12 @@ def _populate_runtime_files(
     plan: CanaryPlan, runtime_root: Path, secrets_bundle: RuntimeSecrets
 ) -> None:
     try:
-        source_bundle = runtime_root / "source-secrets" / "canary" / "database"
-        source_bundle.mkdir(mode=0o700, parents=True)
+        source_root = runtime_root / "source-secrets"
+        source_root.mkdir(mode=0o700)
+        canary_source = source_root / "canary"
+        canary_source.mkdir(mode=0o700)
+        source_bundle = canary_source / "database"
+        source_bundle.mkdir(mode=0o700)
         (runtime_root / "runtime-secrets").mkdir(mode=0o700)
     except OSError as exc:
         raise CanaryContractError("runtime workspace must be new and private") from exc

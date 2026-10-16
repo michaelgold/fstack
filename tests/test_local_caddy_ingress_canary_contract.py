@@ -1099,6 +1099,14 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
     for filename in ("postgres.env", "temporal.env", "api.env", "worker.env"):
         assert (runtime / filename).stat().st_mode & 0o777 == 0o600
     source_bundle = runtime / "source-secrets" / "canary" / "database"
+    for directory in (
+        runtime / "source-secrets",
+        runtime / "source-secrets" / "canary",
+        source_bundle,
+        runtime / "runtime-secrets",
+    ):
+        assert directory.stat().st_mode & 0o777 == 0o700
+        assert directory.stat().st_uid == runtime.stat().st_uid
     assert (
         json.loads((source_bundle / "owner.json").read_text(encoding="utf-8"))[
             "application_password"
