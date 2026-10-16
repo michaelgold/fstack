@@ -681,6 +681,7 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
         assert topology[:3] == ("docker", "exec", plan.worker_container)
         assert "preflight_then_reconcile" in topology[-1]
         assert scenario in topology[-1]
+        assert all("\n" not in argument and "\r" not in argument for argument in topology)
         compile(topology[-1], f"<topology-{scenario}>", "exec")
 
     for command in (

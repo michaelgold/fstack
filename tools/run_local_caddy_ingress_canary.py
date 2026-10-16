@@ -1650,7 +1650,8 @@ def _topology_mismatch_command(
             "else: raise AssertionError('topology mismatch was accepted')",
         )
     )
-    return ("docker", "exec", plan.worker_container, "python", "-c", script)
+    launcher = f"source={script!r};exec(compile(source,'<topology-mismatch>','exec'))"
+    return ("docker", "exec", plan.worker_container, "python", "-c", launcher)
 
 
 def _durable_counts_command(plan: CanaryPlan, operation_id: str) -> tuple[str, ...]:
