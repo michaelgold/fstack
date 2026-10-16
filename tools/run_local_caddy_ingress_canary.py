@@ -2227,7 +2227,7 @@ def _api_status_command(plan: CanaryPlan, operation_id: str) -> tuple[str, ...]:
         "+operation_id,headers={'authorization':'Bearer '+os.environ['FSTACK_OPERATOR_TOKEN']});"
         "response=json.load(urllib.request.urlopen(request,timeout=10));"
         "print(json.dumps({'operation_id':response['operation_id'],'state':response['state'],"
-        "'error':response.get('error')},sort_keys=True,separators=(',',':')))"
+        "'error':response.get('last_error')},sort_keys=True,separators=(',',':')))"
     )
     return ("docker", "exec", plan.api_container, "python", "-c", script)
 

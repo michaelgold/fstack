@@ -23,6 +23,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     RuntimeSecrets,
     _adopt_caddy_route_command,
     _api_post_command,
+    _api_status_command,
     _caddy_routes_command,
     _canary_processes_absent,
     _capture_network_crusher_containers,
@@ -672,6 +673,7 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
     set_routes = _caddy_routes_command(plan, replacement=[{"@id": "fixture"}])
     adopt = _adopt_caddy_route_command(plan, {"@id": "fixture"})
     conflict_post = _api_post_command(plan, f"{plan.prefix}-unmanaged", scenario="unmanaged")
+    status_command = _api_status_command(plan, "12345678-1234-5678-9234-567812345679")
     for command in (get_routes, set_routes, adopt):
         assert command[:3] == ("docker", "exec", plan.caddy_client_container)
     assert "method='PATCH'" in set_routes[-1]
@@ -679,6 +681,8 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
     assert "._exchange(request)" in get_routes[-1]
     assert "CaddyAdmin" in adopt[-1]
     assert "scenario='unmanaged'" in conflict_post[-1]
+    assert "response.get('last_error')" in status_command[-1]
+    assert "response.get('error')" not in status_command[-1]
     for scenario in ("wrong-network", "wrong-probe-ip", "missing-alias"):
         topology = _topology_mismatch_command(
             plan,
