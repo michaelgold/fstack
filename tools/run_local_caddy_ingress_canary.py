@@ -817,6 +817,7 @@ class CanaryPlan:
     postgres_container: str
     temporal_container: str
     caddy_container: str
+    caddy_client_container: str
     api_container: str
     worker_container: str
     temporal_namespace: str
@@ -906,6 +907,7 @@ class CanaryPlan:
             self.postgres_container,
             self.temporal_container,
             self.caddy_container,
+            self.caddy_client_container,
             self.api_container,
             self.worker_container,
             self.temporal_namespace,
@@ -1099,6 +1101,13 @@ def build_runtime_commands(
         "FSTACK_CADDY_PROBE_ADDRESS": plan.listener_address,
         "FSTACK_CADDY_CONTAINER_NAME": plan.caddy_container,
     }
+    caddy_client_environment = {
+        "FSTACK_CADDY_ADMIN_ROOT": "/run/fstack-caddy",
+        "FSTACK_CADDY_ADMIN_UID": str(plan.worker_uid),
+        "FSTACK_CADDY_ADMIN_GID": str(plan.caddy_socket_gid),
+        "FSTACK_CADDY_PROBE_ADDRESS": plan.listener_address,
+        "FSTACK_CADDY_CONTAINER_NAME": plan.caddy_container,
+    }
     api_environment = {
         database_url_key: database_url,
         operator_token_key: secrets_bundle.operator_token,
@@ -1228,6 +1237,40 @@ def build_runtime_commands(
             {"CADDY_SOCKET_MODE": "0220"},
         ),
         CommandSpec(
+            "caddy-client",
+            (
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                plan.caddy_client_container,
+                "--network",
+                "none",
+                "--label",
+                label,
+                "--label",
+                invocation_label,
+                "--user",
+                f"{plan.worker_uid}:{plan.worker_gid}",
+                "--group-add",
+                str(plan.caddy_socket_gid),
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--env-file",
+                str(runtime_root / "caddy-client.env"),
+                "--volume",
+                socket_mount,
+                plan.fstack_image,
+                "python",
+                "-c",
+                "import time;time.sleep(86400)",
+            ),
+            caddy_client_environment,
+        ),
+        CommandSpec(
             "api",
             (
                 "docker",
@@ -1353,6 +1396,11 @@ def build_resource_specs(
         ResourceSpec(
             plan.caddy_container,
             commands["caddy"].argv,
+            ("docker", "container", "rm", "--force"),
+        ),
+        ResourceSpec(
+            plan.caddy_client_container,
+            commands["caddy-client"].argv,
             ("docker", "container", "rm", "--force"),
         ),
         ResourceSpec(
@@ -1505,7 +1553,7 @@ def build_live_verification_commands(
     return (
         CommandSpec(
             "inspect-exact-caddy-route",
-            ("docker", "exec", plan.worker_container, "python", "-c", route_script),
+            ("docker", "exec", plan.caddy_client_container, "python", "-c", route_script),
         ),
         CommandSpec(
             "probe-caddy-to-crusher",
@@ -1707,6 +1755,7 @@ def assert_no_resource_collisions(plan: CanaryPlan, executor: CommandExecutor) -
                 plan.postgres_container,
                 plan.temporal_container,
                 plan.caddy_container,
+                plan.caddy_client_container,
                 plan.api_container,
                 plan.worker_container,
                 f"{plan.prefix}-migration-20261006_0003",
@@ -1741,6 +1790,7 @@ def build_plan(inputs: CanaryInputs) -> CanaryPlan:
         postgres_container=f"{prefix}-postgres",
         temporal_container=f"{prefix}-temporal",
         caddy_container=f"{prefix}-caddy",
+        caddy_client_container=f"{prefix}-caddy-client",
         api_container=f"{prefix}-api",
         worker_container=f"{prefix}-worker",
         temporal_namespace=f"{prefix}-namespace",
@@ -2150,7 +2200,7 @@ def _caddy_routes_command(
         "response=CaddyAdminTransport(CaddyAdminConfig.from_environ())._exchange(request);"
         "assert 200<=response.status<300,response.status;print(response.body.decode())"
     )
-    return ("docker", "exec", plan.worker_container, "python", "-c", script)
+    return ("docker", "exec", plan.caddy_client_container, "python", "-c", script)
 
 
 def _adopt_caddy_route_command(plan: CanaryPlan, route: dict[str, object]) -> tuple[str, ...]:
@@ -2166,7 +2216,7 @@ def _adopt_caddy_route_command(plan: CanaryPlan, route: dict[str, object]) -> tu
         "config=CaddyAdminConfig.from_environ();"
         "CaddyAdmin(CaddyAdminTransport(config)).reconcile(route);print('adopted')"
     )
-    return ("docker", "exec", plan.worker_container, "python", "-c", script)
+    return ("docker", "exec", plan.caddy_client_container, "python", "-c", script)
 
 
 def _api_status_command(plan: CanaryPlan, operation_id: str) -> tuple[str, ...]:
@@ -2537,6 +2587,12 @@ def run_live_canary(inputs: CanaryInputs) -> None:
                 "/run/fstack-caddy/caddy-admin.sock",
             ),
             accept=lambda output: output == expected_socket,
+        )
+        execute_resource(by_name[plan.caddy_client_container], docker_runner, cleanup)
+        _wait_for_output(
+            executor,
+            _caddy_routes_command(plan),
+            accept=lambda output: output == "[]",
         )
 
         maintenance = {

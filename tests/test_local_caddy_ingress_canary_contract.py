@@ -582,9 +582,19 @@ def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: 
         assert ("--network", plan.network) in list(
             zip(commands[name].argv, commands[name].argv[1:], strict=False)
         )
+    assert ("--network", "none") in list(
+        zip(commands["caddy-client"].argv, commands["caddy-client"].argv[1:], strict=False)
+    )
     socket_mount = f"{plan.control_volume}:/run/fstack-caddy"
     socket_consumers = {name for name, command in commands.items() if socket_mount in command.argv}
-    assert socket_consumers == {"caddy", "worker"}
+    assert socket_consumers == {"caddy", "caddy-client", "worker"}
+    assert "/var/run/docker.sock:/var/run/docker.sock" not in commands["caddy-client"].argv
+    assert ("--user", f"{plan.worker_uid}:{plan.worker_gid}") in list(
+        zip(commands["caddy-client"].argv, commands["caddy-client"].argv[1:], strict=False)
+    )
+    assert ("--group-add", str(plan.caddy_socket_gid)) in list(
+        zip(commands["caddy-client"].argv, commands["caddy-client"].argv[1:], strict=False)
+    )
     invocation_label = f"io.fstack.canary.invocation={plan.invocation_token}"
     for command in commands.values():
         assert invocation_label in command.argv
@@ -663,7 +673,7 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
     adopt = _adopt_caddy_route_command(plan, {"@id": "fixture"})
     conflict_post = _api_post_command(plan, f"{plan.prefix}-unmanaged", scenario="unmanaged")
     for command in (get_routes, set_routes, adopt):
-        assert command[:3] == ("docker", "exec", plan.worker_container)
+        assert command[:3] == ("docker", "exec", plan.caddy_client_container)
     assert "method='PATCH'" in set_routes[-1]
     assert "CaddyAdminTransport" in get_routes[-1]
     assert "._exchange(request)" in get_routes[-1]
@@ -1125,7 +1135,13 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
         "database_secret_ref": "secret://local-file/canary/database",
         "object_storage_secret_ref": "secret://local-file/canary/database",
     }
-    for filename in ("postgres.env", "temporal.env", "api.env", "worker.env"):
+    for filename in (
+        "postgres.env",
+        "temporal.env",
+        "api.env",
+        "worker.env",
+        "caddy-client.env",
+    ):
         assert (runtime / filename).stat().st_mode & 0o777 == 0o600
     source_bundle = runtime / "source-secrets" / "canary" / "database"
     for directory in (
@@ -1164,6 +1180,7 @@ def test_collision_preflight_rejects_any_exact_existing_resource(tmp_path: Path)
         plan.postgres_container,
         plan.temporal_container,
         plan.caddy_container,
+        plan.caddy_client_container,
         plan.api_container,
         plan.worker_container,
         f"{plan.prefix}-migration-20261006_0003",
