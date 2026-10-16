@@ -116,7 +116,7 @@ def test_requires_exact_immutable_images_and_caddy_v2117(tmp_path: Path) -> None
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=evidence,
         nonce="abc123",
     )
@@ -127,13 +127,20 @@ def test_requires_exact_immutable_images_and_caddy_v2117(tmp_path: Path) -> None
         "caddy_image": "caddy:2.11.7",
         "postgres_image": "postgres:17-alpine",
         "temporal_image": "temporalio/auto-setup:1.25.2",
-        "crusher_image": "ghcr.io/michaelgold/crusher:canary",
+        "crusher_image": "ghcr.io/michaelgold/crusher",
     }.items():
         with pytest.raises(CanaryContractError):
             CanaryInputs(**{**inputs.__dict__, field: value})
 
     with pytest.raises(CanaryContractError):
         CanaryInputs(**{**inputs.__dict__, "caddy_image": _digest("caddy:2.11.6", "1")})
+    with pytest.raises(CanaryContractError, match="Crusher image"):
+        CanaryInputs(
+            **{
+                **inputs.__dict__,
+                "crusher_image": _digest("ghcr.io/michaelgold/crusher:canary", "4"),
+            }
+        )
 
 
 def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
@@ -146,7 +153,7 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -263,7 +270,7 @@ def test_plan_is_fully_isolated_and_registers_cleanup_before_create(tmp_path: Pa
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -536,7 +543,7 @@ def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: 
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -595,7 +602,7 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -704,7 +711,7 @@ def test_runtime_commands_are_detached_configured_and_keep_secrets_out_of_argv(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -765,7 +772,7 @@ def test_resource_specs_create_dependencies_in_order_and_define_exact_cleanup(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -805,7 +812,7 @@ def test_cleanup_recovers_accepted_operations_from_durable_canary_state() -> Non
             caddy_image=_digest("caddy:2.11.7", "b"),
             postgres_image=_digest("postgres:17", "c"),
             temporal_image=_digest("temporalio/auto-setup:1.27", "d"),
-            crusher_image=_digest("crusher:canary", "e"),
+            crusher_image=_digest("example.invalid/crusher", "e"),
             evidence_dir=Path("/evidence"),
             nonce="abc123",
         )
@@ -866,7 +873,7 @@ def test_cleanup_quiesces_api_and_worker_before_dynamic_inventory() -> None:
             caddy_image=_digest("caddy:2.11.7", "b"),
             postgres_image=_digest("postgres:17", "c"),
             temporal_image=_digest("temporalio/auto-setup:1.27", "d"),
-            crusher_image=_digest("crusher:canary", "e"),
+            crusher_image=_digest("example.invalid/crusher", "e"),
             evidence_dir=Path("/evidence"),
             nonce="abc123",
         )
@@ -901,7 +908,7 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1014,7 +1021,7 @@ def test_full_resource_failure_cleans_every_previously_captured_identity(tmp_pat
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1049,7 +1056,7 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1109,7 +1116,7 @@ def test_collision_preflight_rejects_any_exact_existing_resource(tmp_path: Path)
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1141,7 +1148,7 @@ def test_process_exit_proof_ignores_unrelated_containers_but_fails_on_canary_nam
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1160,7 +1167,7 @@ def test_maintenance_sequence_keeps_api_off_until_v2_polling_is_proved(tmp_path:
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1310,7 +1317,7 @@ def test_cli_requires_exact_task21_inputs(tmp_path: Path) -> None:
             "--temporal-image-digest",
             _digest("temporalio/auto-setup:1.25.2", "3"),
             "--crusher-image-digest",
-            _digest("ghcr.io/michaelgold/crusher:canary", "4"),
+            _digest("ghcr.io/michaelgold/crusher", "4"),
             "--evidence-dir",
             str(tmp_path / "evidence"),
         ]
@@ -1338,7 +1345,7 @@ def test_main_constructs_validated_inputs_and_invokes_the_live_runner(tmp_path: 
             "--temporal-image-digest",
             _digest("temporalio/auto-setup:1.25.2", "3"),
             "--crusher-image-digest",
-            _digest("ghcr.io/michaelgold/crusher:canary", "4"),
+            _digest("ghcr.io/michaelgold/crusher", "4"),
             "--evidence-dir",
             str(tmp_path / "evidence"),
             "--nonce",

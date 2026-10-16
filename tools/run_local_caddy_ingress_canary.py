@@ -23,6 +23,11 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}$")
+_PROVISIONING_IMAGE = re.compile(
+    r"[a-z0-9]+(?:[.-][a-z0-9]+)*/"
+    r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*@sha256:[0-9a-f]{64}\Z"
+)
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _NONCE = re.compile(r"^[a-z0-9]{6,20}$")
 _CONFLICT_SCENARIOS = (
@@ -1719,6 +1724,10 @@ class CanaryInputs:
                 raise CanaryContractError("every image must use an exact sha256 digest")
         if not self.caddy_image.startswith("caddy:2.11.7@sha256:"):
             raise CanaryContractError("the Caddy image must identify v2.11.7")
+        if _PROVISIONING_IMAGE.fullmatch(self.crusher_image) is None:
+            raise CanaryContractError(
+                "Crusher image must use the provisioning API's canonical digest-only form"
+            )
         if _NONCE.fullmatch(self.nonce) is None:
             raise CanaryContractError("invalid canary nonce")
         if (self.source_commit is None) == (self.source_archive is None):
