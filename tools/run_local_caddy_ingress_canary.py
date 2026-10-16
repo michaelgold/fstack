@@ -13,6 +13,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 import uuid
@@ -63,8 +64,8 @@ def _captured(argv: list[str], *, cwd: Path | None = None) -> str:
             text=True,
             timeout=60,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise CanaryContractError("source verification command failed") from exc
+    except (OSError, subprocess.SubprocessError):
+        raise CanaryContractError("source verification command failed") from None
     return completed.stdout
 
 
@@ -95,8 +96,8 @@ def prepare_source(
                 capture_output=True,
                 timeout=60,
             ).stdout
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise CanaryContractError("source commit archive failed") from exc
+        except (OSError, subprocess.SubprocessError):
+            raise CanaryContractError("source commit archive failed") from None
         digest = hashlib.sha256(archived).hexdigest()
         archive_path = workspace.parent / f".{workspace.name}-{secrets.token_hex(8)}.tar"
         try:
@@ -473,8 +474,8 @@ class LocalCommandExecutor:
                 timeout=timeout,
                 env={"PATH": os.environ.get("PATH", os.defpath)},
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise CanaryContractError("canary command failed") from exc
+        except (OSError, subprocess.SubprocessError):
+            raise CanaryContractError("canary command failed") from None
         if len(completed.stdout) > 64 * 1024 or len(completed.stderr) > 64 * 1024:
             raise CanaryContractError("canary command output exceeded the bound")
         return completed.stdout.strip()
@@ -494,8 +495,8 @@ class LocalCommandExecutor:
                 timeout=timeout,
                 env={"PATH": os.environ.get("PATH", os.defpath)},
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise CanaryContractError("collision preflight command failed") from exc
+        except (OSError, subprocess.SubprocessError):
+            raise CanaryContractError("collision preflight command failed") from None
         if completed.returncode not in {0, 1}:
             raise CanaryContractError("collision preflight returned an unexpected status")
         return completed.returncode == 0
@@ -590,6 +591,7 @@ class DockerResourceRunner:
     ownership_token: str = "test-invocation"
     kinds: dict[str, str] = field(default_factory=dict)
     identities: dict[str, str] = field(default_factory=dict)
+    container_images: dict[str, str] = field(default_factory=dict)
     creation_confirmed: set[str] = field(default_factory=set)
     creation_attempted: set[str] = field(default_factory=set)
 
@@ -608,7 +610,7 @@ class DockerResourceRunner:
         template = "{{json .CreatedAt}}" if kind == "volume" else "{{.Id}}"
         return ("docker", kind, "inspect", "--format", template, name)
 
-    def _owner_command(self, kind: str, name: str) -> tuple[str, ...]:
+    def _owner_command(self, kind: str, target: str) -> tuple[str, ...]:
         labels_path = ".Config.Labels" if kind in {"container", "image"} else ".Labels"
         template = (
             "{{index " + labels_path + ' "io.fstack.canary"}}|'
@@ -620,7 +622,17 @@ class DockerResourceRunner:
             "inspect",
             "--format",
             template,
-            name,
+            target,
+        )
+
+    def _container_image_command(self, target: str) -> tuple[str, ...]:
+        return (
+            "docker",
+            "container",
+            "inspect",
+            "--format",
+            "{{.Config.Image}}",
+            target,
         )
 
     def _expected_owner(self, name: str) -> str:
@@ -649,6 +661,8 @@ class DockerResourceRunner:
         if not identity:
             raise CanaryContractError("created Docker resource has no immutable identity")
         self.identities[name] = identity
+        if kind == "container":
+            self.container_images[name] = self.executor.run(self._container_image_command(identity))
         return identity
 
     def recover_identity(self, name: str) -> str:
@@ -668,10 +682,12 @@ class DockerResourceRunner:
         if not identity:
             raise CanaryContractError("created Docker resource identity remains unavailable")
         if name not in self.creation_confirmed:
-            owner = self.executor.run(self._owner_command(kind, name))
+            owner = self.executor.run(self._owner_command(kind, identity))
             if owner != self._expected_owner(name):
                 raise CanaryContractError("ambiguous Docker resource is not canary-owned")
         self.identities[name] = identity
+        if kind == "container":
+            self.container_images[name] = self.executor.run(self._container_image_command(identity))
         return identity
 
     def remove(self, name: str, command: tuple[str, ...]) -> None:
@@ -679,19 +695,30 @@ class DockerResourceRunner:
         expected = self.identities.get(name)
         if kind is None or expected is None:
             raise CanaryContractError("cleanup ownership is unavailable")
-        current = self.executor.run(self._inspect_command(kind, name))
+        target = expected if kind == "container" else name
+        current = self.executor.run(self._inspect_command(kind, target))
         if current != expected:
             raise CanaryContractError("cleanup identity no longer matches the created resource")
-        owner = self.executor.run(self._owner_command(kind, name))
+        owner = self.executor.run(self._owner_command(kind, target))
         if owner != self._expected_owner(name):
             raise CanaryContractError("cleanup ownership label no longer matches")
-        self.executor.run((*command, name), timeout=120)
+        if kind == "container":
+            expected_image = self.container_images.get(name)
+            if (
+                not expected_image
+                or self.executor.run(self._container_image_command(target)) != expected_image
+            ):
+                raise CanaryContractError("cleanup configured image no longer matches")
+        self.executor.run((*command, target), timeout=120)
 
     def verify_absent(self, name: str) -> None:
         kind = self.kinds.get(name)
         if kind is None:
             raise CanaryContractError("cleanup resource kind is unavailable")
-        if self.executor.exists(("docker", kind, "inspect", name)):
+        target = self.identities.get(name) if kind == "container" else name
+        if not target:
+            raise CanaryContractError("cleanup ownership is unavailable")
+        if self.executor.exists(("docker", kind, "inspect", target)):
             raise CanaryContractError("cleanup left a Docker resource behind")
 
     def register_kind(self, name: str, remove_command: tuple[str, ...]) -> None:
@@ -2358,16 +2385,29 @@ def _recover_expected_operations(
     return recovered
 
 
-def _quiesce_canary_producers(executor: CommandExecutor, plan: CanaryPlan) -> None:
-    names = tuple(
-        name
-        for name in (plan.api_container, plan.worker_container)
-        if executor.exists(("docker", "container", "inspect", name))
+def _quiesce_canary_producers(
+    executor: CommandExecutor,
+    plan: CanaryPlan,
+    runner: DockerResourceRunner,
+) -> None:
+    identifiers: list[str] = []
+    for name in (plan.api_container, plan.worker_container):
+        identifier = runner.identities.get(name)
+        if identifier is None:
+            if executor.exists(("docker", "container", "inspect", name)):
+                raise CanaryContractError("canary producer identity was unavailable")
+            continue
+        if executor.exists(("docker", "container", "inspect", identifier)):
+            identifiers.append(identifier)
+    if identifiers:
+        executor.run(("docker", "container", "stop", "--time", "10", *identifiers), timeout=60)
+    running = set(
+        filter(
+            None,
+            executor.run(("docker", "container", "ls", "--quiet", "--no-trunc")).splitlines(),
+        )
     )
-    if names:
-        executor.run(("docker", "container", "stop", "--time", "10", *names), timeout=60)
-    running = executor.run(("docker", "container", "ls", "--format", "{{.Names}}"))
-    if not _canary_processes_absent(running, plan):
+    if any(identifier in running for identifier in identifiers):
         raise CanaryContractError("canary producers remained active during cleanup")
 
 
@@ -2990,7 +3030,8 @@ def run_live_canary(inputs: CanaryInputs) -> None:
     finally:
         producers_quiesced = False
         try:
-            _quiesce_canary_producers(executor, plan)
+            if docker_runner is not None:
+                _quiesce_canary_producers(executor, plan, docker_runner)
             producers_quiesced = True
         except Exception as exc:
             cleanup_error = exc
@@ -3106,5 +3147,17 @@ def main(
     return 0
 
 
+def cli(
+    argv: list[str] | None = None,
+    *,
+    runner: Callable[[CanaryInputs], None] | None = None,
+) -> int:
+    try:
+        return main(argv, runner=runner)
+    except CanaryContractError as exc:
+        print(f"canary_error: {exc}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import tarfile
+import traceback
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     CleanupRegistry,
     CommandSpec,
     DockerResourceRunner,
+    LocalCommandExecutor,
     RecordingRunner,
     ResourceSpec,
     RuntimeSecrets,
@@ -51,6 +53,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     build_plan,
     build_resource_specs,
     build_runtime_commands,
+    cli,
     create_evidence_directory,
     execute_resource,
     main,
@@ -378,9 +381,11 @@ def test_execute_resource_registers_cleanup_before_creation_and_records_identity
 
 def test_nonzero_create_that_materialized_owned_resource_is_cleaned() -> None:
     name = "fstack-caddy-canary-abc123-worker"
+    identifier = "c" * 64
     create = ("docker", "run", "-d", "--name", name, "image")
-    inspect = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
-    owner = (
+    inspect_name = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
+    inspect_id = ("docker", "container", "inspect", "--format", "{{.Id}}", identifier)
+    owner_id = (
         "docker",
         "container",
         "inspect",
@@ -389,19 +394,29 @@ def test_nonzero_create_that_materialized_owned_resource_is_cleaned() -> None:
             '{{index .Config.Labels "io.fstack.canary"}}|'
             '{{index .Config.Labels "io.fstack.canary.invocation"}}'
         ),
-        name,
+        identifier,
     )
-    remove = ("docker", "container", "rm", "--force", name)
+    image_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Config.Image}}",
+        identifier,
+    )
+    remove_id = ("docker", "container", "rm", "--force", identifier)
     executor = SequenceExecutor(
         {
             create: [None],
-            inspect: ["c" * 64, "c" * 64],
-            owner: [
+            inspect_name: [identifier],
+            inspect_id: [identifier],
+            owner_id: [
                 "fstack-caddy-canary-abc123|test-invocation",
                 "fstack-caddy-canary-abc123|test-invocation",
             ],
-            remove: ["removed"],
-            ("docker", "container", "inspect", name): [None],
+            image_id: ["image", "image"],
+            remove_id: ["removed"],
+            ("docker", "container", "inspect", identifier): [None],
         }
     )
     runner = DockerResourceRunner(executor)
@@ -412,11 +427,12 @@ def test_nonzero_create_that_materialized_owned_resource_is_cleaned() -> None:
         execute_resource(spec, runner, cleanup)
     cleanup.run_and_verify()
 
-    assert executor.calls.count(remove) == 1
+    assert executor.calls.count(remove_id) == 1
 
 
 def test_nonzero_create_never_adopts_resource_with_wrong_invocation_token() -> None:
     name = "fstack-caddy-canary-abc123-worker"
+    identifier = "c" * 64
     create = ("docker", "run", "-d", "--name", name, "image")
     inspect = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
     owner = (
@@ -428,13 +444,13 @@ def test_nonzero_create_never_adopts_resource_with_wrong_invocation_token() -> N
             '{{index .Config.Labels "io.fstack.canary"}}|'
             '{{index .Config.Labels "io.fstack.canary.invocation"}}'
         ),
-        name,
+        identifier,
     )
-    remove = ("docker", "container", "rm", "--force", name)
+    remove = ("docker", "container", "rm", "--force", identifier)
     executor = SequenceExecutor(
         {
             create: [None],
-            inspect: ["c" * 64],
+            inspect: [identifier],
             owner: ["fstack-caddy-canary-abc123|raced-token"],
         }
     )
@@ -453,10 +469,19 @@ def test_real_runner_retries_identity_capture_after_successful_create() -> None:
     name = "fstack-caddy-canary-abc123-worker"
     create = ("docker", "run", "-d", "--name", name, "image")
     inspect = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
+    image_command = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Config.Image}}",
+        "container-id",
+    )
     executor = SequenceExecutor(
         {
             create: ["container-id"],
             inspect: [None, "container-id"],
+            image_command: ["image"],
         }
     )
     runner = DockerResourceRunner(executor)
@@ -471,9 +496,11 @@ def test_real_runner_retries_identity_capture_after_successful_create() -> None:
 
 def test_successful_create_with_delayed_identity_is_recovered_for_cleanup() -> None:
     name = "fstack-caddy-canary-abc123-worker"
+    identifier = "c" * 64
     create = ("docker", "run", "-d", "--name", name, "image")
-    inspect = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
-    owner = (
+    inspect_name = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
+    inspect_id = ("docker", "container", "inspect", "--format", "{{.Id}}", identifier)
+    owner_id = (
         "docker",
         "container",
         "inspect",
@@ -482,16 +509,26 @@ def test_successful_create_with_delayed_identity_is_recovered_for_cleanup() -> N
             '{{index .Config.Labels "io.fstack.canary"}}|'
             '{{index .Config.Labels "io.fstack.canary.invocation"}}'
         ),
-        name,
+        identifier,
     )
-    remove = ("docker", "container", "rm", "--force", name)
+    image_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Config.Image}}",
+        identifier,
+    )
+    remove_id = ("docker", "container", "rm", "--force", identifier)
     executor = SequenceExecutor(
         {
-            create: ["c" * 64],
-            inspect: [*[None] * 10, "c" * 64, "c" * 64],
-            owner: ["fstack-caddy-canary-abc123|test-invocation"],
-            remove: ["removed"],
-            ("docker", "container", "inspect", name): [None],
+            create: [identifier],
+            inspect_name: [*[None] * 10, identifier],
+            inspect_id: [identifier],
+            owner_id: ["fstack-caddy-canary-abc123|test-invocation"],
+            image_id: ["image", "image"],
+            remove_id: ["removed"],
+            ("docker", "container", "inspect", identifier): [None],
         }
     )
     runner = DockerResourceRunner(executor)
@@ -502,14 +539,16 @@ def test_successful_create_with_delayed_identity_is_recovered_for_cleanup() -> N
         execute_resource(spec, runner, cleanup)
     cleanup.run_and_verify()
 
-    assert executor.calls.count(remove) == 1
+    assert executor.calls.count(remove_id) == 1
 
 
 def test_real_runner_removes_the_captured_container_exactly_once() -> None:
     name = "fstack-caddy-canary-abc123-worker"
+    identifier = "container-id"
     create = ("docker", "run", "-d", "--name", name, "image")
-    inspect = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
-    owner = (
+    inspect_name = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
+    inspect_id = ("docker", "container", "inspect", "--format", "{{.Id}}", identifier)
+    owner_id = (
         "docker",
         "container",
         "inspect",
@@ -518,15 +557,25 @@ def test_real_runner_removes_the_captured_container_exactly_once() -> None:
             '{{index .Config.Labels "io.fstack.canary"}}|'
             '{{index .Config.Labels "io.fstack.canary.invocation"}}'
         ),
-        name,
+        identifier,
     )
-    remove = ("docker", "container", "rm", "--force", name)
+    image_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Config.Image}}",
+        identifier,
+    )
+    remove_id = ("docker", "container", "rm", "--force", identifier)
     executor = SequenceExecutor(
         {
-            create: ["container-id"],
-            inspect: ["container-id", "container-id"],
-            owner: ["fstack-caddy-canary-abc123|test-invocation"],
-            remove: ["container-id"],
+            create: [identifier],
+            inspect_name: [identifier],
+            inspect_id: [identifier],
+            owner_id: ["fstack-caddy-canary-abc123|test-invocation"],
+            image_id: ["image", "image"],
+            remove_id: [identifier],
         }
     )
     runner = DockerResourceRunner(executor)
@@ -536,17 +585,29 @@ def test_real_runner_removes_the_captured_container_exactly_once() -> None:
 
     cleanup.run_and_verify()
 
-    assert executor.calls.count(remove) == 1
+    assert executor.calls.count(remove_id) == 1
 
 
 def test_real_runner_rechecks_container_identity_before_cleanup() -> None:
     name = "fstack-caddy-canary-abc123-worker"
+    identifier = "container-id"
     create = ("docker", "run", "-d", "--name", name, "image")
-    inspect = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
+    inspect_name = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
+    inspect_id = ("docker", "container", "inspect", "--format", "{{.Id}}", identifier)
+    image_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Config.Image}}",
+        identifier,
+    )
     executor = SequenceExecutor(
         {
-            create: ["container-id"],
-            inspect: ["container-id", "replacement-id"],
+            create: [identifier],
+            inspect_name: [identifier],
+            inspect_id: ["replacement-id"],
+            image_id: ["image"],
         }
     )
     runner = DockerResourceRunner(executor)
@@ -558,7 +619,112 @@ def test_real_runner_rechecks_container_identity_before_cleanup() -> None:
     with pytest.raises(CanaryContractError):
         cleanup.run_and_verify()
 
+    assert ("docker", "container", "rm", "--force", identifier) not in executor.calls
+
+
+def test_real_runner_cleans_renamed_container_by_captured_id() -> None:
+    name = "fstack-caddy-canary-abc123-worker"
+    identifier = "c" * 64
+    image = "example.invalid/fstack@sha256:" + "d" * 64
+    create = ("docker", "run", "-d", "--name", name, image)
+    inspect_name = ("docker", "container", "inspect", "--format", "{{.Id}}", name)
+
+    inspect_id = ("docker", "container", "inspect", "--format", "{{.Id}}", identifier)
+    image_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Config.Image}}",
+        identifier,
+    )
+    owner_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        (
+            '{{index .Config.Labels "io.fstack.canary"}}|'
+            '{{index .Config.Labels "io.fstack.canary.invocation"}}'
+        ),
+        identifier,
+    )
+    remove_id = ("docker", "container", "rm", "--force", identifier)
+    executor = SequenceExecutor(
+        {
+            create: [identifier],
+            inspect_name: [identifier],
+            inspect_id: [identifier],
+            image_id: [image, image],
+            owner_id: ["fstack-caddy-canary-abc123|test-invocation"],
+            remove_id: [identifier],
+            ("docker", "container", "inspect", identifier): [None],
+        }
+    )
+    runner = DockerResourceRunner(executor)
+    cleanup = CleanupRegistry(runner)
+    cleanup.register(name, ("docker", "container", "rm", "--force"))
+    cleanup.mark_created(name, runner.create(name, create))
+
+    cleanup.run_and_verify()
+
+    assert remove_id in executor.calls
     assert ("docker", "container", "rm", "--force", name) not in executor.calls
+
+
+def test_command_failure_traceback_excludes_command_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "forbidden-command-argument"
+
+    def fail(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(1, ["command", marker])
+
+    monkeypatch.setattr(subprocess, "run", fail)
+
+    with pytest.raises(CanaryContractError) as error:
+        LocalCommandExecutor().run(("command", marker))
+
+    rendered = "".join(traceback.format_exception(error.value))
+    assert marker not in rendered
+
+
+def test_cli_reports_only_a_bounded_sanitized_contract_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    marker = "forbidden-cli-argument"
+
+    def runner(_inputs: CanaryInputs) -> None:
+        try:
+            raise subprocess.CalledProcessError(1, ["command", marker])
+        except subprocess.CalledProcessError as exc:
+            raise CanaryContractError("canary command failed") from exc
+
+    result = cli(
+        [
+            "--source-commit",
+            "a" * 40,
+            "--caddy-image-digest",
+            _digest("caddy:2.11.7", "1"),
+            "--postgres-image-digest",
+            _digest("postgres:17", "2"),
+            "--temporal-image-digest",
+            _digest("temporalio/auto-setup:1.27", "3"),
+            "--crusher-image-digest",
+            _digest("example.invalid/crusher", "4"),
+            "--evidence-dir",
+            str(tmp_path / "evidence"),
+            "--nonce",
+            "abc123",
+        ],
+        runner=runner,
+    )
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "canary_error: canary command failed\n"
+    assert marker not in captured.err
 
 
 def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: Path) -> None:
@@ -927,23 +1093,30 @@ def test_cleanup_quiesces_api_and_worker_before_dynamic_inventory() -> None:
             nonce="abc123",
         )
     )
-    api_inspect = ("docker", "container", "inspect", plan.api_container)
-    worker_inspect = ("docker", "container", "inspect", plan.worker_container)
+    api_id = "a" * 64
+    worker_id = "b" * 64
+    api_inspect = ("docker", "container", "inspect", api_id)
+    worker_inspect = ("docker", "container", "inspect", worker_id)
     stop = (
         "docker",
         "container",
         "stop",
         "--time",
         "10",
-        plan.api_container,
-        plan.worker_container,
+        api_id,
+        worker_id,
     )
-    running = ("docker", "container", "ls", "--format", "{{.Names}}")
+    running = ("docker", "container", "ls", "--quiet", "--no-trunc")
     executor = FakeExecutor(
-        {stop: "stopped", running: "unrelated\n"},
+        {stop: "stopped", running: "f" * 64 + "\n"},
         existing={api_inspect, worker_inspect},
     )
-    _quiesce_canary_producers(executor, plan)
+    runner = DockerResourceRunner(executor)
+    runner.identities = {
+        plan.api_container: api_id,
+        plan.worker_container: worker_id,
+    }
+    _quiesce_canary_producers(executor, plan, runner)
     assert executor.calls.index(stop) < executor.calls.index(running)
 
 
