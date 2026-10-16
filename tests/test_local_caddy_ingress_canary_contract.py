@@ -23,22 +23,28 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     RuntimeSecrets,
     _adopt_caddy_route_command,
     _api_post_command,
+    _api_status_command,
     _caddy_routes_command,
     _canary_processes_absent,
     _capture_network_crusher_containers,
+    _cleanup_owned_crusher_containers,
     _conflict_fixture,
     _dispatch_generation_command,
     _durable_counts_command,
     _finalize_success_evidence,
     _merge_captured_resources,
+    _migration_head_command,
     _quiesce_canary_producers,
     _recover_expected_operations,
     _select_exact_managed_route,
     _source_tree_digest,
     _submission_ids_command,
+    _task_queue_has_fresh_pollers,
     _task_queue_has_pollers,
+    _temporal_health_command,
     _topology_mismatch_command,
     _verify_executing_harness,
+    _verify_temporal_pollers_quiesced,
     assert_no_resource_collisions,
     build_live_verification_commands,
     build_maintenance_steps,
@@ -114,7 +120,7 @@ def test_requires_exact_immutable_images_and_caddy_v2117(tmp_path: Path) -> None
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=evidence,
         nonce="abc123",
     )
@@ -125,13 +131,20 @@ def test_requires_exact_immutable_images_and_caddy_v2117(tmp_path: Path) -> None
         "caddy_image": "caddy:2.11.7",
         "postgres_image": "postgres:17-alpine",
         "temporal_image": "temporalio/auto-setup:1.25.2",
-        "crusher_image": "ghcr.io/michaelgold/crusher:canary",
+        "crusher_image": "ghcr.io/michaelgold/crusher",
     }.items():
         with pytest.raises(CanaryContractError):
             CanaryInputs(**{**inputs.__dict__, field: value})
 
     with pytest.raises(CanaryContractError):
         CanaryInputs(**{**inputs.__dict__, "caddy_image": _digest("caddy:2.11.6", "1")})
+    with pytest.raises(CanaryContractError, match="Crusher image"):
+        CanaryInputs(
+            **{
+                **inputs.__dict__,
+                "crusher_image": _digest("ghcr.io/michaelgold/crusher:canary", "4"),
+            }
+        )
 
 
 def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
@@ -144,11 +157,12 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
     outputs: dict[tuple[str, ...], str] = {}
+    outputs[("docker", "info", "--format", "{{.Architecture}}")] = "aarch64"
     for image in (
         inputs.caddy_image,
         inputs.postgres_image,
@@ -159,7 +173,10 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         outputs[("docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image)] = (
             '["example.invalid/image@sha256:' + image.rsplit(":", 1)[-1] + '"]'
         )
-    outputs[("docker", "run", "--rm", inputs.caddy_image, "caddy", "version")] = "v2.11.7"
+        outputs[("docker", "image", "inspect", "--format", "{{.Architecture}}", image)] = "arm64"
+    outputs[("docker", "run", "--rm", inputs.caddy_image, "caddy", "version")] = (
+        "v2.11.7 h1:acceptance-build-hash"
+    )
     executor = FakeExecutor(outputs)
 
     verified = verify_images(inputs, executor)
@@ -173,6 +190,13 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         "caddy",
         "version",
     )
+
+    mismatched = dict(outputs)
+    mismatched[
+        ("docker", "image", "inspect", "--format", "{{.Architecture}}", inputs.crusher_image)
+    ] = "amd64"
+    with pytest.raises(CanaryContractError, match="architecture"):
+        verify_images(inputs, FakeExecutor(mismatched))
 
 
 def test_executing_harness_must_match_immutable_prepared_source(tmp_path: Path) -> None:
@@ -259,7 +283,7 @@ def test_plan_is_fully_isolated_and_registers_cleanup_before_create(tmp_path: Pa
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -267,6 +291,19 @@ def test_plan_is_fully_isolated_and_registers_cleanup_before_create(tmp_path: Pa
 
     assert plan.prefix == "fstack-caddy-canary-abc123"
     assert plan.database_name.endswith("_test")
+    assert plan.crusher_database_name == "fstack_caddy_canary_abc123_crusher"
+    assert plan.crusher_database_name != plan.database_name
+    assert plan.create_crusher_database_command == (
+        "docker",
+        "exec",
+        plan.postgres_container,
+        "createdb",
+        "--username",
+        "fstack",
+        "--owner",
+        "fstack",
+        plan.crusher_database_name,
+    )
     assert all(name.startswith(plan.prefix) for name in plan.resource_names)
     assert plan.caddy_ip == "172.30.0.10"
     assert plan.listener_address == "172.30.0.10:8080"
@@ -532,7 +569,7 @@ def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: 
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -549,17 +586,44 @@ def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: 
         assert ("--network", plan.network) in list(
             zip(commands[name].argv, commands[name].argv[1:], strict=False)
         )
+    assert ("--network", "none") in list(
+        zip(commands["caddy-client"].argv, commands["caddy-client"].argv[1:], strict=False)
+    )
     socket_mount = f"{plan.control_volume}:/run/fstack-caddy"
     socket_consumers = {name for name, command in commands.items() if socket_mount in command.argv}
-    assert socket_consumers == {"caddy", "worker"}
+    assert socket_consumers == {"caddy", "caddy-client", "worker"}
+    assert "/var/run/docker.sock:/var/run/docker.sock" not in commands["caddy-client"].argv
+    assert ("--user", f"{plan.worker_uid}:{plan.worker_gid}") in list(
+        zip(commands["caddy-client"].argv, commands["caddy-client"].argv[1:], strict=False)
+    )
+    assert ("--group-add", str(plan.caddy_socket_gid)) in list(
+        zip(commands["caddy-client"].argv, commands["caddy-client"].argv[1:], strict=False)
+    )
     invocation_label = f"io.fstack.canary.invocation={plan.invocation_token}"
     for command in commands.values():
         assert invocation_label in command.argv
     assert ("--ip", plan.caddy_ip) in list(
         zip(commands["caddy"].argv, commands["caddy"].argv[1:], strict=False)
     )
+    assert ("--network-alias", plan.caddy_container) in list(
+        zip(commands["caddy"].argv, commands["caddy"].argv[1:], strict=False)
+    )
     for key, value in plan.worker_environment.items():
         assert commands["worker"].environment[key] == value
+    assert commands["temporal"].environment["DYNAMIC_CONFIG_FILE_PATH"] == (
+        "config/dynamicconfig/docker.yaml"
+    )
+    assert _temporal_health_command(plan) == (
+        "docker",
+        "exec",
+        plan.temporal_container,
+        "temporal",
+        "operator",
+        "cluster",
+        "health",
+        "--address",
+        f"{plan.temporal_container}:7233",
+    )
     assert ("--group-add", str(plan.worker_supplemental_gid)) in list(
         zip(commands["worker"].argv, commands["worker"].argv[1:], strict=False)
     )
@@ -577,7 +641,7 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -602,6 +666,10 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
     counts = _durable_counts_command(plan, "12345678-1234-5678-9234-567812345679")
     assert counts[:4] == ("docker", "exec", plan.postgres_container, "psql")
     assert "12345678-1234-5678-9234-567812345679" in counts[-1]
+    migration_head = _migration_head_command(plan)
+    assert migration_head[:4] == ("docker", "exec", plan.postgres_container, "psql")
+    assert migration_head[migration_head.index("--dbname") + 1] == plan.database_name
+    assert migration_head[-1] == "SELECT version_num FROM alembic_version"
     for sql_command in (
         _dispatch_generation_command(plan, "12345678-1234-5678-9234-567812345679"),
         _submission_ids_command(plan, "12345678-1234-5678-9234-567812345679"),
@@ -612,13 +680,16 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
     set_routes = _caddy_routes_command(plan, replacement=[{"@id": "fixture"}])
     adopt = _adopt_caddy_route_command(plan, {"@id": "fixture"})
     conflict_post = _api_post_command(plan, f"{plan.prefix}-unmanaged", scenario="unmanaged")
+    status_command = _api_status_command(plan, "12345678-1234-5678-9234-567812345679")
     for command in (get_routes, set_routes, adopt):
-        assert command[:3] == ("docker", "exec", plan.worker_container)
+        assert command[:3] == ("docker", "exec", plan.caddy_client_container)
     assert "method='PATCH'" in set_routes[-1]
     assert "CaddyAdminTransport" in get_routes[-1]
     assert "._exchange(request)" in get_routes[-1]
     assert "CaddyAdmin" in adopt[-1]
     assert "scenario='unmanaged'" in conflict_post[-1]
+    assert "response.get('last_error')" in status_command[-1]
+    assert "response.get('error')" not in status_command[-1]
     for scenario in ("wrong-network", "wrong-probe-ip", "missing-alias"):
         topology = _topology_mismatch_command(
             plan,
@@ -631,6 +702,9 @@ def test_live_verification_commands_inspect_exact_route_and_probe_both_hops(tmp_
         assert topology[:3] == ("docker", "exec", plan.worker_container)
         assert "preflight_then_reconcile" in topology[-1]
         assert scenario in topology[-1]
+        assert all("\n" not in argument and "\r" not in argument for argument in topology)
+        if scenario == "missing-alias":
+            assert "payload[0]['Name']='/fstack-canary-alias-only'" in topology[-1]
         compile(topology[-1], f"<topology-{scenario}>", "exec")
 
     for command in (
@@ -686,7 +760,7 @@ def test_runtime_commands_are_detached_configured_and_keep_secrets_out_of_argv(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -747,7 +821,7 @@ def test_resource_specs_create_dependencies_in_order_and_define_exact_cleanup(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -787,7 +861,7 @@ def test_cleanup_recovers_accepted_operations_from_durable_canary_state() -> Non
             caddy_image=_digest("caddy:2.11.7", "b"),
             postgres_image=_digest("postgres:17", "c"),
             temporal_image=_digest("temporalio/auto-setup:1.27", "d"),
-            crusher_image=_digest("crusher:canary", "e"),
+            crusher_image=_digest("example.invalid/crusher", "e"),
             evidence_dir=Path("/evidence"),
             nonce="abc123",
         )
@@ -848,7 +922,7 @@ def test_cleanup_quiesces_api_and_worker_before_dynamic_inventory() -> None:
             caddy_image=_digest("caddy:2.11.7", "b"),
             postgres_image=_digest("postgres:17", "c"),
             temporal_image=_digest("temporalio/auto-setup:1.27", "d"),
-            crusher_image=_digest("crusher:canary", "e"),
+            crusher_image=_digest("example.invalid/crusher", "e"),
             evidence_dir=Path("/evidence"),
             nonce="abc123",
         )
@@ -883,7 +957,7 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -923,21 +997,19 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
             list_command: name + "\n",
             image_id_command: "sha256:" + "e" * 64,
             inspect_command: json.dumps(
-                [
-                    {
-                        "Id": "d" * 64,
-                        "Image": "sha256:" + "e" * 64,
-                        "Config": {
-                            "Image": plan.inputs.crusher_image,
-                            "Labels": {
-                                "io.fstack.managed": "true",
-                                "io.fstack.operation_id": operation_id,
-                                "io.fstack.deployment_id": deployment_id,
-                            },
+                {
+                    "Id": "d" * 64,
+                    "Image": "sha256:" + "e" * 64,
+                    "Config": {
+                        "Image": plan.inputs.crusher_image,
+                        "Labels": {
+                            "io.fstack.managed": "true",
+                            "io.fstack.operation_id": operation_id,
+                            "io.fstack.deployment_id": deployment_id,
                         },
-                        "NetworkSettings": {"Networks": {plan.network: {}}},
-                    }
-                ]
+                    },
+                    "NetworkSettings": {"Networks": {plan.network: {}}},
+                }
             ),
         },
         existing={("docker", "network", "inspect", plan.network)},
@@ -958,7 +1030,7 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
         "{{.Names}}",
     )
     disconnected = json.loads(executor.outputs[inspect_command])
-    disconnected[0]["NetworkSettings"]["Networks"] = {}
+    disconnected["NetworkSettings"]["Networks"] = {}
     global_executor = FakeExecutor(
         {
             global_list_command: name + "\n",
@@ -973,7 +1045,7 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
         require_network=False,
     ) == [(name, "d" * 64, operation_id, deployment_id)]
     wrong_image = json.loads(executor.outputs[inspect_command])
-    wrong_image[0]["Config"]["Image"] = "mutable:latest"
+    wrong_image["Config"]["Image"] = "mutable:latest"
     executor.outputs[inspect_command] = json.dumps(wrong_image)
     with pytest.raises(CanaryContractError):
         _capture_network_crusher_containers(executor, plan, expected_operations)
@@ -988,6 +1060,108 @@ def test_dynamic_capture_rejects_same_name_replacement_identity() -> None:
     assert _merge_captured_resources(original, list(original)) == original
 
 
+def test_unexpected_owned_crusher_name_fails_acceptance_but_remains_cleanup_eligible(
+    tmp_path: Path,
+) -> None:
+    inputs = CanaryInputs(
+        source_commit="a" * 40,
+        source_archive=None,
+        source_archive_sha256=None,
+        caddy_image=_digest("caddy:2.11.7", "1"),
+        postgres_image=_digest("postgres:17-alpine", "2"),
+        temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
+        evidence_dir=tmp_path / "evidence",
+        nonce="abc123",
+    )
+    plan = build_plan(inputs)
+    operation_id = "22345678-1234-5678-9234-567812345678"
+    deployment_id = "12345678-1234-5678-9234-567812345678"
+    name = "unexpected-owned-crusher"
+    identifier = "d" * 64
+    image_id = "sha256:" + "e" * 64
+    list_command = (
+        "docker",
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        f"network={plan.network}",
+        "--format",
+        "{{.Names}}",
+    )
+    inspect_command = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{json .}}",
+        name,
+    )
+    image_id_command = (
+        "docker",
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        plan.inputs.crusher_image,
+    )
+    inspection = json.dumps(
+        {
+            "Id": identifier,
+            "Image": image_id,
+            "Config": {
+                "Image": plan.inputs.crusher_image,
+                "Labels": {
+                    "io.fstack.managed": "true",
+                    "io.fstack.operation_id": operation_id,
+                    "io.fstack.deployment_id": deployment_id,
+                },
+            },
+            "NetworkSettings": {"Networks": {plan.network: {}}},
+        }
+    )
+    executor = FakeExecutor(
+        {
+            list_command: name + "\n",
+            image_id_command: image_id,
+            inspect_command: inspection,
+        },
+        existing={("docker", "network", "inspect", plan.network)},
+    )
+    expected_operations = {operation_id: deployment_id}
+
+    with pytest.raises(CanaryContractError, match="ownership was ambiguous"):
+        _capture_network_crusher_containers(executor, plan, expected_operations)
+
+    owned = _capture_network_crusher_containers(
+        executor,
+        plan,
+        expected_operations,
+        require_canonical_names=False,
+    )
+    assert owned == [(name, identifier, operation_id, deployment_id)]
+
+    cleanup_executor = SequenceExecutor(
+        {
+            image_id_command: [image_id],
+            ("docker", "container", "inspect", identifier): ["exists", None],
+            (
+                "docker",
+                "container",
+                "inspect",
+                "--format",
+                "{{json .}}",
+                identifier,
+            ): [inspection],
+            ("docker", "container", "rm", "--force", identifier): [identifier],
+        }
+    )
+    _cleanup_owned_crusher_containers(cleanup_executor, plan, owned)
+    assert ("docker", "container", "rm", "--force", identifier) in cleanup_executor.calls
+    assert ("docker", "container", "inspect", name) not in cleanup_executor.calls
+
+
 def test_full_resource_failure_cleans_every_previously_captured_identity(tmp_path: Path) -> None:
     inputs = CanaryInputs(
         source_commit="a" * 40,
@@ -996,7 +1170,7 @@ def test_full_resource_failure_cleans_every_previously_captured_identity(tmp_pat
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1031,7 +1205,7 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1047,15 +1221,18 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
     prepare_runtime_files(plan, runtime, secrets)
 
     caddy = json.loads((runtime / "caddy.json").read_text(encoding="utf-8"))
-    assert caddy["admin"]["listen"] == "unix//run/fstack-caddy/caddy-admin.sock"
+    assert caddy["admin"]["listen"] == "unix//run/fstack-caddy/caddy-admin.sock|0220"
     assert caddy["admin"]["config"]["persist"] is False
     assert caddy["apps"]["http"]["servers"]["fstack"] == {
         "listen": [":8080"],
         "routes": [],
+        "automatic_https": {"disable": True},
     }
     assert "tcp/" not in json.dumps(caddy)
     build_context = runtime / "build-context"
-    assert "docker.io" in (build_context / "Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (build_context / "Dockerfile").read_text(encoding="utf-8")
+    assert "apt-get install -y --no-install-recommends docker-cli" in dockerfile
+    assert "docker.io" not in dockerfile
     runtime_commands = build_runtime_commands(plan, tmp_path / "source", runtime, secrets)
     build_command = {command.name: command for command in runtime_commands}["build-fstack-runtime"]
     assert build_command.argv[-1] == str(build_context)
@@ -1071,15 +1248,31 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
         "database_secret_ref": "secret://local-file/canary/database",
         "object_storage_secret_ref": "secret://local-file/canary/database",
     }
-    for filename in ("postgres.env", "temporal.env", "api.env", "worker.env"):
+    for filename in (
+        "postgres.env",
+        "temporal.env",
+        "api.env",
+        "worker.env",
+        "caddy-client.env",
+    ):
         assert (runtime / filename).stat().st_mode & 0o777 == 0o600
     source_bundle = runtime / "source-secrets" / "canary" / "database"
-    assert (
-        json.loads((source_bundle / "owner.json").read_text(encoding="utf-8"))[
-            "application_password"
-        ]
-        == "application-secret-marker"
+    for directory in (
+        runtime / "source-secrets",
+        runtime / "source-secrets" / "canary",
+        source_bundle,
+        runtime / "runtime-secrets",
+    ):
+        assert directory.stat().st_mode & 0o777 == 0o700
+        assert directory.stat().st_uid == runtime.stat().st_uid
+    owner_bundle = json.loads((source_bundle / "owner.json").read_text(encoding="utf-8"))
+    application_bundle = json.loads(
+        (source_bundle / "application.json").read_text(encoding="utf-8")
     )
+    assert owner_bundle["application_password"] == "application-secret-marker"
+    assert owner_bundle["owner_url"].endswith(f"/{plan.crusher_database_name}")
+    assert application_bundle["application_url"].endswith(f"/{plan.crusher_database_name}")
+    assert not owner_bundle["owner_url"].endswith(f"/{plan.database_name}")
     assert (source_bundle / "owner.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -1091,7 +1284,7 @@ def test_collision_preflight_rejects_any_exact_existing_resource(tmp_path: Path)
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1100,6 +1293,7 @@ def test_collision_preflight_rejects_any_exact_existing_resource(tmp_path: Path)
         plan.postgres_container,
         plan.temporal_container,
         plan.caddy_container,
+        plan.caddy_client_container,
         plan.api_container,
         plan.worker_container,
         f"{plan.prefix}-migration-20261006_0003",
@@ -1123,7 +1317,7 @@ def test_process_exit_proof_ignores_unrelated_containers_but_fails_on_canary_nam
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1142,7 +1336,7 @@ def test_maintenance_sequence_keeps_api_off_until_v2_polling_is_proved(tmp_path:
         caddy_image=_digest("caddy:2.11.7", "1"),
         postgres_image=_digest("postgres:17-alpine", "2"),
         temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
-        crusher_image=_digest("ghcr.io/michaelgold/crusher:canary", "4"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
         evidence_dir=tmp_path / "evidence",
         nonce="abc123",
     )
@@ -1178,6 +1372,11 @@ def test_maintenance_sequence_keeps_api_off_until_v2_polling_is_proved(tmp_path:
         "stop",
     )
     assert by_name["verify-process-exit"].argv != by_name["stop-api-dispatcher-worker"].argv
+    for name in ("verify-no-old-poller", "verify-new-poller"):
+        assert by_name[name].argv[-2:] == (
+            "--address",
+            f"{build_plan(inputs).temporal_container}:7233",
+        )
     for name, revision in (
         ("bootstrap-20261006-0003", "20261006_0003"),
         ("upgrade-20261013-0004", "20261013_0004"),
@@ -1197,15 +1396,82 @@ def test_temporal_poller_evidence_requires_a_nonempty_workflow_or_activity_polle
         is False
     )
     assert (
-        _task_queue_has_pollers('{"workflowTaskQueuePollers":[{"identity":"worker@canary"}]}')
+        _task_queue_has_pollers(
+            '{"workflowTaskQueuePollers":[{"identity":"worker@canary",'
+            '"lastAccessTime":"2026-10-16T00:00:00Z"}]}'
+        )
         is True
     )
+    assert _task_queue_has_pollers('{"pollers":null}') is False
     with pytest.raises(CanaryContractError):
         _task_queue_has_pollers("not-json")
     with pytest.raises(CanaryContractError):
         _task_queue_has_pollers("{}")
     with pytest.raises(CanaryContractError):
         _task_queue_has_pollers('{"unknown":[]}')
+
+
+def test_temporal_poller_quiescence_requires_stable_last_access_evidence() -> None:
+    command = ("temporal", "task-queue", "describe")
+    stable = json.dumps(
+        {
+            "pollers": [
+                {
+                    "identity": "worker@canary",
+                    "taskQueueType": "workflow",
+                    "lastAccessTime": "2026-10-16T00:00:00Z",
+                }
+            ]
+        }
+    )
+    executor = SequenceExecutor({command: [stable, stable]})
+
+    baseline = _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+    assert _task_queue_has_fresh_pollers(stable, baseline) is False
+
+    fresh = stable.replace("00:00:00Z", "00:00:01Z")
+    assert _task_queue_has_fresh_pollers(fresh, baseline) is True
+    assert _task_queue_has_fresh_pollers('{"pollers":[]}', baseline) is False
+
+    advanced = stable.replace("00:00:00Z", "00:00:01Z")
+    executor = SequenceExecutor({command: [stable, advanced]})
+    with pytest.raises(CanaryContractError, match="poller quiescence was not proved"):
+        _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+
+    invalid_snapshots = (
+        '{"pollers":null}',
+        '{"pollers":[{}]}',
+        '{"pollers":[{"identity":"worker@canary","taskQueueType":"workflow"}]}',
+        '{"pollers":[{"identity":"worker@canary","taskQueueType":"workflow",'
+        '"lastAccessTime":"not-a-timestamp"}]}',
+        (
+            '{"pollers":[{"identity":"worker@canary","identity":"duplicate",'
+            '"taskQueueType":"workflow","lastAccessTime":"2026-10-16T00:00:00Z"}]}'
+        ),
+        (
+            '{"pollers":[{"identity":"worker@canary","taskQueueType":"workflow",'
+            '"lastAccessTime":NaN}]}'
+        ),
+    )
+    for invalid in invalid_snapshots:
+        executor = SequenceExecutor({command: [invalid, invalid]})
+        with pytest.raises(CanaryContractError, match="poller evidence was invalid"):
+            _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+
+    workflow = json.dumps(
+        {
+            "workflowTaskQueuePollers": [
+                {
+                    "identity": "worker@canary",
+                    "lastAccessTime": "2026-10-16T00:00:00Z",
+                }
+            ]
+        }
+    )
+    activity = workflow.replace("workflowTaskQueuePollers", "activityTaskQueuePollers")
+    executor = SequenceExecutor({command: [workflow, activity]})
+    with pytest.raises(CanaryContractError, match="poller quiescence was not proved"):
+        _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
 
 
 def plan_secret_markers(commands: tuple[CommandSpec, ...]) -> set[str]:
@@ -1225,7 +1491,7 @@ def test_cli_requires_exact_task21_inputs(tmp_path: Path) -> None:
             "--temporal-image-digest",
             _digest("temporalio/auto-setup:1.25.2", "3"),
             "--crusher-image-digest",
-            _digest("ghcr.io/michaelgold/crusher:canary", "4"),
+            _digest("ghcr.io/michaelgold/crusher", "4"),
             "--evidence-dir",
             str(tmp_path / "evidence"),
         ]
@@ -1253,7 +1519,7 @@ def test_main_constructs_validated_inputs_and_invokes_the_live_runner(tmp_path: 
             "--temporal-image-digest",
             _digest("temporalio/auto-setup:1.25.2", "3"),
             "--crusher-image-digest",
-            _digest("ghcr.io/michaelgold/crusher:canary", "4"),
+            _digest("ghcr.io/michaelgold/crusher", "4"),
             "--evidence-dir",
             str(tmp_path / "evidence"),
             "--nonce",

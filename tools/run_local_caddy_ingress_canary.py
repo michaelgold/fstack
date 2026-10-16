@@ -18,10 +18,16 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Any, Protocol
 
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}$")
+_PROVISIONING_IMAGE = re.compile(
+    r"[a-z0-9]+(?:[.-][a-z0-9]+)*/"
+    r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*@sha256:[0-9a-f]{64}\Z"
+)
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _NONCE = re.compile(r"^[a-z0-9]{6,20}$")
 _CONFLICT_SCENARIOS = (
@@ -502,6 +508,17 @@ def verify_images(inputs: CanaryInputs, executor: CommandExecutor) -> dict[str, 
         "temporal": inputs.temporal_image,
         "crusher": inputs.crusher_image,
     }
+    architecture_aliases = {
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "amd64": "amd64",
+        "x86_64": "amd64",
+    }
+    daemon_architecture = architecture_aliases.get(
+        executor.run(("docker", "info", "--format", "{{.Architecture}}"))
+    )
+    if daemon_architecture is None:
+        raise CanaryContractError("Docker daemon architecture was unsupported")
     verified: dict[str, str] = {}
     for name, image in named.items():
         executor.run(("docker", "pull", image), timeout=900)
@@ -520,9 +537,15 @@ def verify_images(inputs: CanaryInputs, executor: CommandExecutor) -> dict[str, 
             or not any(value.endswith("@" + expected) for value in digests)
         ):
             raise CanaryContractError("pulled image does not expose the requested digest")
+        image_architecture = architecture_aliases.get(
+            executor.run(("docker", "image", "inspect", "--format", "{{.Architecture}}", image))
+        )
+        if image_architecture != daemon_architecture:
+            raise CanaryContractError("pulled image architecture does not match the Docker daemon")
         verified[name] = expected
     version = executor.run(("docker", "run", "--rm", inputs.caddy_image, "caddy", "version"))
-    if version.strip() != "v2.11.7":
+    version_fields = version.strip().split()
+    if not version_fields or version_fields[0] != "v2.11.7":
         raise CanaryContractError("Caddy image is not exactly v2.11.7")
     return verified
 
@@ -794,6 +817,7 @@ class CanaryPlan:
     postgres_container: str
     temporal_container: str
     caddy_container: str
+    caddy_client_container: str
     api_container: str
     worker_container: str
     temporal_namespace: str
@@ -825,6 +849,24 @@ class CanaryPlan:
     @property
     def temporal_visibility_database_name(self) -> str:
         return f"fstack_canary_{self.inputs.nonce}_visibility"
+
+    @property
+    def crusher_database_name(self) -> str:
+        return f"fstack_caddy_canary_{self.inputs.nonce}_crusher"
+
+    @property
+    def create_crusher_database_command(self) -> tuple[str, ...]:
+        return (
+            "docker",
+            "exec",
+            self.postgres_container,
+            "createdb",
+            "--username",
+            "fstack",
+            "--owner",
+            "fstack",
+            self.crusher_database_name,
+        )
 
     @property
     def worker_supplemental_gid(self) -> int:
@@ -865,6 +907,7 @@ class CanaryPlan:
             self.postgres_container,
             self.temporal_container,
             self.caddy_container,
+            self.caddy_client_container,
             self.api_container,
             self.worker_container,
             self.temporal_namespace,
@@ -921,8 +964,12 @@ def _populate_runtime_files(
     plan: CanaryPlan, runtime_root: Path, secrets_bundle: RuntimeSecrets
 ) -> None:
     try:
-        source_bundle = runtime_root / "source-secrets" / "canary" / "database"
-        source_bundle.mkdir(mode=0o700, parents=True)
+        source_root = runtime_root / "source-secrets"
+        source_root.mkdir(mode=0o700)
+        canary_source = source_root / "canary"
+        canary_source.mkdir(mode=0o700)
+        source_bundle = canary_source / "database"
+        source_bundle.mkdir(mode=0o700)
         (runtime_root / "runtime-secrets").mkdir(mode=0o700)
     except OSError as exc:
         raise CanaryContractError("runtime workspace must be new and private") from exc
@@ -930,13 +977,13 @@ def _populate_runtime_files(
         "fstack",
         secrets_bundle.postgres_password,
         plan.postgres_container,
-        plan.database_name,
+        plan.crusher_database_name,
     )
     application_url = _postgres_url(
         "crusher_app",
         secrets_bundle.application_password,
         plan.postgres_container,
-        plan.database_name,
+        plan.crusher_database_name,
     )
     owner_bundle = {
         "owner_url": owner_url,
@@ -959,11 +1006,19 @@ def _populate_runtime_files(
     )
     caddy_config = {
         "admin": {
-            "listen": "unix//run/fstack-caddy/caddy-admin.sock",
+            "listen": "unix//run/fstack-caddy/caddy-admin.sock|0220",
             "config": {"persist": False},
         },
         "apps": {
-            "http": {"servers": {"fstack": {"listen": [f":{plan.listener_port}"], "routes": []}}}
+            "http": {
+                "servers": {
+                    "fstack": {
+                        "listen": [f":{plan.listener_port}"],
+                        "routes": [],
+                        "automatic_https": {"disable": True},
+                    }
+                }
+            }
         },
     }
     _write_private(
@@ -993,7 +1048,7 @@ def _populate_runtime_files(
         (
             f"FROM {base_image}\n"
             "USER root\n"
-            "RUN apt-get update && apt-get install -y --no-install-recommends docker.io "
+            "RUN apt-get update && apt-get install -y --no-install-recommends docker-cli "
             "&& rm -rf /var/lib/apt/lists/*\n"
         ),
     )
@@ -1046,6 +1101,13 @@ def build_runtime_commands(
         "FSTACK_CADDY_PROBE_ADDRESS": plan.listener_address,
         "FSTACK_CADDY_CONTAINER_NAME": plan.caddy_container,
     }
+    caddy_client_environment = {
+        "FSTACK_CADDY_ADMIN_ROOT": "/run/fstack-caddy",
+        "FSTACK_CADDY_ADMIN_UID": str(plan.worker_uid),
+        "FSTACK_CADDY_ADMIN_GID": str(plan.caddy_socket_gid),
+        "FSTACK_CADDY_PROBE_ADDRESS": plan.listener_address,
+        "FSTACK_CADDY_CONTAINER_NAME": plan.caddy_container,
+    }
     api_environment = {
         database_url_key: database_url,
         operator_token_key: secrets_bundle.operator_token,
@@ -1056,7 +1118,7 @@ def build_runtime_commands(
         "POSTGRES_USER": "fstack",
         "POSTGRES_PWD": secrets_bundle.postgres_password,
         "POSTGRES_SEEDS": plan.postgres_container,
-        "DYNAMIC_CONFIG_FILE_PATH": "config/dynamicconfig/development-sql.yaml",
+        "DYNAMIC_CONFIG_FILE_PATH": "config/dynamicconfig/docker.yaml",
         "DEFAULT_NAMESPACE": plan.temporal_namespace,
         "DBNAME": plan.temporal_database_name,
         "VISIBILITY_DBNAME": plan.temporal_visibility_database_name,
@@ -1147,6 +1209,8 @@ def build_runtime_commands(
                 "--name",
                 plan.caddy_container,
                 *network,
+                "--network-alias",
+                plan.caddy_container,
                 "--ip",
                 plan.caddy_ip,
                 "--label",
@@ -1171,6 +1235,40 @@ def build_runtime_commands(
                 ),
             ),
             {"CADDY_SOCKET_MODE": "0220"},
+        ),
+        CommandSpec(
+            "caddy-client",
+            (
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                plan.caddy_client_container,
+                "--network",
+                "none",
+                "--label",
+                label,
+                "--label",
+                invocation_label,
+                "--user",
+                f"{plan.worker_uid}:{plan.worker_gid}",
+                "--group-add",
+                str(plan.caddy_socket_gid),
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--env-file",
+                str(runtime_root / "caddy-client.env"),
+                "--volume",
+                socket_mount,
+                plan.fstack_image,
+                "python",
+                "-c",
+                "import time;time.sleep(86400)",
+            ),
+            caddy_client_environment,
         ),
         CommandSpec(
             "api",
@@ -1301,6 +1399,11 @@ def build_resource_specs(
             ("docker", "container", "rm", "--force"),
         ),
         ResourceSpec(
+            plan.caddy_client_container,
+            commands["caddy-client"].argv,
+            ("docker", "container", "rm", "--force"),
+        ),
+        ResourceSpec(
             plan.worker_container,
             commands["worker"].argv,
             ("docker", "container", "rm", "--force"),
@@ -1361,11 +1464,8 @@ def build_maintenance_steps(
             revision,
         )
 
-    no_old_poller = (
-        "docker",
-        "exec",
-        plan.temporal_container,
-        "temporal",
+    no_old_poller = _temporal_cli_command(
+        plan,
         "task-queue",
         "describe",
         "--namespace",
@@ -1453,7 +1553,7 @@ def build_live_verification_commands(
     return (
         CommandSpec(
             "inspect-exact-caddy-route",
-            ("docker", "exec", plan.worker_container, "python", "-c", route_script),
+            ("docker", "exec", plan.caddy_client_container, "python", "-c", route_script),
         ),
         CommandSpec(
             "probe-caddy-to-crusher",
@@ -1551,6 +1651,7 @@ def _topology_mismatch_command(
                 " result=subprocess.run(argv,check=False,capture_output=True,timeout=timeout)",
                 " if tuple(argv[:3])==('docker','container','inspect') and expected_name in argv:",
                 "  payload=json.loads(result.stdout)",
+                "  payload[0]['Name']='/fstack-canary-alias-only'",
                 "  for endpoint in payload[0]['NetworkSettings']['Networks'].values():",
                 "   endpoint['Aliases']=[]",
                 (
@@ -1598,7 +1699,8 @@ def _topology_mismatch_command(
             "else: raise AssertionError('topology mismatch was accepted')",
         )
     )
-    return ("docker", "exec", plan.worker_container, "python", "-c", script)
+    launcher = f"source={script!r};exec(compile(source,'<topology-mismatch>','exec'))"
+    return ("docker", "exec", plan.worker_container, "python", "-c", launcher)
 
 
 def _durable_counts_command(plan: CanaryPlan, operation_id: str) -> tuple[str, ...]:
@@ -1632,6 +1734,23 @@ def _durable_counts_command(plan: CanaryPlan, operation_id: str) -> tuple[str, .
     )
 
 
+def _migration_head_command(plan: CanaryPlan) -> tuple[str, ...]:
+    return (
+        "docker",
+        "exec",
+        plan.postgres_container,
+        "psql",
+        "--username",
+        "fstack",
+        "--dbname",
+        plan.database_name,
+        "--tuples-only",
+        "--no-align",
+        "--command",
+        "SELECT version_num FROM alembic_version",
+    )
+
+
 def inputs_image(plan: CanaryPlan, name: str) -> str:
     images = {
         "caddy": plan.inputs.caddy_image,
@@ -1653,6 +1772,7 @@ def assert_no_resource_collisions(plan: CanaryPlan, executor: CommandExecutor) -
                 plan.postgres_container,
                 plan.temporal_container,
                 plan.caddy_container,
+                plan.caddy_client_container,
                 plan.api_container,
                 plan.worker_container,
                 f"{plan.prefix}-migration-20261006_0003",
@@ -1687,6 +1807,7 @@ def build_plan(inputs: CanaryInputs) -> CanaryPlan:
         postgres_container=f"{prefix}-postgres",
         temporal_container=f"{prefix}-temporal",
         caddy_container=f"{prefix}-caddy",
+        caddy_client_container=f"{prefix}-caddy-client",
         api_container=f"{prefix}-api",
         worker_container=f"{prefix}-worker",
         temporal_namespace=f"{prefix}-namespace",
@@ -1720,6 +1841,10 @@ class CanaryInputs:
                 raise CanaryContractError("every image must use an exact sha256 digest")
         if not self.caddy_image.startswith("caddy:2.11.7@sha256:"):
             raise CanaryContractError("the Caddy image must identify v2.11.7")
+        if _PROVISIONING_IMAGE.fullmatch(self.crusher_image) is None:
+            raise CanaryContractError(
+                "Crusher image must use the provisioning API's canonical digest-only form"
+            )
         if _NONCE.fullmatch(self.nonce) is None:
             raise CanaryContractError("invalid canary nonce")
         if (self.source_commit is None) == (self.source_archive is None):
@@ -1767,14 +1892,39 @@ def _canary_processes_absent(output: str, plan: CanaryPlan) -> bool:
     return not names.intersection({plan.api_container, plan.worker_container})
 
 
-def _task_queue_has_pollers(raw: str) -> bool:
+def _strict_json_object(raw: str) -> dict[str, object]:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"invalid JSON constant: {value}")
+
     try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        value = json.loads(
+            raw,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise CanaryContractError("Temporal poller evidence was invalid") from exc
     if type(value) is not dict:
         raise CanaryContractError("Temporal poller evidence was invalid")
+    return value
+
+
+def _task_queue_poller_snapshot(
+    raw: str,
+    *,
+    require_concrete_collection: bool = False,
+) -> tuple[str, ...]:
+    value = _strict_json_object(raw)
     recognized = False
+    snapshot: list[str] = []
     for key in (
         "pollers",
         "workflowTaskQueuePollers",
@@ -1783,13 +1933,108 @@ def _task_queue_has_pollers(raw: str) -> bool:
         pollers = value.get(key)
         if key in value:
             recognized = True
-        if type(pollers) is list and pollers:
-            return True
+        if pollers is None and key in value and require_concrete_collection:
+            raise CanaryContractError("Temporal poller evidence was invalid")
+        if type(pollers) is list:
+            for poller in pollers:
+                if type(poller) is not dict:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                identity = poller.get("identity")
+                last_access_time = poller.get("lastAccessTime")
+                if not isinstance(identity, str) or not identity:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                if not isinstance(last_access_time, str) or not last_access_time:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                try:
+                    parsed_last_access = datetime.fromisoformat(
+                        last_access_time.replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise CanaryContractError("Temporal poller evidence was invalid") from exc
+                if parsed_last_access.tzinfo is None:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                if key == "pollers":
+                    task_queue_type = poller.get("taskQueueType")
+                    if not isinstance(task_queue_type, str) or not task_queue_type:
+                        raise CanaryContractError("Temporal poller evidence was invalid")
+                snapshot.append(
+                    json.dumps(
+                        {"category": key, "poller": poller},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
         if pollers is not None and type(pollers) is not list:
             raise CanaryContractError("Temporal poller evidence was invalid")
     if not recognized:
         raise CanaryContractError("Temporal poller evidence was invalid")
-    return False
+    return tuple(sorted(snapshot))
+
+
+def _task_queue_has_pollers(raw: str) -> bool:
+    return bool(_task_queue_poller_snapshot(raw))
+
+
+def _poller_last_access_times(snapshot: tuple[str, ...]) -> tuple[datetime, ...]:
+    values: list[datetime] = []
+    for item in snapshot:
+        value = json.loads(item)
+        last_access_time = value["poller"]["lastAccessTime"]
+        parsed = datetime.fromisoformat(last_access_time.replace("Z", "+00:00"))
+        values.append(parsed)
+    return tuple(values)
+
+
+def _task_queue_has_fresh_pollers(raw: str, quiesced_snapshot: tuple[str, ...]) -> bool:
+    current = _task_queue_poller_snapshot(raw, require_concrete_collection=True)
+    if not current:
+        return False
+    quiesced_times = _poller_last_access_times(quiesced_snapshot)
+    if not quiesced_times:
+        return True
+    cutoff = max(quiesced_times)
+    return any(value > cutoff for value in _poller_last_access_times(current))
+
+
+def _verify_temporal_pollers_quiesced(
+    executor: CommandExecutor,
+    command: tuple[str, ...],
+    *,
+    observation_delay: float = 65.0,
+) -> tuple[str, ...]:
+    first = _task_queue_poller_snapshot(
+        executor.run(command, timeout=30),
+        require_concrete_collection=True,
+    )
+    time.sleep(observation_delay)
+    second = _task_queue_poller_snapshot(
+        executor.run(command, timeout=30),
+        require_concrete_collection=True,
+    )
+    if first != second:
+        raise CanaryContractError("Temporal poller quiescence was not proved")
+    return second
+
+
+def _temporal_cli_command(plan: CanaryPlan, *arguments: str) -> tuple[str, ...]:
+    return (
+        "docker",
+        "exec",
+        plan.temporal_container,
+        "temporal",
+        *arguments,
+        "--address",
+        f"{plan.temporal_container}:7233",
+    )
+
+
+def _temporal_health_command(plan: CanaryPlan) -> tuple[str, ...]:
+    return _temporal_cli_command(
+        plan,
+        "operator",
+        "cluster",
+        "health",
+    )
 
 
 def _wait_for_output(
@@ -1994,7 +2239,7 @@ def _caddy_routes_command(
         "response=CaddyAdminTransport(CaddyAdminConfig.from_environ())._exchange(request);"
         "assert 200<=response.status<300,response.status;print(response.body.decode())"
     )
-    return ("docker", "exec", plan.worker_container, "python", "-c", script)
+    return ("docker", "exec", plan.caddy_client_container, "python", "-c", script)
 
 
 def _adopt_caddy_route_command(plan: CanaryPlan, route: dict[str, object]) -> tuple[str, ...]:
@@ -2010,7 +2255,7 @@ def _adopt_caddy_route_command(plan: CanaryPlan, route: dict[str, object]) -> tu
         "config=CaddyAdminConfig.from_environ();"
         "CaddyAdmin(CaddyAdminTransport(config)).reconcile(route);print('adopted')"
     )
-    return ("docker", "exec", plan.worker_container, "python", "-c", script)
+    return ("docker", "exec", plan.caddy_client_container, "python", "-c", script)
 
 
 def _api_status_command(plan: CanaryPlan, operation_id: str) -> tuple[str, ...]:
@@ -2021,7 +2266,7 @@ def _api_status_command(plan: CanaryPlan, operation_id: str) -> tuple[str, ...]:
         "+operation_id,headers={'authorization':'Bearer '+os.environ['FSTACK_OPERATOR_TOKEN']});"
         "response=json.load(urllib.request.urlopen(request,timeout=10));"
         "print(json.dumps({'operation_id':response['operation_id'],'state':response['state'],"
-        "'error':response.get('error')},sort_keys=True,separators=(',',':')))"
+        "'error':response.get('last_error')},sort_keys=True,separators=(',',':')))"
     )
     return ("docker", "exec", plan.api_container, "python", "-c", script)
 
@@ -2126,12 +2371,23 @@ def _quiesce_canary_producers(executor: CommandExecutor, plan: CanaryPlan) -> No
         raise CanaryContractError("canary producers remained active during cleanup")
 
 
+def _docker_formatted_inspection(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CanaryContractError("Docker inspection evidence was invalid") from exc
+    if type(value) is not dict:
+        raise CanaryContractError("Docker inspection evidence was invalid")
+    return value
+
+
 def _capture_network_crusher_containers(
     executor: CommandExecutor,
     plan: CanaryPlan,
     expected_operations: dict[str, str],
     *,
     require_network: bool = True,
+    require_canonical_names: bool = True,
 ) -> list[tuple[str, str, str, str]]:
     if not expected_operations:
         return []
@@ -2167,13 +2423,18 @@ def _capture_network_crusher_containers(
         raise CanaryContractError("Crusher image identity was invalid")
     captured: list[tuple[str, str, str, str]] = []
     for name in sorted(filter(None, output.splitlines())):
-        if re.fullmatch(r"fstack-crusher(?:-migrate)?-[0-9a-f]{32}", name) is None:
-            continue
-        value = json.loads(
+        value = _docker_formatted_inspection(
             executor.run(("docker", "container", "inspect", "--format", "{{json .}}", name))
-        )[0]
-        labels = value["Config"]["Labels"]
-        configured_image = value["Config"].get("Image")
+        )
+        config = value.get("Config")
+        if not isinstance(config, dict):
+            raise CanaryContractError("Docker inspection evidence was invalid")
+        labels = config.get("Labels")
+        if labels is None:
+            labels = {}
+        if not isinstance(labels, dict):
+            raise CanaryContractError("Docker inspection evidence was invalid")
+        configured_image = config.get("Image")
         image_id = value.get("Image")
         identifier = value["Id"]
         operation_id = labels.get("io.fstack.operation_id")
@@ -2183,10 +2444,13 @@ def _capture_network_crusher_containers(
             continue
         expected_deployment = expected_operations[operation_id]
         deployment_hex = deployment_id.replace("-", "") if isinstance(deployment_id, str) else ""
+        canonical_names = {
+            f"fstack-crusher-{deployment_hex}",
+            f"fstack-crusher-migrate-{deployment_hex}",
+        }
         if (
             labels.get("io.fstack.managed") != "true"
             or expected_deployment != deployment_id
-            or not name.endswith(deployment_hex)
             or re.fullmatch(r"[0-9a-f]{32}", deployment_hex) is None
             or configured_image != plan.inputs.crusher_image
             or image_id != expected_image_id
@@ -2196,6 +2460,8 @@ def _capture_network_crusher_containers(
             or not isinstance(deployment_id, str)
             or (plan.network not in networks and (require_network or bool(networks)))
         ):
+            raise CanaryContractError("network Crusher container ownership was ambiguous")
+        if require_canonical_names and name not in canonical_names:
             raise CanaryContractError("network Crusher container ownership was ambiguous")
         captured.append((name, identifier, operation_id, deployment_id))
     return captured
@@ -2232,31 +2498,29 @@ def _cleanup_owned_crusher_containers(
             plan.inputs.crusher_image,
         )
     )
-    for name, captured_id, operation_id, deployment_id in reversed(owned):
+    for _name, captured_id, operation_id, deployment_id in reversed(owned):
         inspect = (
             "docker",
             "container",
             "inspect",
             "--format",
             "{{json .}}",
-            name,
+            captured_id,
         )
-        if not executor.exists(("docker", "container", "inspect", name)):
+        if not executor.exists(("docker", "container", "inspect", captured_id)):
             continue
         try:
             raw = executor.run(inspect)
-            value = json.loads(raw)
-            labels = value[0]["Config"]["Labels"]
-            configured_image = value[0]["Config"].get("Image")
-            image_id = value[0].get("Image")
-            networks = value[0]["NetworkSettings"]["Networks"]
-            identifier = value[0]["Id"]
-            deployment_hex = deployment_id.replace("-", "")
+            value = _docker_formatted_inspection(raw)
+            labels = value["Config"]["Labels"]
+            configured_image = value["Config"].get("Image")
+            image_id = value.get("Image")
+            networks = value["NetworkSettings"]["Networks"]
+            identifier = value["Id"]
             if (
                 labels.get("io.fstack.managed") != "true"
                 or labels.get("io.fstack.operation_id") != operation_id
                 or labels.get("io.fstack.deployment_id") != deployment_id
-                or not name.endswith(deployment_hex)
                 or configured_image != plan.inputs.crusher_image
                 or image_id != expected_image_id
                 or (plan.network not in networks and bool(networks))
@@ -2264,7 +2528,7 @@ def _cleanup_owned_crusher_containers(
             ):
                 raise CanaryContractError("dynamic Crusher container identity did not match")
             executor.run(("docker", "container", "rm", "--force", identifier), timeout=120)
-            if executor.exists(("docker", "container", "inspect", name)):
+            if executor.exists(("docker", "container", "inspect", captured_id)):
                 raise CanaryContractError("dynamic Crusher container remained after cleanup")
         except (CanaryContractError, KeyError, TypeError, json.JSONDecodeError):
             errors += 1
@@ -2349,18 +2613,11 @@ def run_live_canary(inputs: CanaryInputs) -> None:
             ),
             accept=lambda output: "accepting connections" in output,
         )
+        executor.run(plan.create_crusher_database_command, timeout=60)
         execute_resource(by_name[plan.temporal_container], docker_runner, cleanup)
         _wait_for_output(
             executor,
-            (
-                "docker",
-                "exec",
-                plan.temporal_container,
-                "temporal",
-                "operator",
-                "cluster",
-                "health",
-            ),
+            _temporal_health_command(plan),
             accept=lambda output: "SERVING" in output.upper(),
             attempts=120,
         )
@@ -2378,6 +2635,12 @@ def run_live_canary(inputs: CanaryInputs) -> None:
                 "/run/fstack-caddy/caddy-admin.sock",
             ),
             accept=lambda output: output == expected_socket,
+        )
+        execute_resource(by_name[plan.caddy_client_container], docker_runner, cleanup)
+        _wait_for_output(
+            executor,
+            _caddy_routes_command(plan),
+            accept=lambda output: output == "[]",
         )
 
         maintenance = {
@@ -2422,10 +2685,9 @@ def run_live_canary(inputs: CanaryInputs) -> None:
             maintenance["verify-process-exit"].argv,
             accept=lambda output: _canary_processes_absent(output, plan),
         )
-        _wait_for_output(
+        quiesced_pollers = _verify_temporal_pollers_quiesced(
             executor,
             maintenance["verify-no-old-poller"].argv,
-            accept=lambda output: not _task_queue_has_pollers(output),
         )
         _one_shot_container(
             name=f"{plan.prefix}-migration-20261013_0004",
@@ -2452,7 +2714,7 @@ def run_live_canary(inputs: CanaryInputs) -> None:
         _wait_for_output(
             executor,
             maintenance["verify-new-poller"].argv,
-            accept=_task_queue_has_pollers,
+            accept=lambda output: _task_queue_has_fresh_pollers(output, quiesced_pollers),
         )
         listener_probe = (
             "docker",
@@ -2692,9 +2954,9 @@ def run_live_canary(inputs: CanaryInputs) -> None:
             maintenance["verify-new-poller"].argv,
             accept=_task_queue_has_pollers,
         )
-        migration_head = executor.run(
-            ("docker", "exec", plan.worker_container, "alembic", "current")
-        )
+        migration_head = executor.run(_migration_head_command(plan))
+        if migration_head != "20261015_0005":
+            raise CanaryContractError("migration head was unexpected")
         versions = {
             "docker": executor.run(("docker", "version", "--format", "{{.Server.Version}}")),
             "git": executor.run(("git", "--version")),
@@ -2755,6 +3017,7 @@ def run_live_canary(inputs: CanaryInputs) -> None:
                     plan,
                     expected_operations,
                     require_network=False,
+                    require_canonical_names=False,
                 )
                 owned_crusher = _merge_captured_resources(owned_crusher, discovered)
             except Exception as exc:

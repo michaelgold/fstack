@@ -1688,6 +1688,10 @@ def test_malformed_host_value_without_established_claim_is_ambiguous(hosts: obje
         (b'""', '""'),
         (b'"opaque!#~"', '"opaque!#~"'),
         (b'W/"weak-opaque"', 'W/"weak-opaque"'),
+        (
+            b'"/config/apps/http/servers/fstack/routes 2c455418182f45b0"',
+            '"/config/apps/http/servers/fstack/routes 2c455418182f45b0"',
+        ),
         (b'"\x80\xff"', '"\x80\xff"'),
     ],
 )
@@ -1715,6 +1719,7 @@ def test_public_direct_pre_accepts_one_syntactically_valid_etag_unchanged(
         [],
         [b"Etag: arbitrary-nonempty"],
         [b'Etag:  " padded "'],
+        [b'Etag: "two  spaces"'],
         [b'etag: w/"lowercase-weak"'],
         [b'etag: "unterminated'],
         [b'etag: "embedded"quote"'],
@@ -1726,6 +1731,7 @@ def test_public_direct_pre_accepts_one_syntactically_valid_etag_unchanged(
         "missing",
         "arbitrary-nonempty-regression",
         "whitespace-inside-opaque-tag",
+        "repeated-whitespace-inside-opaque-tag",
         "lowercase-weak-prefix",
         "unterminated",
         "embedded-quote",
