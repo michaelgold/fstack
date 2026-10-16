@@ -1192,6 +1192,8 @@ def build_runtime_commands(
                 "--name",
                 plan.caddy_container,
                 *network,
+                "--network-alias",
+                plan.caddy_container,
                 "--ip",
                 plan.caddy_ip,
                 "--label",

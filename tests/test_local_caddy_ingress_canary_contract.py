@@ -591,6 +591,9 @@ def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: 
     assert ("--ip", plan.caddy_ip) in list(
         zip(commands["caddy"].argv, commands["caddy"].argv[1:], strict=False)
     )
+    assert ("--network-alias", plan.caddy_container) in list(
+        zip(commands["caddy"].argv, commands["caddy"].argv[1:], strict=False)
+    )
     for key, value in plan.worker_environment.items():
         assert commands["worker"].environment[key] == value
     assert commands["temporal"].environment["DYNAMIC_CONFIG_FILE_PATH"] == (
