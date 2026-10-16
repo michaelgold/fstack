@@ -615,6 +615,7 @@ def test_real_runner_cleans_renamed_container_by_captured_id() -> None:
     cleanup.run_and_verify()
 
     assert remove_id in executor.calls
+    assert ("docker", "container", "inspect", name) in executor.calls
     assert (
         "docker",
         "container",
@@ -623,6 +624,55 @@ def test_real_runner_cleans_renamed_container_by_captured_id() -> None:
         "{{.Id}}",
         name,
     ) not in executor.calls
+    assert ("docker", "container", "rm", "--force", name) not in executor.calls
+
+
+def test_static_replacement_at_canonical_name_blocks_successful_cleanup() -> None:
+    name = "fstack-caddy-canary-abc123-worker"
+    identifier = "f" * 64
+    image = "example.invalid/fstack@sha256:" + "a" * 64
+    inspect_id = ("docker", "container", "inspect", "--format", "{{.Id}}", identifier)
+    image_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Config.Image}}",
+        identifier,
+    )
+    owner_id = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        (
+            '{{index .Config.Labels "io.fstack.canary"}}|'
+            '{{index .Config.Labels "io.fstack.canary.invocation"}}'
+        ),
+        identifier,
+    )
+    remove_id = ("docker", "container", "rm", "--force", identifier)
+    executor = SequenceExecutor(
+        {
+            inspect_id: [identifier],
+            image_id: [image],
+            owner_id: ["fstack-caddy-canary-abc123|test-invocation"],
+            remove_id: [identifier],
+            ("docker", "container", "inspect", identifier): [None],
+            ("docker", "container", "inspect", name): ["exists"],
+        }
+    )
+    runner = DockerResourceRunner(executor)
+    cleanup = CleanupRegistry(runner)
+    cleanup.register(name, ("docker", "container", "rm", "--force"))
+    runner.identities[name] = identifier
+    runner.container_images[name] = image
+    cleanup.mark_created(name, identifier)
+
+    with pytest.raises(CanaryContractError, match="cleanup failed"):
+        cleanup.run_and_verify()
+
+    assert remove_id in executor.calls
     assert ("docker", "container", "rm", "--force", name) not in executor.calls
 
 
@@ -677,7 +727,7 @@ def test_cli_reports_only_a_bounded_sanitized_contract_error(
     captured = capsys.readouterr()
     assert result == 1
     assert captured.out == ""
-    assert captured.err == "canary_error: canary command failed\n"
+    assert captured.err == "canary_error: contract failure\n"
     assert marker not in captured.err
 
 

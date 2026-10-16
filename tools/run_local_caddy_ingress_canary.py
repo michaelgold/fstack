@@ -727,6 +727,8 @@ class DockerResourceRunner:
             raise CanaryContractError("cleanup ownership is unavailable")
         if self.executor.exists(("docker", kind, "inspect", target)):
             raise CanaryContractError("cleanup left a Docker resource behind")
+        if kind == "container" and self.executor.exists(("docker", "container", "inspect", name)):
+            raise CanaryContractError("cleanup left the canonical container name occupied")
 
     def register_kind(self, name: str, remove_command: tuple[str, ...]) -> None:
         self.kinds[name] = self._kind_from(remove_command)
@@ -3161,8 +3163,8 @@ def cli(
 ) -> int:
     try:
         return main(argv, runner=runner)
-    except CanaryContractError as exc:
-        print(f"canary_error: {exc}", file=sys.stderr)
+    except CanaryContractError:
+        print("canary_error: contract failure", file=sys.stderr)
         return 1
     except Exception:
         print("canary_error: internal failure", file=sys.stderr)
