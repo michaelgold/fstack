@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Any, Protocol
 
 _DIGEST_IMAGE = re.compile(r"^[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}$")
 _PROVISIONING_IMAGE = re.compile(
@@ -508,6 +508,17 @@ def verify_images(inputs: CanaryInputs, executor: CommandExecutor) -> dict[str, 
         "temporal": inputs.temporal_image,
         "crusher": inputs.crusher_image,
     }
+    architecture_aliases = {
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "amd64": "amd64",
+        "x86_64": "amd64",
+    }
+    daemon_architecture = architecture_aliases.get(
+        executor.run(("docker", "info", "--format", "{{.Architecture}}"))
+    )
+    if daemon_architecture is None:
+        raise CanaryContractError("Docker daemon architecture was unsupported")
     verified: dict[str, str] = {}
     for name, image in named.items():
         executor.run(("docker", "pull", image), timeout=900)
@@ -526,6 +537,11 @@ def verify_images(inputs: CanaryInputs, executor: CommandExecutor) -> dict[str, 
             or not any(value.endswith("@" + expected) for value in digests)
         ):
             raise CanaryContractError("pulled image does not expose the requested digest")
+        image_architecture = architecture_aliases.get(
+            executor.run(("docker", "image", "inspect", "--format", "{{.Architecture}}", image))
+        )
+        if image_architecture != daemon_architecture:
+            raise CanaryContractError("pulled image architecture does not match the Docker daemon")
         verified[name] = expected
     version = executor.run(("docker", "run", "--rm", inputs.caddy_image, "caddy", "version"))
     version_fields = version.strip().split()
@@ -2236,6 +2252,16 @@ def _quiesce_canary_producers(executor: CommandExecutor, plan: CanaryPlan) -> No
         raise CanaryContractError("canary producers remained active during cleanup")
 
 
+def _docker_formatted_inspection(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CanaryContractError("Docker inspection evidence was invalid") from exc
+    if type(value) is not dict:
+        raise CanaryContractError("Docker inspection evidence was invalid")
+    return value
+
+
 def _capture_network_crusher_containers(
     executor: CommandExecutor,
     plan: CanaryPlan,
@@ -2279,9 +2305,9 @@ def _capture_network_crusher_containers(
     for name in sorted(filter(None, output.splitlines())):
         if re.fullmatch(r"fstack-crusher(?:-migrate)?-[0-9a-f]{32}", name) is None:
             continue
-        value = json.loads(
+        value = _docker_formatted_inspection(
             executor.run(("docker", "container", "inspect", "--format", "{{json .}}", name))
-        )[0]
+        )
         labels = value["Config"]["Labels"]
         configured_image = value["Config"].get("Image")
         image_id = value.get("Image")
@@ -2355,12 +2381,12 @@ def _cleanup_owned_crusher_containers(
             continue
         try:
             raw = executor.run(inspect)
-            value = json.loads(raw)
-            labels = value[0]["Config"]["Labels"]
-            configured_image = value[0]["Config"].get("Image")
-            image_id = value[0].get("Image")
-            networks = value[0]["NetworkSettings"]["Networks"]
-            identifier = value[0]["Id"]
+            value = _docker_formatted_inspection(raw)
+            labels = value["Config"]["Labels"]
+            configured_image = value["Config"].get("Image")
+            image_id = value.get("Image")
+            networks = value["NetworkSettings"]["Networks"]
+            identifier = value["Id"]
             deployment_hex = deployment_id.replace("-", "")
             if (
                 labels.get("io.fstack.managed") != "true"

@@ -158,6 +158,7 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         nonce="abc123",
     )
     outputs: dict[tuple[str, ...], str] = {}
+    outputs[("docker", "info", "--format", "{{.Architecture}}")] = "aarch64"
     for image in (
         inputs.caddy_image,
         inputs.postgres_image,
@@ -168,6 +169,7 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         outputs[("docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image)] = (
             '["example.invalid/image@sha256:' + image.rsplit(":", 1)[-1] + '"]'
         )
+        outputs[("docker", "image", "inspect", "--format", "{{.Architecture}}", image)] = "arm64"
     outputs[("docker", "run", "--rm", inputs.caddy_image, "caddy", "version")] = (
         "v2.11.7 h1:acceptance-build-hash"
     )
@@ -184,6 +186,13 @@ def test_image_verification_pulls_and_inspects_exact_digests_and_caddy_version(
         "caddy",
         "version",
     )
+
+    mismatched = dict(outputs)
+    mismatched[
+        ("docker", "image", "inspect", "--format", "{{.Architecture}}", inputs.crusher_image)
+    ] = "amd64"
+    with pytest.raises(CanaryContractError, match="architecture"):
+        verify_images(inputs, FakeExecutor(mismatched))
 
 
 def test_executing_harness_must_match_immutable_prepared_source(tmp_path: Path) -> None:
@@ -948,21 +957,19 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
             list_command: name + "\n",
             image_id_command: "sha256:" + "e" * 64,
             inspect_command: json.dumps(
-                [
-                    {
-                        "Id": "d" * 64,
-                        "Image": "sha256:" + "e" * 64,
-                        "Config": {
-                            "Image": plan.inputs.crusher_image,
-                            "Labels": {
-                                "io.fstack.managed": "true",
-                                "io.fstack.operation_id": operation_id,
-                                "io.fstack.deployment_id": deployment_id,
-                            },
+                {
+                    "Id": "d" * 64,
+                    "Image": "sha256:" + "e" * 64,
+                    "Config": {
+                        "Image": plan.inputs.crusher_image,
+                        "Labels": {
+                            "io.fstack.managed": "true",
+                            "io.fstack.operation_id": operation_id,
+                            "io.fstack.deployment_id": deployment_id,
                         },
-                        "NetworkSettings": {"Networks": {plan.network: {}}},
-                    }
-                ]
+                    },
+                    "NetworkSettings": {"Networks": {plan.network: {}}},
+                }
             ),
         },
         existing={("docker", "network", "inspect", plan.network)},
@@ -983,7 +990,7 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
         "{{.Names}}",
     )
     disconnected = json.loads(executor.outputs[inspect_command])
-    disconnected[0]["NetworkSettings"]["Networks"] = {}
+    disconnected["NetworkSettings"]["Networks"] = {}
     global_executor = FakeExecutor(
         {
             global_list_command: name + "\n",
@@ -998,7 +1005,7 @@ def test_dynamic_crusher_cleanup_capture_uses_owned_network_not_api_response(
         require_network=False,
     ) == [(name, "d" * 64, operation_id, deployment_id)]
     wrong_image = json.loads(executor.outputs[inspect_command])
-    wrong_image[0]["Config"]["Image"] = "mutable:latest"
+    wrong_image["Config"]["Image"] = "mutable:latest"
     executor.outputs[inspect_command] = json.dumps(wrong_image)
     with pytest.raises(CanaryContractError):
         _capture_network_crusher_containers(executor, plan, expected_operations)
