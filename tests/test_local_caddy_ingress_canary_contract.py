@@ -287,6 +287,19 @@ def test_plan_is_fully_isolated_and_registers_cleanup_before_create(tmp_path: Pa
 
     assert plan.prefix == "fstack-caddy-canary-abc123"
     assert plan.database_name.endswith("_test")
+    assert plan.crusher_database_name == "fstack_caddy_canary_abc123_crusher"
+    assert plan.crusher_database_name != plan.database_name
+    assert plan.create_crusher_database_command == (
+        "docker",
+        "exec",
+        plan.postgres_container,
+        "createdb",
+        "--username",
+        "fstack",
+        "--owner",
+        "fstack",
+        plan.crusher_database_name,
+    )
     assert all(name.startswith(plan.prefix) for name in plan.resource_names)
     assert plan.caddy_ip == "172.30.0.10"
     assert plan.listener_address == "172.30.0.10:8080"
@@ -1116,12 +1129,14 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
     ):
         assert directory.stat().st_mode & 0o777 == 0o700
         assert directory.stat().st_uid == runtime.stat().st_uid
-    assert (
-        json.loads((source_bundle / "owner.json").read_text(encoding="utf-8"))[
-            "application_password"
-        ]
-        == "application-secret-marker"
+    owner_bundle = json.loads((source_bundle / "owner.json").read_text(encoding="utf-8"))
+    application_bundle = json.loads(
+        (source_bundle / "application.json").read_text(encoding="utf-8")
     )
+    assert owner_bundle["application_password"] == "application-secret-marker"
+    assert owner_bundle["owner_url"].endswith(f"/{plan.crusher_database_name}")
+    assert application_bundle["application_url"].endswith(f"/{plan.crusher_database_name}")
+    assert not owner_bundle["owner_url"].endswith(f"/{plan.database_name}")
     assert (source_bundle / "owner.json").stat().st_mode & 0o777 == 0o600
 
 

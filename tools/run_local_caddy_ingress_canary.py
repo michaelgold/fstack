@@ -850,6 +850,24 @@ class CanaryPlan:
         return f"fstack_canary_{self.inputs.nonce}_visibility"
 
     @property
+    def crusher_database_name(self) -> str:
+        return f"fstack_caddy_canary_{self.inputs.nonce}_crusher"
+
+    @property
+    def create_crusher_database_command(self) -> tuple[str, ...]:
+        return (
+            "docker",
+            "exec",
+            self.postgres_container,
+            "createdb",
+            "--username",
+            "fstack",
+            "--owner",
+            "fstack",
+            self.crusher_database_name,
+        )
+
+    @property
     def worker_supplemental_gid(self) -> int:
         return self.caddy_socket_gid
 
@@ -957,13 +975,13 @@ def _populate_runtime_files(
         "fstack",
         secrets_bundle.postgres_password,
         plan.postgres_container,
-        plan.database_name,
+        plan.crusher_database_name,
     )
     application_url = _postgres_url(
         "crusher_app",
         secrets_bundle.application_password,
         plan.postgres_container,
-        plan.database_name,
+        plan.crusher_database_name,
     )
     owner_bundle = {
         "owner_url": owner_url,
@@ -2485,6 +2503,7 @@ def run_live_canary(inputs: CanaryInputs) -> None:
             ),
             accept=lambda output: "accepting connections" in output,
         )
+        executor.run(plan.create_crusher_database_command, timeout=60)
         execute_resource(by_name[plan.temporal_container], docker_runner, cleanup)
         _wait_for_output(
             executor,
