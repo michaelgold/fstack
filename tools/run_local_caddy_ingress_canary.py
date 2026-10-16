@@ -1004,11 +1004,19 @@ def _populate_runtime_files(
     )
     caddy_config = {
         "admin": {
-            "listen": "unix//run/fstack-caddy/caddy-admin.sock",
+            "listen": "unix//run/fstack-caddy/caddy-admin.sock|0220",
             "config": {"persist": False},
         },
         "apps": {
-            "http": {"servers": {"fstack": {"listen": [f":{plan.listener_port}"], "routes": []}}}
+            "http": {
+                "servers": {
+                    "fstack": {
+                        "listen": [f":{plan.listener_port}"],
+                        "routes": [],
+                        "automatic_https": {"disable": True},
+                    }
+                }
+            }
         },
     }
     _write_private(

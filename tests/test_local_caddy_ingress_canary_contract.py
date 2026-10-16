@@ -1095,11 +1095,12 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
     prepare_runtime_files(plan, runtime, secrets)
 
     caddy = json.loads((runtime / "caddy.json").read_text(encoding="utf-8"))
-    assert caddy["admin"]["listen"] == "unix//run/fstack-caddy/caddy-admin.sock"
+    assert caddy["admin"]["listen"] == "unix//run/fstack-caddy/caddy-admin.sock|0220"
     assert caddy["admin"]["config"]["persist"] is False
     assert caddy["apps"]["http"]["servers"]["fstack"] == {
         "listen": [":8080"],
         "routes": [],
+        "automatic_https": {"disable": True},
     }
     assert "tcp/" not in json.dumps(caddy)
     build_context = runtime / "build-context"
