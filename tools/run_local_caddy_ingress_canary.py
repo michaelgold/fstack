@@ -1603,6 +1603,7 @@ def _topology_mismatch_command(
                 " result=subprocess.run(argv,check=False,capture_output=True,timeout=timeout)",
                 " if tuple(argv[:3])==('docker','container','inspect') and expected_name in argv:",
                 "  payload=json.loads(result.stdout)",
+                "  payload[0]['Name']='/fstack-canary-alias-only'",
                 "  for endpoint in payload[0]['NetworkSettings']['Networks'].values():",
                 "   endpoint['Aliases']=[]",
                 (
