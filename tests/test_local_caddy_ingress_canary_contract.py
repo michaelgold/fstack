@@ -1080,7 +1080,9 @@ def test_runtime_files_define_unix_admin_socket_and_private_secret_material(tmp_
     }
     assert "tcp/" not in json.dumps(caddy)
     build_context = runtime / "build-context"
-    assert "docker.io" in (build_context / "Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (build_context / "Dockerfile").read_text(encoding="utf-8")
+    assert "apt-get install -y --no-install-recommends docker-cli" in dockerfile
+    assert "docker.io" not in dockerfile
     runtime_commands = build_runtime_commands(plan, tmp_path / "source", runtime, secrets)
     build_command = {command.name: command for command in runtime_commands}["build-fstack-runtime"]
     assert build_command.argv[-1] == str(build_context)

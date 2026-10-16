@@ -1004,7 +1004,7 @@ def _populate_runtime_files(
         (
             f"FROM {base_image}\n"
             "USER root\n"
-            "RUN apt-get update && apt-get install -y --no-install-recommends docker.io "
+            "RUN apt-get update && apt-get install -y --no-install-recommends docker-cli "
             "&& rm -rf /var/lib/apt/lists/*\n"
         ),
     )
