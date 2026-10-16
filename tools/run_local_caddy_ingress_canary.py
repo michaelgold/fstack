@@ -2476,16 +2476,16 @@ def _cleanup_owned_crusher_containers(
             plan.inputs.crusher_image,
         )
     )
-    for name, captured_id, operation_id, deployment_id in reversed(owned):
+    for _name, captured_id, operation_id, deployment_id in reversed(owned):
         inspect = (
             "docker",
             "container",
             "inspect",
             "--format",
             "{{json .}}",
-            name,
+            captured_id,
         )
-        if not executor.exists(("docker", "container", "inspect", name)):
+        if not executor.exists(("docker", "container", "inspect", captured_id)):
             continue
         try:
             raw = executor.run(inspect)
@@ -2506,7 +2506,7 @@ def _cleanup_owned_crusher_containers(
             ):
                 raise CanaryContractError("dynamic Crusher container identity did not match")
             executor.run(("docker", "container", "rm", "--force", identifier), timeout=120)
-            if executor.exists(("docker", "container", "inspect", name)):
+            if executor.exists(("docker", "container", "inspect", captured_id)):
                 raise CanaryContractError("dynamic Crusher container remained after cleanup")
         except (CanaryContractError, KeyError, TypeError, json.JSONDecodeError):
             errors += 1

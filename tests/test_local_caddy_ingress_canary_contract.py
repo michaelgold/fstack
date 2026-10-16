@@ -1144,13 +1144,21 @@ def test_unexpected_owned_crusher_name_fails_acceptance_but_remains_cleanup_elig
     cleanup_executor = SequenceExecutor(
         {
             image_id_command: [image_id],
-            ("docker", "container", "inspect", name): ["exists"],
-            inspect_command: [inspection],
+            ("docker", "container", "inspect", identifier): ["exists", None],
+            (
+                "docker",
+                "container",
+                "inspect",
+                "--format",
+                "{{json .}}",
+                identifier,
+            ): [inspection],
             ("docker", "container", "rm", "--force", identifier): [identifier],
         }
     )
     _cleanup_owned_crusher_containers(cleanup_executor, plan, owned)
     assert ("docker", "container", "rm", "--force", identifier) in cleanup_executor.calls
+    assert ("docker", "container", "inspect", name) not in cleanup_executor.calls
 
 
 def test_full_resource_failure_cleans_every_previously_captured_identity(tmp_path: Path) -> None:
