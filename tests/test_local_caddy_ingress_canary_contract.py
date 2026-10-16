@@ -37,6 +37,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     _source_tree_digest,
     _submission_ids_command,
     _task_queue_has_pollers,
+    _temporal_health_command,
     _topology_mismatch_command,
     _verify_executing_harness,
     assert_no_resource_collisions,
@@ -564,6 +565,17 @@ def test_commands_share_one_network_and_preflight_before_provisioning(tmp_path: 
         assert commands["worker"].environment[key] == value
     assert commands["temporal"].environment["DYNAMIC_CONFIG_FILE_PATH"] == (
         "config/dynamicconfig/docker.yaml"
+    )
+    assert _temporal_health_command(plan) == (
+        "docker",
+        "exec",
+        plan.temporal_container,
+        "temporal",
+        "operator",
+        "cluster",
+        "health",
+        "--address",
+        f"{plan.temporal_container}:7233",
     )
     assert ("--group-add", str(plan.worker_supplemental_gid)) in list(
         zip(commands["worker"].argv, commands["worker"].argv[1:], strict=False)
@@ -1183,6 +1195,11 @@ def test_maintenance_sequence_keeps_api_off_until_v2_polling_is_proved(tmp_path:
         "stop",
     )
     assert by_name["verify-process-exit"].argv != by_name["stop-api-dispatcher-worker"].argv
+    for name in ("verify-no-old-poller", "verify-new-poller"):
+        assert by_name[name].argv[-2:] == (
+            "--address",
+            f"{build_plan(inputs).temporal_container}:7233",
+        )
     for name, revision in (
         ("bootstrap-20261006-0003", "20261006_0003"),
         ("upgrade-20261013-0004", "20261013_0004"),

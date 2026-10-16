@@ -1362,11 +1362,8 @@ def build_maintenance_steps(
             revision,
         )
 
-    no_old_poller = (
-        "docker",
-        "exec",
-        plan.temporal_container,
-        "temporal",
+    no_old_poller = _temporal_cli_command(
+        plan,
         "task-queue",
         "describe",
         "--namespace",
@@ -1791,6 +1788,27 @@ def _task_queue_has_pollers(raw: str) -> bool:
     if not recognized:
         raise CanaryContractError("Temporal poller evidence was invalid")
     return False
+
+
+def _temporal_cli_command(plan: CanaryPlan, *arguments: str) -> tuple[str, ...]:
+    return (
+        "docker",
+        "exec",
+        plan.temporal_container,
+        "temporal",
+        *arguments,
+        "--address",
+        f"{plan.temporal_container}:7233",
+    )
+
+
+def _temporal_health_command(plan: CanaryPlan) -> tuple[str, ...]:
+    return _temporal_cli_command(
+        plan,
+        "operator",
+        "cluster",
+        "health",
+    )
 
 
 def _wait_for_output(
@@ -2353,15 +2371,7 @@ def run_live_canary(inputs: CanaryInputs) -> None:
         execute_resource(by_name[plan.temporal_container], docker_runner, cleanup)
         _wait_for_output(
             executor,
-            (
-                "docker",
-                "exec",
-                plan.temporal_container,
-                "temporal",
-                "operator",
-                "cluster",
-                "health",
-            ),
+            _temporal_health_command(plan),
             accept=lambda output: "SERVING" in output.upper(),
             attempts=120,
         )
