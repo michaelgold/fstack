@@ -1975,12 +1975,33 @@ def _task_queue_has_pollers(raw: str) -> bool:
     return bool(_task_queue_poller_snapshot(raw))
 
 
+def _poller_last_access_times(snapshot: tuple[str, ...]) -> tuple[datetime, ...]:
+    values: list[datetime] = []
+    for item in snapshot:
+        value = json.loads(item)
+        last_access_time = value["poller"]["lastAccessTime"]
+        parsed = datetime.fromisoformat(last_access_time.replace("Z", "+00:00"))
+        values.append(parsed)
+    return tuple(values)
+
+
+def _task_queue_has_fresh_pollers(raw: str, quiesced_snapshot: tuple[str, ...]) -> bool:
+    current = _task_queue_poller_snapshot(raw, require_concrete_collection=True)
+    if not current:
+        return False
+    quiesced_times = _poller_last_access_times(quiesced_snapshot)
+    if not quiesced_times:
+        return True
+    cutoff = max(quiesced_times)
+    return any(value > cutoff for value in _poller_last_access_times(current))
+
+
 def _verify_temporal_pollers_quiesced(
     executor: CommandExecutor,
     command: tuple[str, ...],
     *,
     observation_delay: float = 65.0,
-) -> None:
+) -> tuple[str, ...]:
     first = _task_queue_poller_snapshot(
         executor.run(command, timeout=30),
         require_concrete_collection=True,
@@ -1992,6 +2013,7 @@ def _verify_temporal_pollers_quiesced(
     )
     if first != second:
         raise CanaryContractError("Temporal poller quiescence was not proved")
+    return second
 
 
 def _temporal_cli_command(plan: CanaryPlan, *arguments: str) -> tuple[str, ...]:
@@ -2663,7 +2685,7 @@ def run_live_canary(inputs: CanaryInputs) -> None:
             maintenance["verify-process-exit"].argv,
             accept=lambda output: _canary_processes_absent(output, plan),
         )
-        _verify_temporal_pollers_quiesced(
+        quiesced_pollers = _verify_temporal_pollers_quiesced(
             executor,
             maintenance["verify-no-old-poller"].argv,
         )
@@ -2692,7 +2714,7 @@ def run_live_canary(inputs: CanaryInputs) -> None:
         _wait_for_output(
             executor,
             maintenance["verify-new-poller"].argv,
-            accept=_task_queue_has_pollers,
+            accept=lambda output: _task_queue_has_fresh_pollers(output, quiesced_pollers),
         )
         listener_probe = (
             "docker",

@@ -39,6 +39,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     _select_exact_managed_route,
     _source_tree_digest,
     _submission_ids_command,
+    _task_queue_has_fresh_pollers,
     _task_queue_has_pollers,
     _temporal_health_command,
     _topology_mismatch_command,
@@ -1425,7 +1426,12 @@ def test_temporal_poller_quiescence_requires_stable_last_access_evidence() -> No
     )
     executor = SequenceExecutor({command: [stable, stable]})
 
-    _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+    baseline = _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+    assert _task_queue_has_fresh_pollers(stable, baseline) is False
+
+    fresh = stable.replace("00:00:00Z", "00:00:01Z")
+    assert _task_queue_has_fresh_pollers(fresh, baseline) is True
+    assert _task_queue_has_fresh_pollers('{"pollers":[]}', baseline) is False
 
     advanced = stable.replace("00:00:00Z", "00:00:01Z")
     executor = SequenceExecutor({command: [stable, advanced]})
