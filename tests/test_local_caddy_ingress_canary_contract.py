@@ -40,6 +40,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     _temporal_health_command,
     _topology_mismatch_command,
     _verify_executing_harness,
+    _verify_temporal_pollers_quiesced,
     assert_no_resource_collisions,
     build_live_verification_commands,
     build_maintenance_steps,
@@ -1219,15 +1220,77 @@ def test_temporal_poller_evidence_requires_a_nonempty_workflow_or_activity_polle
         is False
     )
     assert (
-        _task_queue_has_pollers('{"workflowTaskQueuePollers":[{"identity":"worker@canary"}]}')
+        _task_queue_has_pollers(
+            '{"workflowTaskQueuePollers":[{"identity":"worker@canary",'
+            '"lastAccessTime":"2026-10-16T00:00:00Z"}]}'
+        )
         is True
     )
+    assert _task_queue_has_pollers('{"pollers":null}') is False
     with pytest.raises(CanaryContractError):
         _task_queue_has_pollers("not-json")
     with pytest.raises(CanaryContractError):
         _task_queue_has_pollers("{}")
     with pytest.raises(CanaryContractError):
         _task_queue_has_pollers('{"unknown":[]}')
+
+
+def test_temporal_poller_quiescence_requires_stable_last_access_evidence() -> None:
+    command = ("temporal", "task-queue", "describe")
+    stable = json.dumps(
+        {
+            "pollers": [
+                {
+                    "identity": "worker@canary",
+                    "taskQueueType": "workflow",
+                    "lastAccessTime": "2026-10-16T00:00:00Z",
+                }
+            ]
+        }
+    )
+    executor = SequenceExecutor({command: [stable, stable]})
+
+    _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+
+    advanced = stable.replace("00:00:00Z", "00:00:01Z")
+    executor = SequenceExecutor({command: [stable, advanced]})
+    with pytest.raises(CanaryContractError, match="poller quiescence was not proved"):
+        _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+
+    invalid_snapshots = (
+        '{"pollers":null}',
+        '{"pollers":[{}]}',
+        '{"pollers":[{"identity":"worker@canary","taskQueueType":"workflow"}]}',
+        '{"pollers":[{"identity":"worker@canary","taskQueueType":"workflow",'
+        '"lastAccessTime":"not-a-timestamp"}]}',
+        (
+            '{"pollers":[{"identity":"worker@canary","identity":"duplicate",'
+            '"taskQueueType":"workflow","lastAccessTime":"2026-10-16T00:00:00Z"}]}'
+        ),
+        (
+            '{"pollers":[{"identity":"worker@canary","taskQueueType":"workflow",'
+            '"lastAccessTime":NaN}]}'
+        ),
+    )
+    for invalid in invalid_snapshots:
+        executor = SequenceExecutor({command: [invalid, invalid]})
+        with pytest.raises(CanaryContractError, match="poller evidence was invalid"):
+            _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
+
+    workflow = json.dumps(
+        {
+            "workflowTaskQueuePollers": [
+                {
+                    "identity": "worker@canary",
+                    "lastAccessTime": "2026-10-16T00:00:00Z",
+                }
+            ]
+        }
+    )
+    activity = workflow.replace("workflowTaskQueuePollers", "activityTaskQueuePollers")
+    executor = SequenceExecutor({command: [workflow, activity]})
+    with pytest.raises(CanaryContractError, match="poller quiescence was not proved"):
+        _verify_temporal_pollers_quiesced(executor, command, observation_delay=0)
 
 
 def plan_secret_markers(commands: tuple[CommandSpec, ...]) -> set[str]:

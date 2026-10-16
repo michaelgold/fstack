@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -1765,14 +1766,39 @@ def _canary_processes_absent(output: str, plan: CanaryPlan) -> bool:
     return not names.intersection({plan.api_container, plan.worker_container})
 
 
-def _task_queue_has_pollers(raw: str) -> bool:
+def _strict_json_object(raw: str) -> dict[str, object]:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"invalid JSON constant: {value}")
+
     try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        value = json.loads(
+            raw,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise CanaryContractError("Temporal poller evidence was invalid") from exc
     if type(value) is not dict:
         raise CanaryContractError("Temporal poller evidence was invalid")
+    return value
+
+
+def _task_queue_poller_snapshot(
+    raw: str,
+    *,
+    require_concrete_collection: bool = False,
+) -> tuple[str, ...]:
+    value = _strict_json_object(raw)
     recognized = False
+    snapshot: list[str] = []
     for key in (
         "pollers",
         "workflowTaskQueuePollers",
@@ -1781,13 +1807,65 @@ def _task_queue_has_pollers(raw: str) -> bool:
         pollers = value.get(key)
         if key in value:
             recognized = True
-        if type(pollers) is list and pollers:
-            return True
+        if pollers is None and key in value and require_concrete_collection:
+            raise CanaryContractError("Temporal poller evidence was invalid")
+        if type(pollers) is list:
+            for poller in pollers:
+                if type(poller) is not dict:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                identity = poller.get("identity")
+                last_access_time = poller.get("lastAccessTime")
+                if not isinstance(identity, str) or not identity:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                if not isinstance(last_access_time, str) or not last_access_time:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                try:
+                    parsed_last_access = datetime.fromisoformat(
+                        last_access_time.replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise CanaryContractError("Temporal poller evidence was invalid") from exc
+                if parsed_last_access.tzinfo is None:
+                    raise CanaryContractError("Temporal poller evidence was invalid")
+                if key == "pollers":
+                    task_queue_type = poller.get("taskQueueType")
+                    if not isinstance(task_queue_type, str) or not task_queue_type:
+                        raise CanaryContractError("Temporal poller evidence was invalid")
+                snapshot.append(
+                    json.dumps(
+                        {"category": key, "poller": poller},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
         if pollers is not None and type(pollers) is not list:
             raise CanaryContractError("Temporal poller evidence was invalid")
     if not recognized:
         raise CanaryContractError("Temporal poller evidence was invalid")
-    return False
+    return tuple(sorted(snapshot))
+
+
+def _task_queue_has_pollers(raw: str) -> bool:
+    return bool(_task_queue_poller_snapshot(raw))
+
+
+def _verify_temporal_pollers_quiesced(
+    executor: CommandExecutor,
+    command: tuple[str, ...],
+    *,
+    observation_delay: float = 65.0,
+) -> None:
+    first = _task_queue_poller_snapshot(
+        executor.run(command, timeout=30),
+        require_concrete_collection=True,
+    )
+    time.sleep(observation_delay)
+    second = _task_queue_poller_snapshot(
+        executor.run(command, timeout=30),
+        require_concrete_collection=True,
+    )
+    if first != second:
+        raise CanaryContractError("Temporal poller quiescence was not proved")
 
 
 def _temporal_cli_command(plan: CanaryPlan, *arguments: str) -> tuple[str, ...]:
@@ -2433,10 +2511,9 @@ def run_live_canary(inputs: CanaryInputs) -> None:
             maintenance["verify-process-exit"].argv,
             accept=lambda output: _canary_processes_absent(output, plan),
         )
-        _wait_for_output(
+        _verify_temporal_pollers_quiesced(
             executor,
             maintenance["verify-no-old-poller"].argv,
-            accept=lambda output: not _task_queue_has_pollers(output),
         )
         _one_shot_container(
             name=f"{plan.prefix}-migration-20261013_0004",
