@@ -27,6 +27,7 @@ from tools.run_local_caddy_ingress_canary import (  # noqa: E402
     _caddy_routes_command,
     _canary_processes_absent,
     _capture_network_crusher_containers,
+    _cleanup_owned_crusher_containers,
     _conflict_fixture,
     _dispatch_generation_command,
     _durable_counts_command,
@@ -1056,6 +1057,100 @@ def test_dynamic_capture_rejects_same_name_replacement_identity() -> None:
     with pytest.raises(CanaryContractError):
         _merge_captured_resources(original, replacement)
     assert _merge_captured_resources(original, list(original)) == original
+
+
+def test_unexpected_owned_crusher_name_fails_acceptance_but_remains_cleanup_eligible(
+    tmp_path: Path,
+) -> None:
+    inputs = CanaryInputs(
+        source_commit="a" * 40,
+        source_archive=None,
+        source_archive_sha256=None,
+        caddy_image=_digest("caddy:2.11.7", "1"),
+        postgres_image=_digest("postgres:17-alpine", "2"),
+        temporal_image=_digest("temporalio/auto-setup:1.25.2", "3"),
+        crusher_image=_digest("ghcr.io/michaelgold/crusher", "4"),
+        evidence_dir=tmp_path / "evidence",
+        nonce="abc123",
+    )
+    plan = build_plan(inputs)
+    operation_id = "22345678-1234-5678-9234-567812345678"
+    deployment_id = "12345678-1234-5678-9234-567812345678"
+    name = "unexpected-owned-crusher"
+    identifier = "d" * 64
+    image_id = "sha256:" + "e" * 64
+    list_command = (
+        "docker",
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        f"network={plan.network}",
+        "--format",
+        "{{.Names}}",
+    )
+    inspect_command = (
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{json .}}",
+        name,
+    )
+    image_id_command = (
+        "docker",
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        plan.inputs.crusher_image,
+    )
+    inspection = json.dumps(
+        {
+            "Id": identifier,
+            "Image": image_id,
+            "Config": {
+                "Image": plan.inputs.crusher_image,
+                "Labels": {
+                    "io.fstack.managed": "true",
+                    "io.fstack.operation_id": operation_id,
+                    "io.fstack.deployment_id": deployment_id,
+                },
+            },
+            "NetworkSettings": {"Networks": {plan.network: {}}},
+        }
+    )
+    executor = FakeExecutor(
+        {
+            list_command: name + "\n",
+            image_id_command: image_id,
+            inspect_command: inspection,
+        },
+        existing={("docker", "network", "inspect", plan.network)},
+    )
+    expected_operations = {operation_id: deployment_id}
+
+    with pytest.raises(CanaryContractError, match="ownership was ambiguous"):
+        _capture_network_crusher_containers(executor, plan, expected_operations)
+
+    owned = _capture_network_crusher_containers(
+        executor,
+        plan,
+        expected_operations,
+        require_canonical_names=False,
+    )
+    assert owned == [(name, identifier, operation_id, deployment_id)]
+
+    cleanup_executor = SequenceExecutor(
+        {
+            image_id_command: [image_id],
+            ("docker", "container", "inspect", name): ["exists"],
+            inspect_command: [inspection],
+            ("docker", "container", "rm", "--force", identifier): [identifier],
+        }
+    )
+    _cleanup_owned_crusher_containers(cleanup_executor, plan, owned)
+    assert ("docker", "container", "rm", "--force", identifier) in cleanup_executor.calls
 
 
 def test_full_resource_failure_cleans_every_previously_captured_identity(tmp_path: Path) -> None:

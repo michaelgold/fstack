@@ -2365,6 +2365,7 @@ def _capture_network_crusher_containers(
     expected_operations: dict[str, str],
     *,
     require_network: bool = True,
+    require_canonical_names: bool = True,
 ) -> list[tuple[str, str, str, str]]:
     if not expected_operations:
         return []
@@ -2400,13 +2401,18 @@ def _capture_network_crusher_containers(
         raise CanaryContractError("Crusher image identity was invalid")
     captured: list[tuple[str, str, str, str]] = []
     for name in sorted(filter(None, output.splitlines())):
-        if re.fullmatch(r"fstack-crusher(?:-migrate)?-[0-9a-f]{32}", name) is None:
-            continue
         value = _docker_formatted_inspection(
             executor.run(("docker", "container", "inspect", "--format", "{{json .}}", name))
         )
-        labels = value["Config"]["Labels"]
-        configured_image = value["Config"].get("Image")
+        config = value.get("Config")
+        if not isinstance(config, dict):
+            raise CanaryContractError("Docker inspection evidence was invalid")
+        labels = config.get("Labels")
+        if labels is None:
+            labels = {}
+        if not isinstance(labels, dict):
+            raise CanaryContractError("Docker inspection evidence was invalid")
+        configured_image = config.get("Image")
         image_id = value.get("Image")
         identifier = value["Id"]
         operation_id = labels.get("io.fstack.operation_id")
@@ -2416,10 +2422,13 @@ def _capture_network_crusher_containers(
             continue
         expected_deployment = expected_operations[operation_id]
         deployment_hex = deployment_id.replace("-", "") if isinstance(deployment_id, str) else ""
+        canonical_names = {
+            f"fstack-crusher-{deployment_hex}",
+            f"fstack-crusher-migrate-{deployment_hex}",
+        }
         if (
             labels.get("io.fstack.managed") != "true"
             or expected_deployment != deployment_id
-            or not name.endswith(deployment_hex)
             or re.fullmatch(r"[0-9a-f]{32}", deployment_hex) is None
             or configured_image != plan.inputs.crusher_image
             or image_id != expected_image_id
@@ -2429,6 +2438,8 @@ def _capture_network_crusher_containers(
             or not isinstance(deployment_id, str)
             or (plan.network not in networks and (require_network or bool(networks)))
         ):
+            raise CanaryContractError("network Crusher container ownership was ambiguous")
+        if require_canonical_names and name not in canonical_names:
             raise CanaryContractError("network Crusher container ownership was ambiguous")
         captured.append((name, identifier, operation_id, deployment_id))
     return captured
@@ -2484,12 +2495,10 @@ def _cleanup_owned_crusher_containers(
             image_id = value.get("Image")
             networks = value["NetworkSettings"]["Networks"]
             identifier = value["Id"]
-            deployment_hex = deployment_id.replace("-", "")
             if (
                 labels.get("io.fstack.managed") != "true"
                 or labels.get("io.fstack.operation_id") != operation_id
                 or labels.get("io.fstack.deployment_id") != deployment_id
-                or not name.endswith(deployment_hex)
                 or configured_image != plan.inputs.crusher_image
                 or image_id != expected_image_id
                 or (plan.network not in networks and bool(networks))
@@ -2986,6 +2995,7 @@ def run_live_canary(inputs: CanaryInputs) -> None:
                     plan,
                     expected_operations,
                     require_network=False,
+                    require_canonical_names=False,
                 )
                 owned_crusher = _merge_captured_resources(owned_crusher, discovered)
             except Exception as exc:
