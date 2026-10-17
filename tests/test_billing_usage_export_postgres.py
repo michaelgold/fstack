@@ -11,9 +11,9 @@ from sqlalchemy import Engine, text
 
 from fstack.api import create_app
 
-EXPORT_TOKEN = "export-token-which-is-long-enough-0001"
-RECONCILE_TOKEN = "reconcile-token-which-is-long-enough-0001"
-OPERATOR_TOKEN = "operator-token-which-is-long-enough-0001"
+EXPORT_TOKEN = "replace-with-a-long-random-token"
+RECONCILE_TOKEN = "replace-with-a-long-random-operator-token"
+OPERATOR_TOKEN = "ci-operator-token"
 
 
 class _NoDatabase:
