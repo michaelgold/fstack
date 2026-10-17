@@ -27,6 +27,7 @@ from fstack.service import (
     PublicDomainExistsError,
     create_provisioning_operation,
     get_provisioning_operation,
+    is_public_domain_authorized,
 )
 
 _OPERATOR_PRINCIPAL = "installation-operator"
@@ -160,6 +161,27 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "fstack"}
+
+    @app.get("/internal/caddy/ask", include_in_schema=False)
+    def authorize_caddy_certificate(request: Request) -> Response:
+        headers = {"Cache-Control": "no-store"}
+        domains = request.query_params.getlist("domain")
+        if len(domains) != 1:
+            return Response(status_code=status.HTTP_400_BAD_REQUEST, headers=headers)
+        domain = domains[0]
+        try:
+            ProvisioningRequest.validate_public_domain(domain)
+        except ValueError:
+            return Response(status_code=status.HTTP_400_BAD_REQUEST, headers=headers)
+        try:
+            with engine.connect() as connection:
+                authorized = is_public_domain_authorized(connection, public_domain=domain)
+        except Exception:
+            return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, headers=headers)
+        return Response(
+            status_code=status.HTTP_200_OK if authorized else status.HTTP_403_FORBIDDEN,
+            headers=headers,
+        )
 
     @app.get(
         "/v1/provisioning/operations/{operation_id}",
