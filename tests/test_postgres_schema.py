@@ -378,7 +378,7 @@ def test_local_caddy_ingress_schema_is_exact(migrated_database: Engine) -> None:
         )
         assert trigger_names == {"tr_ingress_submissions_lifecycle_guard"}
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261015_0005"
+            "20261017_0006"
         )
 
     forbidden_authority_terms = (
@@ -624,7 +624,7 @@ def test_local_caddy_downgrade_rejects_any_v2_workflow_dispatch_history(
 
     with migrated_database.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261015_0005"
+            "20261017_0006"
         )
         row = (
             connection.execute(
@@ -685,7 +685,7 @@ def test_local_caddy_downgrade_rejects_ingress_history(
 
     with migrated_database.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261015_0005"
+            "20261017_0006"
         )
         assert "ingress_submissions" in inspect(migrated_database).get_table_names()
         assert (
@@ -774,7 +774,7 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
         )
 
     assert_pristine_revision(
-        "20261015_0005",
+        "20261017_0006",
         has_ingress_submissions=True,
         workflow_types={"fstack.provision_crusher.v1", "fstack.provision_crusher.v2"},
         enqueued_workflow_type="fstack.provision_crusher.v2",
@@ -796,7 +796,7 @@ def test_local_caddy_pristine_downgrade_upgrade_roundtrip_restores_dispatch_vers
         )
         command.upgrade(configuration, "head")
         assert_pristine_revision(
-            "20261015_0005",
+            "20261017_0006",
             has_ingress_submissions=True,
             workflow_types={"fstack.provision_crusher.v1", "fstack.provision_crusher.v2"},
             enqueued_workflow_type="fstack.provision_crusher.v2",
@@ -872,7 +872,7 @@ def test_v2_cutover_upgrade_fails_fast_when_operation_writer_is_live(
     command.upgrade(configuration, "head")
     with migrated_database.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261015_0005"
+            "20261017_0006"
         )
 
 
@@ -919,7 +919,7 @@ def test_local_caddy_downgrade_fails_fast_when_ingress_writer_is_live(
     assert "ingress_submissions" in inspect(migrated_database).get_table_names()
     with migrated_database.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "20261015_0005"
+            "20261017_0006"
         )
 
 
@@ -1422,6 +1422,20 @@ def test_released_temporal_revision_is_byte_identical() -> None:
     migration_path = Path("migrations/versions/20261006_0003_workflow_dispatch_outbox.py")
     assert hashlib.sha256(migration_path.read_bytes()).hexdigest() == (
         "8018ff8db638820a81bdd8507e183cfcb54ef4bc9bf93a899db9080173ec1f2b"
+    )
+
+
+def test_released_local_caddy_revision_is_byte_identical() -> None:
+    migration_path = Path("migrations/versions/20261013_0004_local_caddy_ingress.py")
+    assert hashlib.sha256(migration_path.read_bytes()).hexdigest() == (
+        "1a27e5c032b0e81762bedb4304dcb5daa035a268e747584a44fe5ac98f334581"
+    )
+
+
+def test_released_v2_cutover_revision_is_byte_identical() -> None:
+    migration_path = Path("migrations/versions/20261015_0005_provisioning_workflow_v2_cutover.py")
+    assert hashlib.sha256(migration_path.read_bytes()).hexdigest() == (
+        "a018d3846d4ed4a36b59c646d5580d65dc2d7c29f195006201c21642158cbf3d"
     )
 
 
