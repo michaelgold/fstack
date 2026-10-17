@@ -24,6 +24,7 @@ from fstack.billing_service import (
 from fstack.billing_service import (
     synchronize_entitlement_revision as persist_entitlement_revision,
 )
+from fstack.billing_usage import InvalidUsageCursor, list_usage_facts, parse_usage_query
 from fstack.provisioning import (
     ProvisioningRequest,
     ProvisioningResponse,
@@ -131,6 +132,32 @@ def create_app() -> FastAPI:
                 detail={
                     "code": "authentication_required",
                     "message": "billing reconciliation authentication required",
+                },
+            )
+
+    def require_billing_export(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)],
+    ) -> None:
+        if billing_configuration.mode == "disabled":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        expected = billing_configuration.export_token
+        try:
+            matches = (
+                credentials is not None
+                and credentials.scheme.lower() == "bearer"
+                and expected is not None
+                and hmac.compare_digest(
+                    credentials.credentials.encode("utf-8"), expected.encode("utf-8")
+                )
+            )
+        except UnicodeEncodeError:
+            matches = False
+        if not matches:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "authentication_required",
+                    "message": "billing usage authentication required",
                 },
             )
 
@@ -284,6 +311,36 @@ def create_app() -> FastAPI:
             "entitlement_revision_id": str(result.entitlement_revision_id),
             "replayed": result.replayed,
         }
+
+    @app.get("/internal/billing/usage-facts", include_in_schema=False)
+    def export_usage_facts(
+        request: Request,
+        _authorized: None = Depends(require_billing_export),
+    ) -> dict[str, object]:
+        try:
+            raw_query = request.scope.get("query_string", b"")
+            if not isinstance(raw_query, bytes) or len(raw_query) > 200:
+                raise InvalidUsageCursor
+            query = parse_usage_query(list(request.query_params.multi_items()))
+        except InvalidUsageCursor:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "invalid_usage_cursor",
+                    "message": "usage cursor is invalid",
+                },
+            ) from None
+        try:
+            with engine.connect() as connection:
+                return list_usage_facts(connection, query=query)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "usage_facts_unavailable",
+                    "message": "usage facts are unavailable",
+                },
+            ) from None
 
     @app.get("/internal/caddy/ask", include_in_schema=False)
     def authorize_caddy_certificate(request: Request) -> Response:
