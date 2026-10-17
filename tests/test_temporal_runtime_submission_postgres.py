@@ -1431,6 +1431,30 @@ def test_prepare_operation_bundle_hides_sealed_parameters_on_database_failure(
 
 
 @pytest.mark.postgres
+def test_caddy_ask_rejects_confirmed_legacy_v1_runtime_without_joint_ingress(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FSTACK_DOCKER_NETWORK", "fstack-test")
+    monkeypatch.setenv("FSTACK_SECRET_STAGE_ROOT", "/var/lib/fstack-test-secrets")
+    created = _create_v1_operation(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="certificate-authorization-rejects-v1",
+        body={"public_domain": "legacy-v1.acme.example"},
+    )
+    _confirm_runtime_submission(created["operation_id"])
+
+    response = TestClient(create_app()).get(
+        "/internal/caddy/ask", params={"domain": "legacy-v1.acme.example"}
+    )
+
+    assert response.status_code == 403
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.postgres
 def test_confirmed_runtime_submission_replays_when_sealed_identity_is_unchanged(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,

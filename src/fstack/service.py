@@ -43,6 +43,41 @@ class ProvisioningResult:
     replayed: bool
 
 
+def is_public_domain_authorized(
+    connection: Connection,
+    *,
+    public_domain: str,
+) -> bool:
+    """Return whether durable state authorizes a certificate for an exact hostname."""
+    return bool(
+        connection.execute(
+            text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM deployments AS deployment
+                    JOIN provisioning_operations AS operation
+                      ON operation.organization_id = deployment.organization_id
+                     AND operation.deployment_id = deployment.id
+                    JOIN workflow_dispatches AS dispatch
+                      ON dispatch.operation_id = operation.id
+                    JOIN runtime_submissions AS runtime
+                      ON runtime.operation_id = operation.id
+                    JOIN ingress_submissions AS ingress
+                      ON ingress.operation_id = operation.id
+                    WHERE deployment.public_domain = :public_domain
+                      AND operation.state = 'succeeded'
+                      AND dispatch.workflow_type = 'fstack.provision_crusher.v2'
+                      AND runtime.state = 'confirmed'
+                      AND ingress.state = 'confirmed'
+                )
+                """
+            ),
+            {"public_domain": public_domain},
+        ).scalar_one()
+    )
+
+
 _CLAIM = text(
     """
     INSERT INTO provisioning_operations (

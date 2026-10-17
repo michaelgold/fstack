@@ -684,6 +684,44 @@ def test_finalize_provisioning_success_confirms_joint_bundle_atomically(
 
 
 @pytest.mark.postgres
+def test_caddy_ask_authorizes_only_after_joint_provisioning_success(
+    migrated_database: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fstack.ingress_state import finalize_provisioning_success, mark_submitted
+    from fstack.runtime_state import persist_submitted
+
+    prepared = _prepared_bundle(
+        migrated_database,
+        monkeypatch,
+        idempotency_key="certificate-authorization-joint-success",
+    )
+    client = TestClient(create_app())
+
+    before = client.get("/internal/caddy/ask", params={"domain": VALID_BODY["public_domain"]})
+
+    persist_submitted(prepared.runtime_submission_id, "docker-api-certificate-authorization")
+    mark_submitted(prepared.ingress_submission_id, prepared.operation_id)
+    finalize_provisioning_success(
+        prepared.runtime_submission_id,
+        prepared.ingress_submission_id,
+        prepared.operation_id,
+    )
+    after = client.get("/internal/caddy/ask", params={"domain": VALID_BODY["public_domain"]})
+    unknown = client.get("/internal/caddy/ask", params={"domain": "unknown.acme.example"})
+
+    assert before.status_code == 403
+    assert before.content == b""
+    assert after.status_code == 200
+    assert after.content == b""
+    assert unknown.status_code == 403
+    assert unknown.content == b""
+    assert {response.headers["cache-control"] for response in (before, after, unknown)} == {
+        "no-store"
+    }
+
+
+@pytest.mark.postgres
 def test_finalize_provisioning_failure_runtime_scope_fails_complete_bundle_atomically(
     migrated_database: Engine,
     monkeypatch: pytest.MonkeyPatch,

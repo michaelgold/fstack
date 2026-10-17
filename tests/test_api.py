@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 
+import pytest
 from fastapi.testclient import TestClient
 
 from fstack.api import create_app
@@ -28,6 +29,130 @@ def test_health_endpoint_does_not_require_database_access(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "fstack"}
+
+
+def test_caddy_ask_authorizes_exact_succeeded_public_domain(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "FSTACK_DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid"
+    )
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield object()
+
+    monkeypatch.setattr("fstack.api._database_engine", lambda: Engine())
+    monkeypatch.setattr(
+        "fstack.api.is_public_domain_authorized",
+        lambda _connection, *, public_domain: public_domain == "smoke.fstack.com",
+        raising=False,
+    )
+
+    response = TestClient(create_app()).get(
+        "/internal/caddy/ask", params={"domain": "smoke.fstack.com"}
+    )
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_caddy_ask_rejects_repeated_domain_query_before_database_access(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "FSTACK_DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid"
+    )
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+
+    class Engine:
+        @contextmanager
+        def connect(self):
+            raise AssertionError("database must not be queried")
+            yield
+
+    monkeypatch.setattr("fstack.api._database_engine", lambda: Engine())
+
+    response = TestClient(create_app()).get(
+        "/internal/caddy/ask?domain=smoke.fstack.com&domain=other.fstack.com"
+    )
+
+    assert response.status_code == 400
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_caddy_ask_sanitizes_unexpected_decision_failure(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "FSTACK_DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid"
+    )
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield object()
+
+    def fail_lookup(*_args, **_kwargs):
+        raise ValueError("certificate-decision-secret-marker")
+
+    monkeypatch.setattr("fstack.api._database_engine", lambda: Engine())
+    monkeypatch.setattr("fstack.api.is_public_domain_authorized", fail_lookup)
+
+    response = TestClient(create_app(), raise_server_exceptions=False).get(
+        "/internal/caddy/ask", params={"domain": "smoke.fstack.com"}
+    )
+
+    assert response.status_code == 503
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+    assert "certificate-decision-secret-marker" not in response.text
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "?domain=",
+        "?domain=smoke",
+        "?domain=SMOKE.fstack.com",
+        "?domain=*.fstack.com",
+        "?domain=smoke.fstack.com.",
+        "?domain=smoke..fstack.com",
+        "?domain=smoke.fstack.com%3A443",
+        "?domain=t%C3%A9st.fstack.com",
+    ],
+)
+def test_caddy_ask_rejects_noncanonical_domain_without_database_access(
+    monkeypatch,
+    query: str,
+) -> None:
+    monkeypatch.setenv(
+        "FSTACK_DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid"
+    )
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+
+    class Engine:
+        @contextmanager
+        def connect(self):
+            raise AssertionError("database must not be queried")
+            yield
+
+    monkeypatch.setattr("fstack.api._database_engine", lambda: Engine())
+
+    response = TestClient(create_app()).get(f"/internal/caddy/ask{query}")
+
+    assert response.status_code == 400
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_caddy_ask_is_excluded_from_public_openapi(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "FSTACK_DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid"
+    )
+    monkeypatch.setenv("FSTACK_OPERATOR_TOKEN", "test-operator-token")
+
+    assert "/internal/caddy/ask" not in create_app().openapi()["paths"]
 
 
 def test_framework_generated_http_errors_use_stable_envelope(monkeypatch) -> None:

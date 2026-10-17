@@ -101,6 +101,13 @@ certificate lifecycle, or Internet reachability. See
 [`docs/architecture/local-caddy-ingress-slice.md`](docs/architecture/local-caddy-ingress-slice.md)
 for the complete contract and exclusions.
 
+Host Caddy may use the installation-local, bodyless
+`GET /internal/caddy/ask?domain=<canonical-hostname>` decision endpoint for on-demand TLS.
+It returns success only for a deployment whose joint provisioning operation durably
+succeeded. The public API ingress must not expose this internal path. See
+[`docs/architecture/provisioned-host-certificate-authorization.md`](docs/architecture/provisioned-host-certificate-authorization.md)
+for the authorization and host-Caddy wiring contract.
+
 Persistence tests require an explicit PostgreSQL URL; they never fall back to SQLite:
 
 ```bash
