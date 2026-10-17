@@ -38,6 +38,7 @@ def _create_operation(engine: Engine, suffix: str) -> dict[str, str]:
             request=request,
             idempotency_key=f"billing-schema-{suffix}",
             actor_principal="installation-operator",
+            entitlement_mode="disabled",
         )
     return {
         "operation_id": str(result.operation_id),

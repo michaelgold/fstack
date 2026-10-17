@@ -30,9 +30,12 @@ from fstack.provisioning import (
     ProvisioningStatusResponse,
 )
 from fstack.service import (
+    EntitlementQuotaExceededError,
+    EntitlementStateUnavailableError,
     OrganizationExistsError,
     ProvisioningConflictError,
     PublicDomainExistsError,
+    SubscriptionInactiveError,
     create_provisioning_operation,
     get_provisioning_operation,
     is_public_domain_authorized,
@@ -163,6 +166,45 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"code": exc.code, "message": messages[exc.code]},
+        )
+
+    @app.exception_handler(EntitlementStateUnavailableError)
+    async def entitlement_state_unavailable_handler(
+        _request: Request,
+        _exc: EntitlementStateUnavailableError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "code": "entitlement_state_unavailable",
+                "message": "entitlement state is unavailable",
+            },
+        )
+
+    @app.exception_handler(SubscriptionInactiveError)
+    async def subscription_inactive_handler(
+        _request: Request,
+        _exc: SubscriptionInactiveError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            content={
+                "code": "subscription_inactive",
+                "message": "subscription is inactive",
+            },
+        )
+
+    @app.exception_handler(EntitlementQuotaExceededError)
+    async def entitlement_quota_exceeded_handler(
+        _request: Request,
+        _exc: EntitlementQuotaExceededError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "code": "entitlement_quota_exceeded",
+                "message": "entitlement quota is exhausted",
+            },
         )
 
     @app.exception_handler(StarletteHTTPException)
@@ -316,6 +358,7 @@ def create_app() -> FastAPI:
                     request=request,
                     idempotency_key=exact_key,
                     actor_principal=actor_principal,
+                    entitlement_mode=billing_configuration.mode,
                 )
         except IntegrityError as exc:
             diagnostic = getattr(exc.orig, "diag", None)
