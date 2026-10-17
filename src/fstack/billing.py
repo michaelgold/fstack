@@ -13,6 +13,7 @@ from uuid import UUID
 from fstack.provisioning import SLUG_PATTERN
 
 _REVISION_DISCRIMINATOR = "fstack.entitlement-revision.v1"
+_USAGE_FACT_DISCRIMINATOR = "fstack.usage-fact.v1"
 _CANONICAL_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
 _REQUEST_KEYS = {
     "organization_slug",
@@ -69,6 +70,43 @@ def _parse_timestamp(value: object) -> datetime:
 
 def _canonical_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def usage_fact_payload_digest(
+    *,
+    usage_fact_id: UUID,
+    entitlement_subject_id: UUID,
+    entitlement_revision_id: UUID,
+    authorization_id: UUID,
+    organization_id: UUID,
+    operation_id: UUID,
+    deployment_id: UUID,
+    occurred_at: datetime,
+) -> str:
+    """Return the canonical provider-neutral deployment-activation digest."""
+    payload = {
+        "discriminator": _USAGE_FACT_DISCRIMINATOR,
+        "usage_fact_id": str(usage_fact_id),
+        "entitlement_subject_id": str(entitlement_subject_id),
+        "entitlement_revision_id": str(entitlement_revision_id),
+        "authorization_id": str(authorization_id),
+        "organization_id": str(organization_id),
+        "operation_id": str(operation_id),
+        "deployment_id": str(deployment_id),
+        "metric": "crusher.deployment.activated",
+        "unit": "deployment",
+        "quantity": 1,
+        "source_event": "provisioning.succeeded",
+        "occurred_at": _canonical_timestamp(occurred_at),
+        "schema_version": 1,
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 @dataclass(frozen=True)

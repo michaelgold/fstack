@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.engine import RowMapping
 
-from fstack import ingress_submission, runtime_submission
+from fstack import billing, ingress_submission, runtime_submission
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
@@ -307,10 +307,14 @@ def _finalize_provisioning_success(
                 connection.execute(
                     text(
                         """
-                        SELECT operation.organization_id, operation.actor_principal,
+                        SELECT operation.organization_id, operation.deployment_id,
+                               operation.actor_principal, operation.authorization_mode,
                                operation.state AS operation_state,
+                               operation.completed_at, operation.updated_at,
                                runtime.state AS runtime_state,
-                               ingress.state AS ingress_state
+                               runtime.confirmed_at AS runtime_confirmed_at,
+                               ingress.state AS ingress_state,
+                               ingress.confirmed_at AS ingress_confirmed_at
                         FROM provisioning_operations AS operation
                         JOIN runtime_submissions AS runtime
                           ON runtime.operation_id = operation.id
@@ -363,6 +367,55 @@ def _finalize_provisioning_success(
                 }
                 if len(audits) != 1 or audits[0]["payload"] != expected_payload:
                     raise IngressStateError("provisioning_success_replay_invalid")
+                if row["authorization_mode"] == "required":
+                    fact = (
+                        connection.execute(
+                            text(
+                                """
+                                SELECT fact.id, fact.subject_id, fact.revision_id,
+                                       fact.authorization_id, fact.organization_id,
+                                       fact.operation_id, fact.deployment_id, fact.metric,
+                                       fact.unit, fact.quantity, fact.source_event,
+                                       fact.occurred_at, fact.schema_version, fact.payload_digest
+                                FROM usage_facts AS fact
+                                WHERE fact.operation_id = :operation_id
+                                  AND fact.metric = 'crusher.deployment.activated'
+                                FOR SHARE
+                                """
+                            ),
+                            {"operation_id": operation_id},
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if fact is None:
+                        raise IngressStateError("provisioning_success_infrastructure")
+                    expected_digest = billing.usage_fact_payload_digest(
+                        usage_fact_id=fact["id"],
+                        entitlement_subject_id=fact["subject_id"],
+                        entitlement_revision_id=fact["revision_id"],
+                        authorization_id=fact["authorization_id"],
+                        organization_id=fact["organization_id"],
+                        operation_id=fact["operation_id"],
+                        deployment_id=fact["deployment_id"],
+                        occurred_at=fact["occurred_at"],
+                    )
+                    if (
+                        fact["organization_id"] != row["organization_id"]
+                        or fact["operation_id"] != operation_id
+                        or fact["deployment_id"] != row["deployment_id"]
+                        or fact["metric"] != "crusher.deployment.activated"
+                        or fact["unit"] != "deployment"
+                        or fact["quantity"] != 1
+                        or fact["source_event"] != "provisioning.succeeded"
+                        or fact["schema_version"] != 1
+                        or fact["occurred_at"] != row["completed_at"]
+                        or fact["occurred_at"] != row["updated_at"]
+                        or fact["occurred_at"] != row["runtime_confirmed_at"]
+                        or fact["occurred_at"] != row["ingress_confirmed_at"]
+                        or fact["payload_digest"] != expected_digest
+                    ):
+                        raise IngressStateError("provisioning_success_infrastructure")
                 return
             if (
                 row["operation_state"] != "running"
@@ -370,16 +423,42 @@ def _finalize_provisioning_success(
                 or row["ingress_state"] != "submitted"
             ):
                 raise IngressStateError("provisioning_success_state_invalid")
+            boundary: datetime = connection.execute(text("SELECT clock_timestamp()")).scalar_one()
+            authorization: RowMapping | None = None
+            if row["authorization_mode"] == "required":
+                authorization = (
+                    connection.execute(
+                        text(
+                            """
+                            SELECT id, usage_fact_id, subject_id, revision_id,
+                                   organization_id, operation_id, deployment_id
+                            FROM provisioning_authorizations
+                            WHERE operation_id = :operation_id
+                            FOR SHARE
+                            """
+                        ),
+                        {"operation_id": operation_id},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if (
+                    authorization is None
+                    or authorization["organization_id"] != row["organization_id"]
+                    or authorization["operation_id"] != operation_id
+                    or authorization["deployment_id"] != row["deployment_id"]
+                ):
+                    raise IngressStateError("provisioning_success_bundle_mismatch")
             runtime_updated = connection.execute(
                 text(
                     """
                     UPDATE runtime_submissions
-                    SET state='confirmed', confirmed_at=clock_timestamp()
+                    SET state='confirmed', confirmed_at=:boundary
                     WHERE id=:runtime_submission_id AND state='submitted'
                     RETURNING id
                     """
                 ),
-                {"runtime_submission_id": runtime_submission_id},
+                {"runtime_submission_id": runtime_submission_id, "boundary": boundary},
             ).scalar_one_or_none()
             if runtime_updated != runtime_submission_id:
                 raise IngressStateError("provisioning_success_state_invalid")
@@ -387,26 +466,25 @@ def _finalize_provisioning_success(
                 text(
                     """
                     UPDATE ingress_submissions
-                    SET state='confirmed', confirmed_at=clock_timestamp()
+                    SET state='confirmed', confirmed_at=:boundary
                     WHERE id=:ingress_submission_id AND state='submitted'
                     RETURNING id
                     """
                 ),
-                {"ingress_submission_id": ingress_submission_id},
+                {"ingress_submission_id": ingress_submission_id, "boundary": boundary},
             ).scalar_one_or_none()
             if ingress_updated != ingress_submission_id:
                 raise IngressStateError("provisioning_success_state_invalid")
             operation_updated = connection.execute(
                 text(
                     """
-                    WITH boundary AS (SELECT clock_timestamp() AS now)
                     UPDATE provisioning_operations
-                    SET state='succeeded', completed_at=boundary.now, updated_at=boundary.now
-                    FROM boundary WHERE id=:operation_id AND state='running'
-                    RETURNING provisioning_operations.id
+                    SET state='succeeded', completed_at=:boundary, updated_at=:boundary
+                    WHERE id=:operation_id AND state='running'
+                    RETURNING id
                     """
                 ),
-                {"operation_id": operation_id},
+                {"operation_id": operation_id, "boundary": boundary},
             ).scalar_one_or_none()
             if operation_updated != operation_id:
                 raise IngressStateError("provisioning_success_state_invalid")
@@ -440,6 +518,65 @@ def _finalize_provisioning_success(
             ).scalar_one_or_none()
             if audit_inserted != success_audit_id:
                 raise IngressStateError("provisioning_success_state_invalid")
+            if authorization is not None:
+                payload_digest = billing.usage_fact_payload_digest(
+                    usage_fact_id=authorization["usage_fact_id"],
+                    entitlement_subject_id=authorization["subject_id"],
+                    entitlement_revision_id=authorization["revision_id"],
+                    authorization_id=authorization["id"],
+                    organization_id=authorization["organization_id"],
+                    operation_id=authorization["operation_id"],
+                    deployment_id=authorization["deployment_id"],
+                    occurred_at=boundary,
+                )
+                inserted_fact = (
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO usage_facts (
+                                id, subject_id, revision_id, authorization_id,
+                                organization_id, operation_id, deployment_id,
+                                metric, unit, quantity, source_event, occurred_at,
+                                schema_version, payload_digest
+                            ) VALUES (
+                                :id, :subject_id, :revision_id, :authorization_id,
+                                :organization_id, :operation_id, :deployment_id,
+                                'crusher.deployment.activated', 'deployment', 1,
+                                'provisioning.succeeded', :occurred_at, 1, :payload_digest
+                            )
+                            RETURNING id, subject_id, revision_id, authorization_id,
+                                      organization_id, operation_id, deployment_id,
+                                      occurred_at, payload_digest
+                            """
+                        ),
+                        {
+                            "id": authorization["usage_fact_id"],
+                            "subject_id": authorization["subject_id"],
+                            "revision_id": authorization["revision_id"],
+                            "authorization_id": authorization["id"],
+                            "organization_id": authorization["organization_id"],
+                            "operation_id": authorization["operation_id"],
+                            "deployment_id": authorization["deployment_id"],
+                            "occurred_at": boundary,
+                            "payload_digest": payload_digest,
+                        },
+                    )
+                    .mappings()
+                    .one()
+                )
+                expected_fact = {
+                    "id": authorization["usage_fact_id"],
+                    "subject_id": authorization["subject_id"],
+                    "revision_id": authorization["revision_id"],
+                    "authorization_id": authorization["id"],
+                    "organization_id": authorization["organization_id"],
+                    "operation_id": authorization["operation_id"],
+                    "deployment_id": authorization["deployment_id"],
+                    "occurred_at": boundary,
+                    "payload_digest": payload_digest,
+                }
+                if dict(inserted_fact) != expected_fact:
+                    raise IngressStateError("provisioning_success_state_invalid")
     finally:
         engine.dispose()
 

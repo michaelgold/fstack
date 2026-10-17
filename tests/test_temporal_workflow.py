@@ -529,6 +529,28 @@ def test_success_finalizer_v2_returns_only_operation_and_confirmed_state(
     ]
 
 
+def test_success_finalizer_v2_usage_evidence_failure_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        temporal_worker_module.ingress_state,
+        "finalize_provisioning_success",
+        lambda *_args: (_ for _ in ()).throw(
+            temporal_worker_module.ingress_state.IngressStateError(
+                "provisioning_success_infrastructure"
+            )
+        ),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        finalize_local_crusher_ingress_success_v2(_v2_ids())
+
+    assert caught.value.type == "ActivityInfrastructureFailure"
+    assert caught.value.non_retryable is False
+    assert caught.value.message == "activity_infrastructure_failure"
+    assert list(caught.value.details) == ["activity_infrastructure_failure"]
+
+
 def test_failure_finalizer_v2_resolves_submissions_from_operation_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
