@@ -108,6 +108,16 @@ succeeded. The public API ingress must not expose this internal path. See
 [`docs/architecture/provisioned-host-certificate-authorization.md`](docs/architecture/provisioned-host-certificate-authorization.md)
 for the authorization and host-Caddy wiring contract.
 
+### First managed billing plane
+
+Managed installations may require a current provider-neutral entitlement before accepting a
+new Crusher provisioning operation. The first plan permits one active Crusher deployment and
+emits one immutable deployment-activation usage fact at joint runtime-and-ingress success.
+Self-hosted installations retain an explicit billing-disabled mode. Commercial policy, prices,
+Lago identifiers, usage export and reconciliation remain private `fstack-cloud` concerns. See
+[`docs/architecture/first-billing-plane-slice.md`](docs/architecture/first-billing-plane-slice.md)
+for the frozen ownership, outage, quota and evidence contract.
+
 Persistence tests require an explicit PostgreSQL URL; they never fall back to SQLite:
 
 ```bash
