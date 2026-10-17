@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID, uuid4
 
 from sqlalchemy import Connection, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from fstack.provisioning import (
     ProvisioningRequest,
@@ -30,6 +32,18 @@ class OrganizationExistsError(ProvisioningConflictError):
 
 class PublicDomainExistsError(ProvisioningConflictError):
     code = "public_domain_exists"
+
+
+class EntitlementStateUnavailableError(Exception):
+    """Required-mode entitlement state cannot authorize a new operation."""
+
+
+class SubscriptionInactiveError(Exception):
+    """The authoritative current subscription revision is inactive."""
+
+
+class EntitlementQuotaExceededError(Exception):
+    """The permanent entitlement quota has already been consumed."""
 
 
 @dataclass(frozen=True)
@@ -78,7 +92,7 @@ def is_public_domain_authorized(
     )
 
 
-_CLAIM = text(
+_CLAIM_DISABLED = text(
     """
     INSERT INTO provisioning_operations (
         id, organization_id, organization_slug, idempotency_key,
@@ -94,6 +108,22 @@ _CLAIM = text(
     """
 )
 
+_CLAIM_REQUIRED = text(
+    """
+    INSERT INTO provisioning_operations (
+        id, organization_id, organization_slug, idempotency_key,
+        request_fingerprint, state, actor_principal, business_id,
+        environment_id, workload_id, deployment_id, authorization_mode
+    ) VALUES (
+        :operation_id, :organization_id, :organization_slug, :idempotency_key,
+        :request_fingerprint, 'pending', :actor_principal, :business_id,
+        :environment_id, :workload_id, :deployment_id, 'required'
+    )
+    ON CONFLICT (organization_slug, idempotency_key) DO NOTHING
+    RETURNING id
+    """
+)
+
 
 def create_provisioning_operation(
     connection: Connection,
@@ -101,6 +131,7 @@ def create_provisioning_operation(
     request: ProvisioningRequest,
     idempotency_key: str,
     actor_principal: str,
+    entitlement_mode: Literal["disabled", "required"],
 ) -> ProvisioningResult:
     """Create or replay the first durable Crusher desired-state transaction."""
     operation_id = uuid4()
@@ -112,6 +143,8 @@ def create_provisioning_operation(
     database_binding_id = uuid4()
     storage_binding_id = uuid4()
     audit_event_id = uuid4()
+    authorization_id = uuid4()
+    usage_fact_id = uuid4()
     fingerprint = request_fingerprint(request)
 
     identifiers = {
@@ -126,7 +159,8 @@ def create_provisioning_operation(
         "request_fingerprint": fingerprint,
         "actor_principal": actor_principal,
     }
-    claimed = connection.execute(_CLAIM, identifiers).scalar_one_or_none()
+    claim = _CLAIM_REQUIRED if entitlement_mode == "required" else _CLAIM_DISABLED
+    claimed = connection.execute(claim, identifiers).scalar_one_or_none()
     if claimed is None:
         existing = (
             connection.execute(
@@ -158,6 +192,111 @@ def create_provisioning_operation(
             deployment_id=existing["deployment_id"],
             replayed=True,
         )
+
+    if entitlement_mode == "required":
+        try:
+            subject_id = connection.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM entitlement_subjects
+                    WHERE subject_type = 'organization_slug'
+                      AND subject_key = :organization_slug
+                    FOR UPDATE
+                    """
+                ),
+                {"organization_slug": request.organization_slug},
+            ).scalar_one_or_none()
+            if subject_id is None:
+                raise EntitlementStateUnavailableError
+            revision = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT id, plan_key, state, capability, quota_dimension, quota_limit,
+                               observed_at, valid_until, clock_timestamp() AS decided_at
+                        FROM entitlement_revisions
+                        WHERE subject_id = :subject_id
+                        ORDER BY generation DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"subject_id": subject_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if revision is None:
+                raise EntitlementStateUnavailableError
+            if (
+                revision["plan_key"] != "crusher.single.v1"
+                or revision["capability"] != "crusher.deployment.create"
+                or revision["quota_dimension"] != "crusher.deployment.active"
+                or revision["quota_limit"] != 1
+                or not revision["observed_at"] <= revision["decided_at"] <= revision["valid_until"]
+            ):
+                raise EntitlementStateUnavailableError
+            if revision["state"] == "inactive":
+                raise SubscriptionInactiveError
+            if revision["state"] != "active":
+                raise EntitlementStateUnavailableError
+            consumed_units = connection.execute(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM provisioning_authorizations
+                    WHERE subject_id = :subject_id
+                      AND quota_dimension = :quota_dimension
+                    """
+                ),
+                {
+                    "subject_id": subject_id,
+                    "quota_dimension": revision["quota_dimension"],
+                },
+            ).scalar_one()
+            if consumed_units >= revision["quota_limit"]:
+                raise EntitlementQuotaExceededError
+            inserted_authorization = (
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO provisioning_authorizations (
+                            id, usage_fact_id, subject_id, revision_id, organization_id,
+                            operation_id, deployment_id, capability, quota_dimension,
+                            units, request_fingerprint, decided_at
+                        ) VALUES (
+                            :id, :usage_fact_id, :subject_id, :revision_id, :organization_id,
+                            :operation_id, :deployment_id, :capability, :quota_dimension,
+                            1, :request_fingerprint, :decided_at
+                        )
+                        RETURNING id, usage_fact_id, request_fingerprint
+                        """
+                    ),
+                    {
+                        "id": authorization_id,
+                        "usage_fact_id": usage_fact_id,
+                        "subject_id": subject_id,
+                        "revision_id": revision["id"],
+                        "organization_id": organization_id,
+                        "operation_id": operation_id,
+                        "deployment_id": deployment_id,
+                        "capability": revision["capability"],
+                        "quota_dimension": revision["quota_dimension"],
+                        "request_fingerprint": fingerprint,
+                        "decided_at": revision["decided_at"],
+                    },
+                )
+                .mappings()
+                .one()
+            )
+            if (
+                inserted_authorization["id"] != authorization_id
+                or inserted_authorization["usage_fact_id"] != usage_fact_id
+                or inserted_authorization["request_fingerprint"] != fingerprint
+            ):
+                raise EntitlementStateUnavailableError
+        except SQLAlchemyError:
+            raise EntitlementStateUnavailableError from None
 
     connection.execute(
         text("INSERT INTO organizations (id, slug, name) VALUES (:id, :slug, :name)"),

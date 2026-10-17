@@ -76,7 +76,8 @@ def test_create_operation_persists_complete_pending_desired_state(
         operation = (
             connection.execute(
                 text(
-                    "SELECT state, organization_slug, idempotency_key, actor_principal "
+                    "SELECT state, organization_slug, idempotency_key, actor_principal, "
+                    "authorization_mode "
                     "FROM provisioning_operations"
                 )
             )
@@ -107,7 +108,15 @@ def test_create_operation_persists_complete_pending_desired_state(
         "organization_slug": "acme",
         "idempotency_key": "create-acme-mailer",
         "actor_principal": "installation-operator",
+        "authorization_mode": "not_required",
     }
+    with migrated_database.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM provisioning_authorizations")
+            ).scalar_one()
+            == 0
+        )
     assert audit == {
         "event_type": "provisioning.requested",
         "actor_principal": "installation-operator",
