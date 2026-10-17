@@ -802,6 +802,27 @@ def _host_pattern_matches(pattern: str, host: str) -> bool:
     )
 
 
+def _is_terminal_fallback(route: object) -> bool:
+    if type(route) is not dict or set(route) != {"@id", "handle", "terminal"}:
+        return False
+    handle = route.get("handle")
+    if type(handle) is not list or len(handle) != 1 or type(handle[0]) is not dict:
+        return False
+    response = handle[0]
+    return (
+        route.get("@id") == "fstack-unclaimed-host"
+        and type(route.get("@id")) is str
+        and route.get("terminal") is True
+        and set(response) == {"handler", "status_code", "body"}
+        and response.get("handler") == "static_response"
+        and type(response.get("handler")) is str
+        and response.get("status_code") == 404
+        and type(response.get("status_code")) is int
+        and response.get("body") == "not found\n"
+        and type(response.get("body")) is str
+    )
+
+
 def _classify_routes(
     routes: list[object], desired: dict[str, object]
 ) -> CaddyInspectionState | CaddyAdminErrorCode:
@@ -819,7 +840,7 @@ def _classify_routes(
         return CaddyAdminErrorCode.ROUTE_ID_CONFLICT
 
     for route in routes:
-        if route == desired:
+        if route == desired or _is_terminal_fallback(route):
             continue
         if any(
             _host_pattern_matches(pattern, desired_host)
@@ -828,8 +849,12 @@ def _classify_routes(
         ):
             return CaddyAdminErrorCode.HOST_CONFLICT
 
+    fallback_indexes = [index for index, route in enumerate(routes) if _is_terminal_fallback(route)]
+    if fallback_indexes != [len(routes) - 1]:
+        return CaddyAdminErrorCode.ROUTES_AMBIGUOUS
+
     for route in routes:
-        if route == desired:
+        if route == desired or _is_terminal_fallback(route):
             continue
         if _route_parts(route) is None:
             return CaddyAdminErrorCode.ROUTES_AMBIGUOUS
@@ -1021,7 +1046,7 @@ def _canonical_route_bytes(desired: dict[str, object]) -> bytes | None:
     return payload if b"\r" not in payload and b"\n" not in payload else None
 
 
-def _post_request(payload: bytes, etag: str) -> bytes | None:
+def _insert_request(payload: bytes, etag: str) -> bytes | None:
     try:
         raw_etag = etag.encode("latin-1")
         length = str(len(payload)).encode("ascii")
@@ -1030,7 +1055,7 @@ def _post_request(payload: bytes, etag: str) -> bytes | None:
     if b"\r" in raw_etag or b"\n" in raw_etag or _ETAG.fullmatch(etag) is None:
         return None
     return (
-        b"POST /config/apps/http/servers/fstack/routes HTTP/1.1\r\n"
+        b"PUT /config/apps/http/servers/fstack/routes/0 HTTP/1.1\r\n"
         b"Host: localhost\r\n"
         b"Content-Type: application/json\r\n"
         b"Content-Length: "
@@ -1078,7 +1103,7 @@ def _mutation_decision(
     etag: str,
     payload: bytes,
 ) -> CaddyAdminErrorCode | None:
-    request = _post_request(payload, etag)
+    request = _insert_request(payload, etag)
     if request is None:
         return CaddyAdminErrorCode.ADMIN_INCOMPATIBLE
     response = _safe_exchange(transport, request, CaddyRequestContext.POST_MUTATION)
@@ -1135,7 +1160,7 @@ class CaddyAdmin:
         return decision
 
     def reconcile(self, route: Mapping[str, object]) -> None:
-        """Adopt or append one exact route with optimistic concurrency."""
+        """Adopt or prepend one exact route with optimistic concurrency."""
         desired = _route_snapshot(route)
         del route
         if desired is None:

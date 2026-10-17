@@ -36,8 +36,28 @@ The installation owns:
 - the existing HTTP server named exactly `fstack` and its existing `routes` array.
 
 Fstack owns only one route object per Fstack deployment inside that preconfigured routes
-array. Fstack does not create, replace or repair the `fstack` server, its listeners, its
-routes array, Caddy storage, or the Caddy process.
+array. The installation owns one exact terminal `fstack-unclaimed-host` static-response
+route returning HTTP `404`; it must exist exactly once as the final array element. Fstack
+does not create, replace or repair the `fstack` server, its listeners, its routes array,
+Caddy storage, the installation-owned fallback, or the Caddy process.
+
+The installation-owned fallback is exactly this JSON object, with these JSON value types
+(`404` is an integer and `true` is a boolean; numeric aliases such as `404.0` or `1` are not
+accepted):
+
+```json
+{
+  "@id": "fstack-unclaimed-host",
+  "handle": [
+    {
+      "handler": "static_response",
+      "status_code": 404,
+      "body": "not found\n"
+    }
+  ],
+  "terminal": true
+}
+```
 
 The preconfigured prerequisites are:
 
@@ -172,15 +192,16 @@ Caddy's native JSON admin API is used only at these scopes:
 GET  /config/apps/http/servers/fstack/routes
 GET  /config/apps/http/servers
 GET  /id/<route-id>
-POST /config/apps/http/servers/fstack/routes
+PUT /config/apps/http/servers/fstack/routes/0
 ```
 
 The servers GET is bounded, read-only parent-prerequisite inspection used only after the
 direct routes-array GET returns `400` or `404`. The direct routes-array GET must return an
 array and an `Etag`; only that direct response can authorize mutation. Fstack never calls
 `/load`, never writes the whole server or routes array, and never performs GET-modify-write
-replacement of shared configuration. The only mutation is one POST that appends the exact
-route object. It carries `If-Match` with the direct routes-array Etag so a concurrent
+replacement of shared configuration. The only mutation is one PUT that inserts the exact
+route object at index zero, before the required terminal fallback. It carries `If-Match`
+with the direct routes-array Etag so a concurrent
 overlapping change fails rather than being overwritten. Each mutation is one Caddy ACID
 request.
 
@@ -193,9 +214,9 @@ Status classification is a closed function over every integer status from `100` 
 `599`. A malformed or out-of-range status line is a framing/protocol failure. Bodies are
 discarded after bounded framing and are never retained for classification.
 
-| Response | Direct routes GET before mutation | Direct routes GET after mutation | ID GET before mutation | ID GET after ambiguous POST |
+| Response | Direct routes GET before mutation | Direct routes GET after mutation | ID GET before mutation | ID GET after ambiguous PUT |
 |---|---|---|---|---|
-| `200` | Parse an exact JSON array plus exactly one valid `Etag`, then classify the whole array. | Parse an exact JSON array and require exactly one exact desired route plus a safe whole array. Exact whole-array conflicts retain their permanent conflict codes. A safe array without the route, malformed JSON, a non-array, or any other unresolved/invalid confirmation is retryable `caddy_mutation_ambiguous`, whether this GET follows POST `200`, POST `400`/`404`, or ID-based ambiguity resolution. | Exact desired route, otherwise permanent `caddy_route_id_conflict`. | Exact desired route is provisional only; a fresh post-mutation direct routes GET must prove one exact occurrence and a safe whole array. Different content is permanent `caddy_route_id_conflict`. |
+| `200` | Parse an exact JSON array plus exactly one valid `Etag`, then classify the whole array. | Parse an exact JSON array and require exactly one exact desired route plus a safe whole array. Exact whole-array conflicts retain their permanent conflict codes. A safe array without the route, malformed JSON, a non-array, or any other unresolved/invalid confirmation is retryable `caddy_mutation_ambiguous`, whether this GET follows PUT `200`, PUT `400`/`404`, or ID-based ambiguity resolution. | Exact desired route, otherwise permanent `caddy_route_id_conflict`. | Exact desired route is provisional only; a fresh post-mutation direct routes GET must prove one exact occurrence and a safe whole array. Different content is permanent `caddy_route_id_conflict`. |
 | `400`, `404` | Discard the body and issue the bounded parent servers GET below in pre-mutation context. | Discard the body and issue the bounded parent servers GET below in post-mutation context. | `400` is permanent `caddy_admin_incompatible`; `404` means route absent. | `400` is permanent `caddy_admin_incompatible`; `404` is retryable `caddy_mutation_ambiguous`. |
 | `401`, `403` | Permanent `caddy_admin_forbidden`. | Permanent `caddy_admin_forbidden`. | Permanent `caddy_admin_forbidden`. | Permanent `caddy_admin_forbidden`. |
 | `300`-`399`, every other `400`-`499` | Permanent `caddy_admin_incompatible`; this includes `405`, `412`, `415`, and `422`. | Permanent `caddy_admin_incompatible`. | Permanent `caddy_admin_incompatible`. | Permanent `caddy_admin_incompatible`. |
@@ -205,7 +226,7 @@ Parent servers GET classification is also closed and depends on request context:
 
 | Parent servers GET response | Before mutation | During post-mutation readback/resolution |
 |---|---|---|
-| `200` | Require an object. Absence of `fstack`, a non-object `fstack`, absence of `routes`, or a non-array `routes` is permanent `caddy_prerequisite_missing`. Otherwise classify the embedded routes by the same complete whole-array rules. An exact safe desired route may be adopted; conflicts keep their exact permanent codes. If the desired route is absent and the array is safe, return permanent `caddy_admin_incompatible`, because parent-only evidence supplies no direct routes `Etag` and cannot authorize POST. | Apply the same object/prerequisite and whole-array rules. An exact safe desired route confirms success. Missing hierarchy is permanent `caddy_prerequisite_missing`, and conflicts retain their exact permanent codes. Any parent evidence that cannot resolve the mutation, including a present safe array without the desired route, is retryable `caddy_mutation_ambiguous`; parent-only evidence cannot establish rejection. |
+| `200` | Require an object. Absence of `fstack`, a non-object `fstack`, absence of `routes`, or a non-array `routes` is permanent `caddy_prerequisite_missing`. Otherwise classify the embedded routes by the same complete whole-array rules. An exact safe desired route may be adopted; conflicts keep their exact permanent codes. If the desired route is absent and the array is safe, return permanent `caddy_admin_incompatible`, because parent-only evidence supplies no direct routes `Etag` and cannot authorize PUT. | Apply the same object/prerequisite and whole-array rules. An exact safe desired route confirms success. Missing hierarchy is permanent `caddy_prerequisite_missing`, and conflicts retain their exact permanent codes. Any parent evidence that cannot resolve the mutation, including a present safe array without the desired route, is retryable `caddy_mutation_ambiguous`; parent-only evidence cannot establish rejection. |
 | `400`, `404` | Permanent `caddy_prerequisite_missing`: the fixed hierarchy is absent. | Permanent `caddy_prerequisite_missing`. |
 | `401`, `403` | Permanent `caddy_admin_forbidden`. | Permanent `caddy_admin_forbidden`. |
 | `300`-`399`, every other `400`-`499` | Permanent `caddy_admin_incompatible`. | Permanent `caddy_admin_incompatible`. |
@@ -215,9 +236,9 @@ No error body is inspected to distinguish a missing path. Caddy v2.11.7 may retu
 `400` or `404` when a configuration path cannot be traversed, so only the bounded parent
 object decides whether the fixed `fstack.routes` prerequisite exists.
 
-POST classification is separately exhaustive:
+PUT classification is separately exhaustive:
 
-| POST response | Result |
+| PUT response | Result |
 |---|---|
 | `200` | Definite mutation acceptance, but do not mark submitted until a fresh routes-array GET proves the exact route occurs once and the whole array is safe. An unavailable confirmation or a present safe array without the desired route is retryable `caddy_mutation_ambiguous`. |
 | `412` | Retryable `caddy_config_changed`; do not retry the mutation inside the activity. The workflow retry restarts from routes-array inspection. |
@@ -229,9 +250,9 @@ POST classification is separately exhaustive:
 
 Malformed or out-of-range status lines map to retryable `caddy_unavailable` for pre-mutation
 direct routes GET and pre-mutation ID GET; to retryable `caddy_mutation_ambiguous` for
-post-mutation direct routes GET and ID GET after an ambiguous POST; and trigger
-ambiguous-POST resolution when received from POST. Tests iterate every status `100` through
-`599` for direct routes GET in both request contexts, both ID-GET contexts, and POST, plus
+post-mutation direct routes GET and ID GET after an ambiguous PUT; and trigger
+ambiguous-PUT resolution when received from PUT. Tests iterate every status `100` through
+`599` for direct routes GET in both request contexts, both ID-GET contexts, and PUT, plus
 malformed/out-of-range status lines. Parent GET tests iterate every status `100` through
 `599` in pre-mutation and post-mutation request contexts and exercise every `200` object
 shape. Tests also prove concurrent prerequisite disappearance and post-success confirmation.
@@ -292,7 +313,7 @@ Ingress reconciliation then follows this exact decision order:
      embedded array is classified by all rules below. It may prove exact adoption or a
      conflict, but when the desired route is absent and the array is safe it is permanent
      `caddy_admin_incompatible`: mutation requires an `Etag` from a successful direct routes
-     GET and parent-only evidence can never authorize POST.
+     GET and parent-only evidence can never authorize PUT.
    - Parent status and request-context failures use the closed parent mapping above; no error
      body is inspected.
    - Scan every element and count every occurrence of the expected `@id`.
@@ -300,19 +321,23 @@ Ingress reconciliation then follows this exact decision order:
      exactly the desired route: permanent `caddy_route_id_conflict`.
    - Any other route that claims the exact desired host or has a wildcard host matcher that
      matches it: permanent `caddy_host_conflict`.
-   - Any catch-all/no-host route, or any route not exactly classifiable as the frozen
-     Fstack-owned shape for another deterministic deployment: permanent
-     `caddy_routes_ambiguous` because ordering or matcher semantics could shadow the desired
-     route.
+   - After route-ID and host-conflict checks, require exactly one structurally exact and
+     type-exact installation-owned `fstack-unclaimed-host` fallback in the final array
+     position. A missing, modified, duplicated, or non-final fallback is permanent
+     `caddy_routes_ambiguous`.
+   - Excluding that exact final fallback, any catch-all/no-host route, or any route not
+     exactly classifiable as the frozen Fstack-owned shape for another deterministic
+     deployment, is permanent `caddy_routes_ambiguous` because ordering or matcher semantics
+     could shadow the desired route.
    - Exactly one expected ID that equals the exact desired route, with no competing host,
-     wildcard, catch-all or ambiguous route: adopt without mutation. Safely classified
-     unrelated Fstack routes may coexist.
+     wildcard, catch-all or ambiguous route, and with the exact fallback last: adopt without
+     mutation. Safely classified unrelated Fstack routes may coexist before the fallback.
    - If step 1 returned exact `200` but this array contains no expected ID, permanent
      `caddy_route_id_conflict`: the global ID is outside the owned routes array.
-   - If step 1 returned `404`, no expected ID and only safely classified unrelated Fstack
-     routes: continue. A route concurrently appearing in this array is classified/adopted by
-     the preceding rules rather than posted again.
-3. `POST /config/apps/http/servers/fstack/routes` with the exact route and the observed
+   - If step 1 returned `404`, no expected ID, only safely classified unrelated Fstack routes,
+     and the exact fallback is last: continue. A route concurrently appearing in this array
+     is classified/adopted by the preceding rules rather than inserted again.
+3. `PUT /config/apps/http/servers/fstack/routes/0` with the exact route and the observed
    `If-Match` Etag.
    - `200`: definite mutation acceptance; perform a post-mutation direct routes GET and
      continue only when its `200` body proves the expected ID is unique/exact and the whole
@@ -336,9 +361,9 @@ Ingress reconciliation then follows this exact decision order:
    - `405`, `415`, any unsupported `3xx`, or any other bounded `4xx`: permanent
      `caddy_admin_incompatible`.
    - Every `100`-`199`, `201`-`299`, `5xx`, timeout, disconnect, malformed/framing failure or
-     other transport result is ambiguous; do not post again until resolving it by
+     other transport result is ambiguous; do not insert again until resolving it by
      `GET /id/<route-id>`.
-4. Ambiguous POST resolution by `GET /id/<route-id>`:
+4. Ambiguous PUT resolution by `GET /id/<route-id>`:
    - Exact route now exists: perform the post-mutation direct routes GET and succeed only if a
      valid `200` proves the expected ID is unique/exact and the whole array remains safe.
    - Same ID has different content, or duplicate expected IDs are observed during that
@@ -648,7 +673,7 @@ not guess or hard-code those digests. It must:
   loading/indexing configuration;
 - exercise exhaustive `100`-`599` status classification for direct routes GET in both
   pre-mutation and post-mutation contexts, parent servers GET in both contexts, both ID-GET
-  contexts, and POST, including
+  contexts, and PUT, including
   every parent `200` object shape, malformed/out-of-range status lines, concurrent
   prerequisite disappearance, and post-mutation confirmation without retaining bodies;
 - prove the maintenance-mode upgrade gate and that no v2 dispatch row is ever exposed to an
