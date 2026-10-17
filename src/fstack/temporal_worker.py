@@ -19,6 +19,7 @@ from temporalio.worker import Worker
 import fstack.runtime_state as runtime_state
 import fstack.runtime_submission as runtime_submission
 from fstack import caddy_admin, caddy_topology, ingress_probe, ingress_state, ingress_submission
+from fstack.billing_config import load_billing_configuration
 from fstack.docker_cli import DockerCLI
 from fstack.runtime_application import RuntimeApplicationError, apply_runtime_plan
 from fstack.temporal_workflow import (
@@ -783,6 +784,7 @@ async def run_worker_services(
 
 
 async def run_temporal_worker() -> None:
+    load_billing_configuration(operator_token=os.environ.get("FSTACK_OPERATOR_TOKEN"))
     target = os.environ.get("FSTACK_TEMPORAL_TARGET", DEFAULT_TEMPORAL_TARGET)
     namespace = os.environ.get("FSTACK_TEMPORAL_NAMESPACE", DEFAULT_TEMPORAL_NAMESPACE)
     task_queue = os.environ.get("FSTACK_TEMPORAL_TASK_QUEUE", DEFAULT_TEMPORAL_TASK_QUEUE)
