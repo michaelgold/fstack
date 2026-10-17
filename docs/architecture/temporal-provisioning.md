@@ -133,6 +133,8 @@ production topology is one explicitly configured Docker container with:
 
 - Caddy v2.11.7 at the exact immutable image digest certified by the release canary;
 - an existing `apps.http.servers.fstack` object and `routes` array;
+- exactly one final installation-owned `fstack-unclaimed-host` terminal static-response route
+  whose strictly typed JSON returns status `404` and body `not found\n`;
 - at least one installation-owned listener reachable at the configured probe address;
 - attachment to the exact `FSTACK_DOCKER_NETWORK` used by Crusher;
 - a separately shared, confined Unix admin-socket volume.

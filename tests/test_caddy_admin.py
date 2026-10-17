@@ -1458,9 +1458,25 @@ _DESIRED_ROUTE = {
         }
     ],
 }
+_FALLBACK_ROUTE = {
+    "@id": "fstack-unclaimed-host",
+    "handle": [{"handler": "static_response", "status_code": 404, "body": "not found\n"}],
+    "terminal": True,
+}
+
+
+def _with_fallback(body: object) -> object:
+    if type(body) is list:
+        return body if _FALLBACK_ROUTE in body else [*body, _FALLBACK_ROUTE]
+    if type(body) is dict and type(body.get("fstack")) is dict:
+        server = body["fstack"]
+        if type(server.get("routes")) is list:
+            return {**body, "fstack": {**server, "routes": _with_fallback(server["routes"])}}
+    return body
 
 
 def _response(status: int, body: object = None, *headers: tuple[str, str]) -> object:
+    body = _with_fallback(body)
     payload = b"" if body is None else json.dumps(body, separators=(",", ":")).encode()
     return caddy_admin._HTTPResponse("HTTP/1.1", status, headers, payload)
 
@@ -1486,17 +1502,96 @@ def _inspect(
     return result, transport
 
 
-def test_pre_mutation_inspection_requests_exact_id_then_routes_and_returns_etag() -> None:
-    result, transport = _inspect(
-        [_response(404), _response(200, [], ("Etag", '"route-array-tag"'))]
+def test_pre_mutation_rejects_missing_terminal_fallback() -> None:
+    missing_fallback = caddy_admin._HTTPResponse(
+        "HTTP/1.1", 200, (("Etag", '"route-array-tag"'),), b"[]"
     )
+    with pytest.raises(CaddyAdminError) as caught:
+        _inspect([_response(404), missing_fallback])
+
+    assert caught.value.code is CaddyAdminErrorCode.ROUTES_AMBIGUOUS
+
+
+def test_pre_mutation_allows_one_exact_terminal_fallback_after_managed_routes() -> None:
+    result, transport = _inspect(
+        [_response(404), _response(200, [_FALLBACK_ROUTE], ("Etag", '"route-array-tag"'))]
+    )
+
+    assert isinstance(result, CaddyInspection)
     assert result.state is CaddyInspectionState.ABSENT
     assert result.etag == '"route-array-tag"'
-    assert transport.requests == [
-        (f"GET /id/{_ROUTE_ID} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").encode(),
-        b"GET /config/apps/http/servers/fstack/routes HTTP/1.1\r\n"
-        b"Host: localhost\r\nConnection: close\r\n\r\n",
-    ]
+    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST]
+
+
+@pytest.mark.parametrize(
+    "routes",
+    [
+        [_FALLBACK_ROUTE, _DESIRED_ROUTE],
+        [_FALLBACK_ROUTE, _FALLBACK_ROUTE],
+        [{**_FALLBACK_ROUTE, "terminal": False}],
+    ],
+)
+def test_pre_mutation_rejects_misordered_duplicate_or_modified_fallbacks(
+    routes: list[object],
+) -> None:
+    with pytest.raises(CaddyAdminError) as caught:
+        _inspect([_response(404), _response(200, routes, ("Etag", '"route-array-tag"'))])
+
+    assert caught.value.code is CaddyAdminErrorCode.ROUTES_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    "raw_routes",
+    [
+        (
+            b'[{"@id":"fstack-unclaimed-host","handle":[{"handler":"static_response",'
+            b'"status_code":404,"body":"not found\\n"}],"terminal":1}]'
+        ),
+        (
+            b'[{"@id":"fstack-unclaimed-host","handle":[{"handler":"static_response",'
+            b'"status_code":404.0,"body":"not found\\n"}],"terminal":true}]'
+        ),
+    ],
+)
+def test_pre_mutation_rejects_fallback_json_type_aliases(raw_routes: bytes) -> None:
+    response = caddy_admin._HTTPResponse(
+        "HTTP/1.1", 200, (("Etag", '"route-array-tag"'),), raw_routes
+    )
+    with pytest.raises(CaddyAdminError) as caught:
+        _inspect([_response(404), response])
+
+    assert caught.value.code is CaddyAdminErrorCode.ROUTES_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    ("route", "code"),
+    [
+        (
+            dict(_DESIRED_ROUTE, match=[{"host": ["changed.example.com"]}]),
+            CaddyAdminErrorCode.ROUTE_ID_CONFLICT,
+        ),
+        (
+            {
+                "@id": f"fstack-crusher-ingress-{_OTHER_HEX}",
+                "match": [{"host": [_DESIRED_HOST]}],
+                "handle": [
+                    {
+                        "handler": "reverse_proxy",
+                        "upstreams": [{"dial": f"fstack-crusher-{_OTHER_HEX}:8000"}],
+                    }
+                ],
+            },
+            CaddyAdminErrorCode.HOST_CONFLICT,
+        ),
+    ],
+)
+def test_route_and_host_conflicts_precede_misordered_fallback(
+    route: dict[str, object], code: CaddyAdminErrorCode
+) -> None:
+    with pytest.raises(CaddyAdminError) as caught:
+        _inspect([_response(404), _response(200, [_FALLBACK_ROUTE, route], ("Etag", '"tag"'))])
+
+    assert caught.value.code is code
 
 
 def test_exact_id_is_provisional_until_whole_array_contains_it() -> None:
@@ -1700,7 +1795,7 @@ def test_public_direct_pre_accepts_one_syntactically_valid_etag_unchanged(
 ) -> None:
     responses = [
         _wire_response(404),
-        _wire_response(200, b"[]", b"Etag: " + raw_etag),
+        _wire_json_response(200, [], b"Etag: " + raw_etag),
     ]
     server = _PersistentWireServer(tmp_path / "admin", responses)
     completed = False
@@ -1743,7 +1838,7 @@ def test_public_direct_pre_accepts_one_syntactically_valid_etag_unchanged(
 def test_public_direct_pre_rejects_invalid_or_nonunique_etag_syntax(
     tmp_path: Path, etag_headers: list[bytes]
 ) -> None:
-    responses = [_wire_response(404), _wire_response(200, b"[]", *etag_headers)]
+    responses = [_wire_response(404), _wire_json_response(200, [], *etag_headers)]
     server = _PersistentWireServer(tmp_path / "admin", responses)
     completed = False
     try:
@@ -1941,7 +2036,7 @@ def _safe_marker_route(marker: str) -> dict[str, object]:
 def _wire_json_response(status: int, body: object, *headers: bytes) -> bytes:
     return _wire_response(
         status,
-        json.dumps(body, separators=(",", ":")).encode(),
+        json.dumps(_with_fallback(body), separators=(",", ":")).encode(),
         *headers,
     )
 
@@ -2055,12 +2150,23 @@ def test_real_wire_public_inspection_status_routing_is_exhaustive(
         server.close(require_all=completed)
 
 
-def test_post_mutation_malformed_or_safe_absent_confirmation_is_ambiguous() -> None:
-    for body in (b"not-json", b"{}", b"[]"):
-        transport = _RecordingTransport([caddy_admin._HTTPResponse("HTTP/1.1", 200, (), body)])
-        with pytest.raises(CaddyAdminError) as caught:
-            CaddyAdmin(transport).inspect(_DESIRED_ROUTE, context=CaddyRequestContext.POST_MUTATION)
-        assert caught.value.code is CaddyAdminErrorCode.MUTATION_AMBIGUOUS
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        (b"not-json", CaddyAdminErrorCode.MUTATION_AMBIGUOUS),
+        (b"{}", CaddyAdminErrorCode.MUTATION_AMBIGUOUS),
+        (b"[]", CaddyAdminErrorCode.ROUTES_AMBIGUOUS),
+    ],
+)
+def test_post_mutation_malformed_or_missing_fallback_confirmation_fails_closed(
+    body: bytes, code: CaddyAdminErrorCode
+) -> None:
+    with pytest.raises(CaddyAdminError) as caught:
+        _inspect(
+            [caddy_admin._HTTPResponse("HTTP/1.1", 200, (), body)],
+            context=CaddyRequestContext.POST_MUTATION,
+        )
+    assert caught.value.code is code
 
 
 def test_duplicate_json_keys_are_never_accepted() -> None:
@@ -2254,7 +2360,7 @@ def test_inspection_uses_real_confined_unix_http_exchanges(tmp_path: Path) -> No
     server.listen()
     responses = [
         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
-        b'HTTP/1.1 200 OK\r\nEtag: "routes"\r\nContent-Length: 2\r\n\r\n[]',
+        _wire_json_response(200, [], b'Etag: "routes"'),
     ]
     requests: list[bytes] = []
 
@@ -2560,8 +2666,8 @@ _CANONICAL_ROUTE_BYTES = (
     b'"fstack-crusher-0123456789abcdef0123456789abcdef:8000"}]}],'
     b'"match":[{"host":["api.example.com"]}]}'
 )
-_POST_REQUEST = (
-    b"POST /config/apps/http/servers/fstack/routes HTTP/1.1\r\n"
+_INSERT_REQUEST = (
+    b"PUT /config/apps/http/servers/fstack/routes/0 HTTP/1.1\r\n"
     b"Host: localhost\r\n"
     b"Content-Type: application/json\r\n"
     b"Content-Length: 221\r\n"
@@ -2570,7 +2676,7 @@ _POST_REQUEST = (
 )
 
 
-def test_reconcile_posts_one_exact_canonical_route_then_requires_confirmation() -> None:
+def test_reconcile_inserts_one_exact_route_before_fallback_then_requires_confirmation() -> None:
     transport = _RecordingTransport(
         [
             _response(404),
@@ -2582,8 +2688,8 @@ def test_reconcile_posts_one_exact_canonical_route_then_requires_confirmation() 
 
     assert CaddyAdmin(transport).reconcile(_DESIRED_ROUTE) is None
 
-    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _POST_REQUEST, _DIRECT_REQUEST]
-    assert b"PUT " not in b"".join(transport.requests)
+    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _INSERT_REQUEST, _DIRECT_REQUEST]
+    assert b"POST " not in b"".join(transport.requests)
     assert b"PATCH " not in b"".join(transport.requests)
     assert b"DELETE " not in b"".join(transport.requests)
 
@@ -2606,7 +2712,7 @@ def test_reconcile_412_is_config_changed_without_readback_or_retry() -> None:
         CaddyAdmin(transport).reconcile(_DESIRED_ROUTE)
 
     assert caught.value.code is CaddyAdminErrorCode.CONFIG_CHANGED
-    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _POST_REQUEST]
+    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _INSERT_REQUEST]
 
 
 @pytest.mark.parametrize("status", [400, 404])
@@ -2621,7 +2727,7 @@ def test_reconcile_400_or_404_reads_back_exact_route(status: int) -> None:
     )
 
     assert CaddyAdmin(transport).reconcile(_DESIRED_ROUTE) is None
-    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _POST_REQUEST, _DIRECT_REQUEST]
+    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _INSERT_REQUEST, _DIRECT_REQUEST]
 
 
 def test_reconcile_422_is_permanent_route_rejected() -> None:
@@ -2650,7 +2756,7 @@ def test_reconcile_ambiguous_post_resolves_exact_id_then_confirms_full_array() -
     assert transport.requests == [
         _ID_REQUEST,
         _DIRECT_REQUEST,
-        _POST_REQUEST,
+        _INSERT_REQUEST,
         _ID_REQUEST,
         _DIRECT_REQUEST,
     ]
@@ -2673,7 +2779,7 @@ def test_reconcile_retry_restarts_inspection_and_adopts_without_second_post() ->
         admin.reconcile(_DESIRED_ROUTE)
     assert caught.value.code is CaddyAdminErrorCode.MUTATION_AMBIGUOUS
     assert admin.reconcile(_DESIRED_ROUTE) is None
-    assert transport.requests.count(_POST_REQUEST) == 1
+    assert transport.requests.count(_INSERT_REQUEST) == 1
 
 
 def test_reconcile_submission_adopts_then_marks_only_the_two_submission_ids(
@@ -2699,7 +2805,7 @@ def test_reconcile_submission_adopts_then_marks_only_the_two_submission_ids(
         is None
     )
     assert calls == [(submission_id, operation_id)]
-    assert _POST_REQUEST not in transport.requests
+    assert _INSERT_REQUEST not in transport.requests
 
 
 def test_reconcile_submission_mutation_marks_only_after_full_array_confirmation(
@@ -2720,7 +2826,12 @@ def test_reconcile_submission_mutation_marks_only_after_full_array_confirmation(
     calls: list[tuple[object, ...]] = []
 
     def mark(*args: object) -> None:
-        assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _POST_REQUEST, _DIRECT_REQUEST]
+        assert transport.requests == [
+            _ID_REQUEST,
+            _DIRECT_REQUEST,
+            _INSERT_REQUEST,
+            _DIRECT_REQUEST,
+        ]
         calls.append(args)
 
     monkeypatch.setattr(ingress_state, "mark_submitted", mark)
@@ -2801,10 +2912,10 @@ def test_reconcile_submission_retries_mark_after_confirmed_mutation_without_seco
     assert caught.value.code == "ingress_state_infrastructure"
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
-    assert transport.requests.count(_POST_REQUEST) == 1
+    assert transport.requests.count(_INSERT_REQUEST) == 1
 
     assert admin.reconcile_submission(_DESIRED_ROUTE, submission_id, operation_id) is None
-    assert transport.requests.count(_POST_REQUEST) == 1
+    assert transport.requests.count(_INSERT_REQUEST) == 1
     assert calls == [(submission_id, operation_id), (submission_id, operation_id)]
 
 
@@ -2902,7 +3013,7 @@ def test_real_wire_public_reconcile_post_statuses_are_exhaustive(tmp_path: Path)
         marker = f"post-status-{status}-body-marker"
         responses, requests = _reconcile_prefix()
         responses.append(_wire_response(status, marker.encode()))
-        requests.append(_POST_REQUEST)
+        requests.append(_INSERT_REQUEST)
         code = _post_status_code(status)
         if status in {200, 400, 404}:
             responses.append(_wire_json_response(200, [_DESIRED_ROUTE]))
@@ -2951,7 +3062,7 @@ def test_real_wire_public_post_ambiguity_id_statuses_are_exhaustive(tmp_path: Pa
         marker = f"post-id-status-{status}-body-marker"
         responses, requests = _reconcile_prefix()
         responses.append(_wire_response(503, b"ambiguous-post-marker"))
-        requests.append(_POST_REQUEST)
+        requests.append(_INSERT_REQUEST)
         if status == 200:
             responses.append(_wire_json_response(200, _DESIRED_ROUTE))
         else:
@@ -3005,10 +3116,10 @@ def test_real_wire_public_post_confirmation_statuses_are_exhaustive(
         responses, requests = _reconcile_prefix()
         if origin == "post-200":
             responses.append(_wire_response(200, b"post-accepted-marker"))
-            requests.append(_POST_REQUEST)
+            requests.append(_INSERT_REQUEST)
         elif origin == "post-400":
             responses.append(_wire_response(400, b"post-readback-marker"))
-            requests.append(_POST_REQUEST)
+            requests.append(_INSERT_REQUEST)
         else:
             responses.extend(
                 [
@@ -3016,7 +3127,7 @@ def test_real_wire_public_post_confirmation_statuses_are_exhaustive(
                     _wire_json_response(200, _DESIRED_ROUTE),
                 ]
             )
-            requests.extend([_POST_REQUEST, _ID_REQUEST])
+            requests.extend([_INSERT_REQUEST, _ID_REQUEST])
         if status == 200:
             responses.append(_wire_json_response(200, [_DESIRED_ROUTE]))
         else:
@@ -3060,13 +3171,13 @@ def test_real_wire_reconcile_malformed_and_out_of_range_statuses_are_ambiguous(
     responses, requests = _reconcile_prefix()
     if location == "post":
         responses.extend([bad, _wire_response(404)])
-        requests.extend([_POST_REQUEST, _ID_REQUEST])
+        requests.extend([_INSERT_REQUEST, _ID_REQUEST])
     elif location == "id":
         responses.extend([_wire_response(503), bad])
-        requests.extend([_POST_REQUEST, _ID_REQUEST])
+        requests.extend([_INSERT_REQUEST, _ID_REQUEST])
     else:
         responses.extend([_wire_response(200), bad])
-        requests.extend([_POST_REQUEST, _DIRECT_REQUEST])
+        requests.extend([_INSERT_REQUEST, _DIRECT_REQUEST])
     server = _PersistentWireServer(tmp_path / f"admin-bad-{location}", responses)
     completed = False
     try:
@@ -3096,16 +3207,23 @@ def test_reconcile_parent_fallback_missing_is_prerequisite(post_status: int) -> 
     assert transport.requests == [
         _ID_REQUEST,
         _DIRECT_REQUEST,
-        _POST_REQUEST,
+        _INSERT_REQUEST,
         _DIRECT_REQUEST,
         _PARENT_REQUEST,
     ]
 
 
 @pytest.mark.parametrize("post_status", [200, 400, 404])
-@pytest.mark.parametrize("confirmation", [b"not-json", b"{}", b"[]"])
-def test_reconcile_unresolved_direct_confirmation_is_ambiguous(
-    post_status: int, confirmation: bytes
+@pytest.mark.parametrize(
+    ("confirmation", "code"),
+    [
+        (b"not-json", CaddyAdminErrorCode.MUTATION_AMBIGUOUS),
+        (b"{}", CaddyAdminErrorCode.MUTATION_AMBIGUOUS),
+        (b"[]", CaddyAdminErrorCode.ROUTES_AMBIGUOUS),
+    ],
+)
+def test_reconcile_unresolved_direct_confirmation_fails_closed(
+    post_status: int, confirmation: bytes, code: CaddyAdminErrorCode
 ) -> None:
     transport = _RecordingTransport(
         [
@@ -3117,7 +3235,7 @@ def test_reconcile_unresolved_direct_confirmation_is_ambiguous(
     )
     with pytest.raises(CaddyAdminError) as caught:
         CaddyAdmin(transport).reconcile(_DESIRED_ROUTE)
-    assert caught.value.code is CaddyAdminErrorCode.MUTATION_AMBIGUOUS
+    assert caught.value.code is code
 
 
 def test_reconcile_ambiguous_post_id_difference_is_permanent_conflict_without_confirmation() -> (
@@ -3135,7 +3253,7 @@ def test_reconcile_ambiguous_post_id_difference_is_permanent_conflict_without_co
     with pytest.raises(CaddyAdminError) as caught:
         CaddyAdmin(transport).reconcile(_DESIRED_ROUTE)
     assert caught.value.code is CaddyAdminErrorCode.ROUTE_ID_CONFLICT
-    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _POST_REQUEST, _ID_REQUEST]
+    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _INSERT_REQUEST, _ID_REQUEST]
 
 
 def test_reconcile_exact_post_id_still_requires_fresh_full_array_confirmation() -> None:
@@ -3352,7 +3470,7 @@ def test_reconcile_freezes_route_and_canonical_payload_before_first_io() -> None
     )
 
     assert CaddyAdmin(transport).reconcile(caller) is None
-    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _POST_REQUEST, _DIRECT_REQUEST]
+    assert transport.requests == [_ID_REQUEST, _DIRECT_REQUEST, _INSERT_REQUEST, _DIRECT_REQUEST]
     assert transport.requests[2].split(b"\r\n\r\n", 1)[1] == _CANONICAL_ROUTE_BYTES
     assert transport.mutation_count == 4
 
