@@ -16,6 +16,14 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from fstack.billing import InvalidEntitlementRevision, parse_entitlement_revision_request
+from fstack.billing_config import load_billing_configuration
+from fstack.billing_service import (
+    EntitlementRevisionConflict,
+)
+from fstack.billing_service import (
+    synchronize_entitlement_revision as persist_entitlement_revision,
+)
 from fstack.provisioning import (
     ProvisioningRequest,
     ProvisioningResponse,
@@ -92,7 +100,36 @@ def _validate_idempotency_key(value: str) -> str:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Fstack")
+    billing_configuration = load_billing_configuration(
+        operator_token=os.environ.get("FSTACK_OPERATOR_TOKEN")
+    )
     engine = _database_engine()
+
+    def require_billing_reconcile(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)],
+    ) -> None:
+        if billing_configuration.mode == "disabled":
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        expected = billing_configuration.reconcile_token
+        try:
+            matches = (
+                credentials is not None
+                and credentials.scheme.lower() == "bearer"
+                and expected is not None
+                and hmac.compare_digest(
+                    credentials.credentials.encode("utf-8"), expected.encode("utf-8")
+                )
+            )
+        except UnicodeEncodeError:
+            matches = False
+        if not matches:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "code": "authentication_required",
+                    "message": "billing reconciliation authentication required",
+                },
+            )
 
     @app.middleware("http")
     async def operation_status_no_store(
@@ -161,6 +198,50 @@ def create_app() -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "fstack"}
+
+    @app.put("/internal/billing/entitlement-revisions", include_in_schema=False)
+    async def synchronize_entitlement_revision(
+        request: Request,
+        response: Response,
+        _authorized: None = Depends(require_billing_reconcile),
+    ) -> dict[str, object]:
+        try:
+            if request.headers.get("content-type") != "application/json":
+                raise InvalidEntitlementRevision
+            revision = parse_entitlement_revision_request(await request.body())
+        except InvalidEntitlementRevision:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "invalid_entitlement_revision",
+                    "message": "entitlement revision is invalid",
+                },
+            ) from None
+        try:
+            with engine.begin() as connection:
+                result = persist_entitlement_revision(connection, request=revision)
+        except EntitlementRevisionConflict:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "entitlement_revision_conflict",
+                    "message": "entitlement revision conflicts with committed state",
+                },
+            ) from None
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "entitlement_persistence_unavailable",
+                    "message": "entitlement revision could not be persisted",
+                },
+            ) from None
+        response.status_code = status.HTTP_200_OK if result.replayed else status.HTTP_201_CREATED
+        return {
+            "entitlement_subject_id": str(result.entitlement_subject_id),
+            "entitlement_revision_id": str(result.entitlement_revision_id),
+            "replayed": result.replayed,
+        }
 
     @app.get("/internal/caddy/ask", include_in_schema=False)
     def authorize_caddy_certificate(request: Request) -> Response:
