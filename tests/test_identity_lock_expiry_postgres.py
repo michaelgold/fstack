@@ -6,9 +6,8 @@ from urllib.parse import urlsplit
 
 import pytest
 from sqlalchemy import Engine, event, text
-
-from tests.test_identity_security_postgres import identity as identity
-from tests.test_identity_security_postgres import issue, start
+from test_identity_security_postgres import identity as identity
+from test_identity_security_postgres import issue, start
 
 # (HTTP boundary, expiring authority, blocked row). Later locks are deliberate:
 # rechecking only immediately after the first locking SELECT is insufficient.
