@@ -1208,7 +1208,7 @@ def test_billing_history_blocks_destructive_downgrade(
     with migrated_database.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20261017_0006"
+            == "20261028_0007"
         )
         assert (
             connection.execute(
@@ -1244,7 +1244,7 @@ def test_billing_downgrade_fails_fast_on_live_operation_writer(
     with migrated_database.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "20261017_0006"
+            == "20261028_0007"
         )
         assert "usage_facts" in inspect(migrated_database).get_table_names()
 

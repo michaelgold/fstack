@@ -26,6 +26,22 @@ The initial delivery accepts an idempotent request for a branded business and at
 
 See [`docs/architecture/first-crusher-slice.md`](docs/architecture/first-crusher-slice.md) for the frozen acceptance contract.
 
+## Human sign-in and agent delegation
+
+The local [authentication candidate](docs/authentication.md) adds explicit human
+magic-email sign-in and owner-approved, scoped agent credentials. Agents need no email
+identity. It is disabled by default. Implementation review and isolated Firefox acceptance
+passed; publication metadata review and protected PR/CI delivery remain pending. It does
+not enable customer billing or third-party federation. See [status](docs/STATUS.md).
+
+## License and product scope
+
+Fstack core is licensed under Apache-2.0; see [LICENSE](LICENSE) and
+[authentication provenance](docs/authentication-provenance.md). This does not relicense
+Crusher, private integrations or external dependencies. Basic security remains in core;
+[proposed Pro auditing/compliance capabilities](docs/pro-auditing-proposal.md) are tentative,
+not implemented license gates or a prerequisite for self-hosting.
+
 ## Development
 
 Requirements: Python 3.12+, `uv`, Docker and PostgreSQL 17.

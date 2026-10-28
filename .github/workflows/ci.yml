@@ -29,6 +29,9 @@ jobs:
       FSTACK_DATABASE_URL: postgresql+psycopg://fstack:fstack-test-password@127.0.0.1:5432/fstack_test
       FSTACK_TEST_DATABASE_URL: postgresql://fstack:fstack-test-password@127.0.0.1:5432/fstack_test
       FSTACK_OPERATOR_TOKEN: ci-operator-token
+      FSTACK_REQUIRE_POSTGRES: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: ""
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5

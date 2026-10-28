@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hmac
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
 
@@ -25,6 +26,8 @@ from fstack.billing_service import (
     synchronize_entitlement_revision as persist_entitlement_revision,
 )
 from fstack.billing_usage import InvalidUsageCursor, list_usage_facts, parse_usage_query
+from fstack.identity import AuthConfiguration, mount_identity
+from fstack.identity_mail import load_auth_configuration
 from fstack.provisioning import (
     ProvisioningRequest,
     ProvisioningResponse,
@@ -102,12 +105,41 @@ def _validate_idempotency_key(value: str) -> str:
     return value
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Fstack")
+def create_app(*, auth_configuration: AuthConfiguration | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            engine.dispose()
+
+    app = FastAPI(title="Fstack", lifespan=lifespan)
     billing_configuration = load_billing_configuration(
         operator_token=os.environ.get("FSTACK_OPERATOR_TOKEN")
     )
     engine = _database_engine()
+    identity = auth_configuration or load_auth_configuration()
+    if identity is not None:
+        app.include_router(mount_identity(engine, identity))
+
+    @app.middleware("http")
+    async def identity_privacy(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if not request.url.path.startswith(("/v1/auth/", "/v1/agent/", "/auth/")):
+            return await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            response = JSONResponse(status_code=503, content={"code": "authentication_unavailable"})
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     def require_billing_reconcile(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_BEARER)],

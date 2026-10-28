@@ -3,11 +3,14 @@ name = "fstack"
 version = "0.1.0"
 description = "Open-core control plane for isolated AI businesses and workloads"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.17,<2",
     "fastapi[opentelemetry]==0.142.2",
     "idna>=3.10,<4",
+    "itsdangerous>=2.2,<3",
     "psycopg[binary]>=3.2,<4",
     "pydantic-settings>=2.10,<3",
     "sqlalchemy>=2.0,<3",
