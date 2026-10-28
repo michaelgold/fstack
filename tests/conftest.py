@@ -25,6 +25,8 @@ def _reset_public_schema(connection) -> None:
 def migrated_database(monkeypatch: pytest.MonkeyPatch) -> Iterator[Engine]:
     raw_url = os.environ.get("FSTACK_TEST_DATABASE_URL")
     if raw_url is None:
+        if os.environ.get("FSTACK_REQUIRE_POSTGRES") == "1":
+            pytest.fail("FSTACK_TEST_DATABASE_URL is required by this verification run")
         pytest.skip("FSTACK_TEST_DATABASE_URL is required for PostgreSQL tests")
 
     with psycopg.connect(raw_url, autocommit=True) as connection:
