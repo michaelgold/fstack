@@ -105,19 +105,84 @@ def denied(code: int = 403) -> HTTPException:
     return HTTPException(code, "authentication or authorization denied")
 
 
+class IdentityAuthority:
+    """Current installation-local authority shared by routes and trusted extensions.
+
+    Call inside a short caller-owned transaction. Never retain the result across
+    external I/O: reauthorize the request after that I/O before returning data.
+    Locks and a fresh clock read are deliberately part of the shared contract.
+    """
+
+    def __init__(self, config: AuthConfiguration):
+        self.config = config
+
+    def digest(self, value: str) -> str:
+        return hmac.new(self.config.secret.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+    def csrf(self, value: str) -> str:
+        return self.digest("csrf:" + value)
+
+    def origin(self, request: Request) -> None:
+        if request.headers.get("origin") != self.config.origin:
+            raise denied()
+
+    def live(self, db: Connection, *expiries: datetime, code: int = 403) -> None:
+        # Read AFTER all authority locks; statement/transaction start is stale after waits.
+        now: datetime = db.execute(text("SELECT clock_timestamp()")).scalar_one()
+        if any(expiry <= now for expiry in expiries):
+            raise denied(code)
+
+    def human(
+        self, db: Connection, request: Request, mutation: bool = False
+    ) -> tuple[UUID, datetime]:
+        raw = request.cookies.get(COOKIE, "")
+        if not raw or request.headers.get("authorization"):
+            raise denied(401)
+        if mutation:
+            self.origin(request)
+            if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), self.csrf(raw)):
+                raise denied()
+        row = db.execute(
+            text("""SELECT s.principal_id, s.expires_at FROM auth_sessions s
+            JOIN auth_principals p ON p.id=s.principal_id
+            WHERE s.digest=:d AND NOT s.revoked AND p.active
+              AND s.expires_at > clock_timestamp() FOR SHARE OF s,p"""),
+            {"d": self.digest(raw)},
+        ).first()
+        if row is None:
+            raise denied(401)
+        self.live(db, row[1], code=401)
+        return UUID(str(row[0])), row[1]
+
+    def member(self, db: Connection, principal: UUID, account: UUID, scopes: list[str]) -> None:
+        row = db.execute(
+            text("""SELECT m.permissions FROM auth_memberships m
+            JOIN auth_principals p ON p.id=m.principal_id
+            WHERE m.account_id=:a AND m.principal_id=:p AND m.active AND m.owner AND p.active
+            FOR SHARE OF m,p"""),
+            {"a": account, "p": principal},
+        ).first()
+        if row is None or not set(scopes).issubset(row[0]):
+            raise denied()
+
+    def require_owner(self, db: Connection, request: Request, account: UUID) -> UUID:
+        """Human current owner only; account:read agent grants confer no authority here."""
+        principal, expires = self.human(db, request)
+        self.member(db, principal, account, [])
+        self.live(db, expires, code=401)
+        return principal
+
+
 def mount_identity(engine: Engine, config: AuthConfiguration) -> APIRouter:
     router = APIRouter()
+    authority = IdentityAuthority(config)
     signer = URLSafeTimedSerializer(config.secret, salt="fstack-human-login-v1")
 
-    def digest(value: str) -> str:
-        return hmac.new(config.secret.encode(), value.encode(), hashlib.sha256).hexdigest()
+    digest = authority.digest
 
-    def csrf(value: str) -> str:
-        return digest("csrf:" + value)
+    csrf = authority.csrf
 
-    def origin(request: Request) -> None:
-        if request.headers.get("origin") != config.origin:
-            raise denied()
+    origin = authority.origin
 
     def cookie(response: Response, name: str, value: str, age: int) -> None:
         response.set_cookie(
@@ -139,47 +204,11 @@ def mount_identity(engine: Engine, config: AuthConfiguration) -> APIRouter:
         if count > limit:
             raise HTTPException(429, "try later")
 
-    def live(db: Connection, *expiries: datetime, code: int = 403) -> None:
-        # A locking SELECT can evaluate its WHERE clause before waiting. Use a
-        # separate, fresh wall-clock read after ALL authority locks, not now()
-        # (transaction start) or a timestamp evaluated by the locking statement.
-        # Mutation routes also check after writes, before leaving engine.begin():
-        # any late wait/expiry rolls back staged effects rather than committing them.
-        now: datetime = db.execute(text("SELECT clock_timestamp()")).scalar_one()
-        if any(expiry <= now for expiry in expiries):
-            raise denied(code)
+    live = authority.live
 
-    def human(db: Connection, request: Request, mutation: bool = False) -> tuple[UUID, datetime]:
-        raw = request.cookies.get(COOKIE, "")
-        if not raw or request.headers.get("authorization"):
-            raise denied(401)
-        if mutation:
-            origin(request)
-            if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), csrf(raw)):
-                raise denied()
-        row = db.execute(
-            text("""SELECT s.principal_id, s.expires_at FROM auth_sessions s
-            JOIN auth_principals p ON p.id=s.principal_id
-            WHERE s.digest=:d AND NOT s.revoked AND p.active
-              AND s.expires_at > clock_timestamp() FOR SHARE OF s,p"""),
-            {"d": digest(raw)},
-        ).first()
-        if row is None:
-            raise denied(401)
-        live(db, row[1], code=401)
-        # Callers acquiring further locks must retain and recheck this deadline.
-        return UUID(str(row[0])), row[1]
+    human = authority.human
 
-    def member(db: Connection, principal: UUID, account: UUID, scopes: list[str]) -> None:
-        row = db.execute(
-            text("""SELECT m.permissions FROM auth_memberships m
-            JOIN auth_principals p ON p.id=m.principal_id
-            WHERE m.account_id=:a AND m.principal_id=:p AND m.active AND m.owner AND p.active
-            FOR SHARE OF m,p"""),
-            {"a": account, "p": principal},
-        ).first()
-        if row is None or not set(scopes).issubset(row[0]):
-            raise denied()
+    member = authority.member
 
     @router.get("/auth/sign-in", response_class=HTMLResponse)
     def signin_page() -> str:
