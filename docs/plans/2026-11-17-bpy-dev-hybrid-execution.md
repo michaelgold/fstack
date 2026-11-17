@@ -1,221 +1,177 @@
-# bpy.dev Hybrid Execution and Fstack Boundaries Implementation Plan
+# bpy.dev Local-First and Hybrid Execution Implementation Plan
 
-> **For Hermes:** Use the subagent-driven-development skill to implement this plan task-by-task. This document authorizes no deployment, cloud spending, or implementation by itself.
+> **For Hermes:** Use the subagent-driven-development skill to implement this plan task-by-task after separate implementation authorization. This revision is documentation only: no deployment, cloud spending, billing enablement, credentials, or merge is authorized.
 
-**Goal:** Let an existing coding agent create a Blender scene and render independent frames across a customer-owned GPU and bpy.dev cloud capacity, with a complete local-only path.
+**Goal:** Let an existing coding agent inspect and edit a local Blender scene, preview it, checkpoint and fork it, and obtain a valid capped render plus an editable `.blend`; then add explicitly authorized cloud execution of that checkpoint.
 
-**Architecture:** Fstack manages installations, releases, registered compute capacity, access, placement policy, and durable operations. Product adapters own workload semantics: bpy.dev owns Blender sessions and frame decomposition; Remesher owns mesh pipelines; Crusher owns email behavior. Start with explicit placement and one cloud provider rather than a general-purpose scheduler.
+**Architecture:** Reuse the bpy.dev enhanced Blender MCP runtime for the first complete local workflow. Public Fstack supplies provider-neutral installation, identity and durable operation contracts only where needed; private Fstack Cloud owns managed procurement and commercial operations. Prove local execution before adding one cloud target, and prove that target before distributing independent frames.
 
-**Tech stack:** Reuse Fstack's Python/FastAPI, PostgreSQL, identity, and durable provisioning contracts where applicable. Use Blender/bpy runners on existing Docker hosts and RunPod as the first proposed cloud GPU provider. Audit the existing product repositories before assigning runtime modules or introducing dependencies; do not select another queue or workflow engine merely for this slice.
+**Tech stack:** Existing Blender/bpy and enhanced MCP tooling; existing Fstack Python/FastAPI, PostgreSQL and durable provisioning/Temporal contracts where the audited integration requires them. Do not add a universal scheduler, queue, framework, or new core/cloud repository.
 
-## Status and approved decisions
+## Status and accepted direction
 
-Planning only. These capabilities are proposed, not implemented or certified by this document.
+Planning only. No runtime behavior is implemented or certified by this document.
 
-The user approved these defaults in conversation:
+- First useful deliverable: the existing-agent local inspect/edit/preview/checkpoint/fork/capped-render loop, with no cloud credentials, vendor endpoints, or subscription.
+- Second deliverable: one explicit cloud execution from an immutable checkpoint, with separate upload consent and a user-approved dollar spend cap. RunPod remains the proposed first GPU target, not an authorization to procure it.
+- The RTX 5090 plus one cloud GPU independent-frame demonstration is a later extension, **not a first-release gate**. Verify actual hardware/backend availability rather than assuming a machine label proves compatibility.
+- CLI/MCP first; use the existing client surface, not a new chat application or browser Blender editor. A minimal preview/files/status/cost view can follow demonstrated need.
+- Keep customer-operated core, runners and self-hosted product adapters open source and usable without vendor login or billing. Monetize provided compute and managed operation; optional team/compliance features are separate decisions. Basic local security remains core.
+- bpy.dev, Remesher and Crusher remain separate branded businesses with separate customer identity, credentials, billing, storage and data boundaries.
+- Patch is an interface reference, not a requirement for full compatibility.
 
-- Agent-first CLI/MCP, with a small web view for previews, jobs, artifacts, and costs; no new chat application or browser Blender editor.
-- Initial hybrid demonstration: the user's RTX 5090 machine plus one RunPod GPU; CPU execution uses the same runner contract. Availability and compatible Blender/GPU runtimes must be checked before execution.
-- Open-source deployment management, runners, product adapters, and enough coordination to run entirely on customer-owned machines without a vendor login or billing service.
-- Charge for provided cloud compute and managed operations. Decide optional commercial team/compliance features separately; basic local security remains core.
-- bpy.dev, Remesher, and Crusher remain separate branded businesses with separate customer identity, credentials, billing, storage, and data boundaries.
-- Patch is a workflow/interface reference, not the product specification. Do not commit to complete Patch compatibility.
+This bounded Fstack integration increment does not redefine the whole bpy.dev release. The existing whole-project plan still requires a Hermes plugin exposing the **full enhanced MCP capability surface**, including explicit live-session/UI prerequisites and local/hosted parity evidence. A successful headless loop is one useful increment, not proof of full plugin delivery or parity; do not silently hide unsupported tools.
 
-## Repository context and reconciliation
+## Verified repository ownership and existing authority
 
-On 2026-11-17, the public Fstack main README and tree were inspected through GitHub. Existing modules include `src/fstack/identity.py`, `provisioning.py`, `runtime_state.py`, `runtime_submission.py`, `runtime_application.py`, `docker_cli.py`, and the Temporal workflow/dispatch modules. Existing public contracts are documented in `docs/architecture/first-crusher-slice.md`, `local-crusher-execution-slice.md`, `temporal-provisioning.md`, and `first-billing-plane-slice.md`.
+Authenticated `gh repo list` for both `michaelgold` and `bpy-dev`, existing local `PROJECT.md`/README documents, and exact remote content reads establish the following ownership on 2026-11-17:
 
-The README currently puts managed fleet orchestration and hosted billing in private `fstack-cloud`, and names Remesher as the second abstraction proof. This plan proposes a narrower refinement: customer-operated runner registration, explicit placement, and coordination belong in public core; vendor capacity management and hosted commercial operations remain private. bpy.dev becomes the first hybrid-compute proof, while Remesher remains the second distinct GPU workload. Reconcile these statements in a documentation PR before implementing; do not silently rewrite frozen acceptance contracts.
+| Repository | Verified role and revision |
+| --- | --- |
+| [`bpy-dev/bpy-dev.github.io`](https://github.com/bpy-dev/bpy-dev.github.io/blob/89a66803cbe2c6ee19665e130b74fe376af708ee/PROJECT.md) | Public website and authoritative whole-project `PROJECT.md`; head `89a66803cbe2c6ee19665e130b74fe376af708ee`. Not the execution runtime. |
+| [`bpy-dev/blender-mcp`](https://github.com/bpy-dev/blender-mcp/tree/e8ac4088d4a3e0469d3eff9f9bb2dd717e899219) | Public enhanced MCP execution runtime; head `e8ac4088d4a3e0469d3eff9f9bb2dd717e899219`. Owns Blender inspection, execution, preview and saved-file behavior. |
+| [`michaelgold/buildbpy`](https://github.com/michaelgold/buildbpy) | Standalone bpy build/packaging tooling, not the product service. The whole-project plan pins its inspected README at `8113295240b0d95781fa4c043b6cfecba9a6eba7`; this is a historical source reference, not a fresh runtime certification. |
+| [`michaelgold/fstack`](https://github.com/michaelgold/fstack) | Public platform core; inspected main `0083f101a68204d78e74e0bf6da1a3b83b92dba6`. |
+| `michaelgold/fstack-cloud` | Separate private managed-service repository; inspected main `16db24748fbb426a72b70859ba3d45cf15686dbb`. Its merged documentation PR #41 records full bpy.dev integration as planned, not delivered. |
 
-### Repository ownership
+**Discovery result:** the product is split across the verified website/project-plan and enhanced MCP repositories; there is no need to invent a `bpy.dev` service repository. `buildbpy` was a researched packaging candidate, not the execution owner. Plugin packaging/distribution and the exact implementation file map remain open design work; this is not an unresolved repository-ownership blocker. Freeze that file map against the actual runtime tree before implementation, rather than inventing module names here.
 
-- **`michaelgold/fstack` (public core):** installation/release contracts, runner registration, authorization, explicit placement/reservation primitives, local coordination, and provider adapter interfaces. Owns the platform portions of Slices 0–4.
-- **`michaelgold/fstack-cloud` (private cloud):** vendor capacity procurement/operations, managed credentials, hosted quotas, rating and billing integration. Owns the managed-service portion of Slice 3 and managed cost reporting in Slices 4–5. Preserve unmodified OSS Lago and native Stripe; extend around Lago, not inside its core.
-- **bpy.dev product repository (locate in Slice 0):** Blender runners, sessions, scene packaging, frame decomposition, rendering validation, output assembly, and product HTTP/SDK/CLI/MCP/web interfaces. Owns product execution in Slices 1–5.
-- **Remesher and Crusher product repositories:** their domain-specific adapters and validation in Slice 6; no migration of product semantics into Fstack core.
+Read the current public `README.md`, `docs/STATUS.md`, `src/fstack/identity.py`, `provisioning.py`, `runtime_state.py`, `runtime_submission.py`, `runtime_application.py`, `docker_cli.py`, and existing Temporal dispatch contracts. Reuse existing seams; inspect `docs/architecture/first-crusher-slice.md`, `local-crusher-execution-slice.md`, `temporal-provisioning.md`, and `first-billing-plane-slice.md` before proposing extensions.
 
-This plan does not create another core/cloud repository or merge the existing repositories. Product runners and self-hosted adapters remain open source; managed business operations remain private. A generic self-hosted coordinator dispatches opaque tasks, while the product creates their dependency and retry semantics.
+Read private `docs/STATUS.md` and `docs/architecture/first-lago-billing-slice.md` at the current private revision. Its billing recovery/delivery gates remain open where recorded; a merged integration plan does not establish collection, eventual usage delivery, deployment or billing enablement. Preserve historical evidence and the stock OSS Lago/native Stripe direction.
 
-## Product/platform dividing line
+The public README's managed-fleet boundary and second-workload language need a scoped reconciliation before implementing any public coordination extension. Customer-operated explicit coordination may belong in core; vendor capacity management and hosted commercial operations remain private. This plan does not move the entire fleet layer into public core or make a runner registry a prerequisite for the first local scene edit.
 
-### Public Fstack responsibilities
+## Product/platform boundary
 
-- Installation and release identity; desired/observed deployment state.
-- Registration of explicitly trusted runners, supported runtime capabilities, health, and availability.
-- Lifecycle operations and durable placement/reservation handles.
-- Human-owned delegated agent credentials, authorization, revocation, and local audit records.
-- Local job coordination with explicit worker selection; customer-operated installations must not phone home.
-- Neutral usage facts and adapter interfaces, without embedded vendor billing identities.
+### Public Fstack
 
-### Product adapter responsibilities
+Installation/release identity, desired/observed deployment state, scoped human/agent authorization, durable lifecycle operations, local audit, and provider-neutral usage facts remain core. Add trusted runner registration, explicit placement or reservation only when the concrete workflow needs a missing contract. Customer-operated operation must not phone home or import private billing/provider identities.
 
-- **bpy.dev:** Blender runtime/version selection, persistent sessions, bpy execution, inspection/previews, scene packaging, checkpoints, frame/variation decomposition, render validation and output assembly.
-- **Remesher:** model/pipeline selection, stage dependencies, VRAM requirements, mesh/rig/export artifacts and domain-specific validation.
-- **Crusher:** services, migration/readiness/drain hooks, mail transport, sender policy, suppression and delivery/recovery semantics. Do not model email deliveries as generic GPU jobs.
+### Product-owned semantics
 
-Adapters declare required resources and supply lifecycle/readiness/drain hooks. Fstack must not import Blender scene logic, mesh logic, or email-recipient logic into its generic placement layer.
+- **bpy.dev:** Blender version/backend selection, sessions and saved files, inspection/edit/preview, checkpoint/fork, artifact packaging, render validation, and later independent-frame decomposition/assembly.
+- **Remesher:** model/pipeline selection, stage dependencies, VRAM, mesh/rig/export validation.
+- **Crusher:** migration/readiness/drain hooks, mail transport, sender policy, suppression and delivery/recovery semantics. Email deliveries are not generic GPU jobs.
 
-### Private managed-service responsibilities
+Keep Blender, mesh and recipient logic out of generic placement. Remesher/Crusher implementation is exclusively in the separate [small adapter follow-up plan](2026-11-17-product-adapter-follow-up.md); neither adapter is a dependency of local or checkpoint-cloud delivery.
 
-Vendor fleet capacity and procurement, managed credentials, hosted billing/rating, commercial quotas, and cross-installation operations. Keep each branded business's customer realm and ledger separate. Public usage/security contracts remain usable without these services.
+### Private Fstack Cloud
 
-## First acceptance demonstration
+Vendor capacity procurement, managed credentials, hosted quotas/rating/billing and commercial operations remain private. Preserve **unmodified stock OSS Lago and native Stripe collection through supported interfaces**; extend around Lago, not inside its core, and do not introduce a second billing engine. Separate branded realms and ledgers. Public security and usage contracts remain usable without these services.
 
-1. An existing coding agent connects through CLI or MCP to a local/self-hosted endpoint.
-2. A CPU runner creates a small editable scene, returns a preview, and saves an immutable scene/artifact manifest.
-3. The user explicitly permits cloud upload for this scene and specifies a cloud spending cap.
-4. bpy.dev decomposes independent animation frames into deterministic tasks.
-5. Explicit placement assigns some tasks to the customer RTX 5090 runner and some to one RunPod GPU runner.
-6. The coordinator collects verified outputs without duplicate accepted frames and reports which runner produced each one.
-7. The user downloads the editable `.blend`, frame outputs and provenance, and sees cloud charges separately from local execution.
-8. A local-only run succeeds with cloud credentials absent and vendor endpoints unavailable.
+## First acceptance: one local existing-agent loop
 
-No claim of shared GPU memory or transparent cross-machine rendering of one arbitrary frame. Multiple GPUs within one machine are a separate Blender/backend capability. Cross-machine work initially consists of independent frames, scenes, cameras or parameter variations. Simulations requiring sequential cache state are excluded until explicitly supported.
+Acceptance must run through the actual agent-facing MCP/CLI interface, not just internal helpers:
 
-## Minimal execution model
+1. Start from a small non-sensitive scene on a trusted local runner; inspect objects, current scene and runtime capabilities.
+2. Make a visible edit and obtain a preview; inspect again to verify the requested edit, not merely command success.
+3. Save an immutable checkpoint with input/dependency hashes and runtime provenance. Reopen the saved `.blend` in a fresh process to prove the edit persisted.
+4. Fork the checkpoint into a distinct editable output path; edit the fork and prove the original checkpoint bytes remain unchanged.
+5. Submit a bounded local render: explicit frame count, resolution, samples, wall-clock deadline and cancellation. Reject invalid/unsupported limits before work; enforce limits at execution, not only in the client.
+6. Decode the output, check dimensions and expected scene content, and return a downloadable valid render and editable `.blend` with matching provenance. A nonempty file or success status alone is insufficient.
+7. Repeat with cloud credentials absent and vendor endpoints blocked, capturing the negative network control. Local-only must never fall back to paid work.
+8. Exercise script failure, timeout/cancellation, changed-input retry and unauthorized artifact access. Preserve checkpoint/source files, return a stable operation handle, and verify child cleanup rather than relying on test teardown.
 
-Reuse existing entities and operation contracts before adding new ones. The implementation audit should establish the minimum equivalent of:
+A CPU backend is sufficient for this first acceptance. Local GPU execution is an optional next capability using the same saved scene/client contract; unsupported GPU hardware must yield a useful error, never implicit cloud fallback. No cloud registration, pricing integration or distributed scheduling is required to prove this loop.
 
-- **Runner:** installation-scoped identity, allowed capabilities, pinned runtime, resource limits and heartbeat.
-- **Job:** owner, immutable inputs, product operation, placement policy and maximum cloud spend.
-- **Task attempt:** deterministic logical task identity plus execution generation, claimed runner, lease and durable outcome.
-- **Artifact manifest:** authorized object references, content hashes, sizes, runtime provenance and dependencies.
+## Second acceptance: explicitly authorized checkpoint cloud execution
 
-Use enforced transitions, transactional conditional updates and narrow typed operations—not arbitrary enum assignments. A timed-out caller must retrieve the existing operation rather than start another billable job. Keep logical task success separate from attempt-level usage: a retried frame can incur real compute even when only one output is accepted.
+Only after local acceptance and separate execution authorization:
 
-Interactive scene mutation stays on one runner. Save/checkpoint before parallel rendering. Pin compatible Blender versions, render settings and dependencies across workers. Do not promise byte-identical GPU images across different architectures; define output completeness and appropriate visual tolerance instead.
+1. Select one immutable local checkpoint and its complete dependency manifest. Show exactly what would leave the machine; require explicit upload consent scoped to that checkpoint/assets and destination.
+2. Authenticate the account and delegated agent, verify current membership/scopes and entitlement, and obtain an explicit dollar spend cap and termination deadline. Upload consent, admission authority and spending approval are separate requirements.
+3. Reserve a conservative allowance before provisioning one cloud target. Pin compatible Blender/backend/dependencies and immutable image/artifact identity. An altered checkpoint requires renewed matching authorization.
+4. Execute one bounded render, fetch and validate outputs, and preserve the editable checkpoint plus runtime/output provenance.
+5. Exercise cancellation and ambiguous launch/response recovery. Read back actual resource termination; account for storage, transfer, stopping latency and outstanding provider charges separately.
+6. Reconcile accepted output separately from attempt usage and final cost; verify cloud denial leaves the local loop usable.
 
-## Delivery sequence
+Provider fixtures establish contract behavior, not live acceptance. A real-provider smoke needs its own explicit test budget/upload permission; illustrative prices below grant neither. Do not claim a spend cap prevents all delayed provider charges during an outage: stop new admission with conservative headroom, bound teardown attempts and expose unresolved liability/resource handles for reconciliation.
 
-### Slice 0 — audit and freeze the smallest contract
+## Delivery sequence: finish each useful increment
 
-**Files to read:** current Fstack modules and architecture documents listed above; `docs/STATUS.md`; current bpy.dev/buildbpy, Remesher and private cloud repository interfaces after locating their authoritative repositories.
+### Slice 0 — narrow existing-runtime audit
 
-**Documentation outputs proposed:**
-- `docs/architecture/hybrid-product-execution.md`
-- Update `README.md` and `docs/STATUS.md` to link this plan and explain the public/private boundary refinement.
+**Read:** the pinned product `PROJECT.md`, runtime `readme.md`, `readme_tools.rst`, `readme_bpy_backend.rst`, `SECURITY.md`, and the public/private contracts above.
 
-Steps:
-1. Record exact repository/base revisions and existing reusable APIs, runner code and authentication.
-2. Locate the actual bpy.dev repository/package; do not invent one or put Blender execution into Fstack to avoid the question.
-3. Map each acceptance step to an existing component or one required addition.
-4. Select supported runtime/version pins and write explicit request/result/error contracts.
-5. Record whether existing Temporal machinery is sufficient. Do not generalize workflow infrastructure without a concrete missing behavior.
+1. Inventory the actual registered capability surface and live-session versus saved-file prerequisites. Existing `_for_cli` tools use fresh subprocesses and require explicit saves to distinct paths; standalone bpy is not an interactive UI or OS sandbox.
+2. Map the first local acceptance steps to existing tools and only the missing behavior. Record supported version/platform pins; historical macOS evidence does not certify this Linux/RTX runtime.
+3. Freeze exact existing implementation/test paths and commands in the owning runtime repository before writing code. Record plugin packaging ownership without creating a new repository.
+4. Review the local request/result/error/limit contract and acceptance fixture. Propose Fstack changes only if an actual missing boundary prevents this loop.
 
-Gate: reviewed contract and exact implementation file map. No new universal scheduler, Kubernetes requirement or provider marketplace.
+**Exit:** an actionable file map and first behavioral test, not a new platform/framework inventory. Repository discovery is completed above; runtime compatibility and implementation mapping are still open. Stop if these cannot be established; do not put Blender execution into Fstack to evade ownership.
 
-### Slice 1 — one local CPU runner end to end
+### Slice 1 — deliver the local loop
 
-**Proposed Fstack additions, subject to Slice 0 reuse audit:** `src/fstack/runner_contracts.py`, `src/fstack/runner_registry.py`; tests `tests/test_runner_contracts.py`, `tests/test_runner_registry_postgres.py`. Extend existing identity/API seams only where needed. Product-specific execution files belong in the located bpy.dev repository.
+**Owner/files:** `bpy-dev/blender-mcp` runtime and its audited tests; update its existing runtime/tool/security guides where behavior changes. Exact code paths are a Slice 0 gate, not speculative Fstack additions.
 
-Steps:
-1. Write failing tests for scoped runner registration, unauthorized cross-installation access and bounded capability declarations.
-2. Implement only enough registration and dispatch to execute one Blender script on a local CPU runner.
-3. Return structured status, logs, a preview and downloadable `.blend` via the product API.
-4. Verify actual Blender execution, ownership isolation and local-only operation with vendor network access disabled.
+For each next observable behavior: write one failing agent-facing acceptance test, run it and confirm the expected missing behavior, implement the smallest change, then run the focused and affected tests and refactor. Start with inspect/edit/preview and persistence, then checkpoint/fork and capped render in the same complete local workflow. Include necessary ownership, valid-state, timeout and source-preservation failures in this slice, not as later polish.
 
-Gate: real CPU-produced artifacts, not mocked execution; no cloud account required.
+**Exit:** every first-acceptance step above passes with real Blender, decodable output and reopened editable `.blend`, plus cloud-off controls. Deliver this useful increment before provider integration. Do not label it full enhanced MCP/plugin parity.
 
-### Slice 2 — local GPU with the same client surface
+### Slice 2 — deliver one authorized cloud checkpoint
 
-**Proposed tests:** `tests/test_runner_placement_postgres.py`; product tests for CPU/GPU capability rejection and render output validity.
+**Owner/files:** product checkpoint packaging/client behavior in the audited runtime; provider-neutral admission/operation seam in public core only if missing; vendor credentials, spend reservation and managed billing composition in private cloud. Read and extend existing provisioning/identity contracts rather than creating parallel authorities.
 
-Steps:
-1. Add explicit compatible-runner selection and resource reservations.
-2. Verify live GPU/runtime capability rather than relying on machine labels.
-3. Run the same saved scene on the local GPU, preserving inputs and runtime provenance.
-4. Reject unsupported backends or insufficient memory with useful errors; never silently start paid cloud work.
+1. Drive consent/authorization/limit failures test-first, including cross-account access and changed-input retry rejection, before any external side effect.
+2. Add only the provider launch/lookup/cancel/teardown contract needed for one render; test lost responses and failed termination with controlled fixtures and real durable storage.
+3. Exercise the complete second acceptance under a separately approved budget, then verify teardown/cost readback. Keep customer-supplied provider credentials usable without our managed service where that mode is offered.
+4. Publish the exact evidence and unresolved charges or cleanup failures; fixtures and source review do not certify live operation.
 
-Gate: CPU and GPU operations use the same product-facing interface with explicit capabilities.
+**Exit:** authorized checkpoint-to-valid-output execution with bounded admission and honest cleanup/cost evidence. No hybrid frame scheduler or other product adapter is required.
 
-### Slice 3 — one cloud GPU and one bounded job
+### Later extension — independent-frame hybrid rendering
 
-**Location:** RunPod target adapter at the public provider-extension boundary established in Slice 0; vendor-owned credentials and billing composition in private `fstack-cloud`. Customer-supplied RunPod credentials must remain usable without our managed cloud.
+After Slices 1 and 2 are delivered, optionally verify local GPU support and split a saved scene into deterministic independent-frame tasks. Explicit placement may assign frames to a customer RTX 5090 and one cloud GPU. Test disconnected workers, interrupted attempts, one accepted output per frame, cancellation and exhausted budgets. bpy.dev owns decomposition/assembly; only a demonstrated shared need can justify a public dispatch abstraction.
 
-Steps:
-1. Test launch, lookup, cancellation and teardown using provider fixtures, including lost responses and failed termination.
-2. Add immutable image/artifact staging and explicit upload authorization.
-3. Reserve a bounded spend allowance before starting paid resources; reconcile actual usage afterward.
-4. Run one authorized real-provider smoke with a user-approved dollar cap and termination deadline.
-5. Read back actual resource termination; report residual provider charges and storage separately.
+This is **not a first-release gate**. No shared GPU memory, transparent multi-machine arbitrary single-frame rendering, or distributed sequential simulations are promised. Pin compatible runtimes/settings/dependencies; use representative visual tolerances rather than promise byte-identical images across GPU architectures.
 
-Gate: actual cloud output plus verified teardown and metering. Fixtures are not live-provider evidence. A client timeout does not authorize a second instance.
+### Client presentation, not another engine
 
-### Slice 4 — hybrid frame fan-out
+Use the existing MCP/client interface in Slice 1, not after infrastructure work. If HTTP/SDK/CLI wrappers are needed later, keep one canonical execution contract and thin mappings: inspect, edit, preview, checkpoint, fork, render, status, download, cancel. Add a minimal web view only when useful. A narrow Patch adapter requires a concrete client need and explicit compatibility tests, not resemblance alone.
 
-**Proposed Fstack additions if not already present:** `src/fstack/job_dispatch.py`; tests `tests/test_job_dispatch_postgres.py`, `tests/test_hybrid_job_recovery_postgres.py`. bpy.dev owns frame selection and assembly.
+## Valid-state, idempotency and security invariants
 
-Steps:
-1. Split a fixed saved scene into independent frame tasks with immutable input identity.
-2. Place tasks explicitly across the local GPU and one cloud runner; keep policies local-only/cloud-only/hybrid.
-3. Handle a disconnected local runner and an interrupted cloud attempt with durable attempt reconciliation.
-4. Verify exactly one accepted output per requested frame, preserved provenance, and honest attempt-level cost reporting.
-5. Demonstrate cancellation, exhausted budget and denied cloud upload without leaving untracked paid resources.
+- A session/checkpoint belongs to an authorized owner; immutable manifests bind inputs, dependencies, sizes, hashes and runtime. Interactive mutation has one writer; forks use distinct outputs.
+- Model legal transitions with narrow typed operations and transactional conditional updates, not arbitrary enum assignment. Reject malformed input before credentials, uploads or provider actions.
+- Reuse existing durable operation identity. Same request and identity returns the existing operation; changed inputs with that identity fail. A timed-out caller retrieves/reconciles rather than launches another billable job.
+- Keep logical success separate from execution attempts and usage. In later fan-out, deterministic task identity plus attempt generation/lease prevents duplicate accepted frames without erasing real retry costs.
+- A fresh subprocess or ordinary container sharing rootful Docker is not hostile-tenant isolation. Use trusted private local runners and separately isolated managed instances; do not place unrelated tenants in unrestricted runtimes. Never expose a Docker socket or cloud control-plane credentials to generated code.
+- Scope artifact access and agent grants; test expired/revoked credentials and cross-installation/tenant denials. A local agent does not gain human payment authority. Prefer authenticated outbound runner connections; do not expose workstation management ports publicly.
+- Local-only policy is enforced, not advisory. No cloud subscription/private repository dependency or silent fallback. Checkpoint uploads require specific consent; checkpoint contents and arbitrary scripts remain sensitive.
 
-Gate: the full acceptance demonstration above, including local-only negative network control.
+## Verification and bounded delivery discipline
 
-### Slice 5 — thin clients and product presentation
+This PR changes documentation only. Use focused document/link/consistency checks, `git diff --check`, the existing tracked-file secret scanner, and exact diff review. Do not manufacture RED/GREEN runtime evidence for a prose change. Retain failed CI evidence and let this normal documentation commit trigger a new PR run; no blind rerun, workflow weakening, protection changes or merge.
 
-Implement one canonical HTTP contract, then a small Python SDK, CLI and MCP mapping around it. Do not maintain three independent execution engines. Proposed client methods are illustrative, not a frozen API: start session, run script, preview, save, submit render, inspect job, download outputs, cancel.
+The predecessor run [44182080432](https://github.com/michaelgold/fstack/actions/runs/44182080432), bound to `7831f47465320fc93c38a5edeb278385f72e11bd`, failed in PostgreSQL service initialization: Docker timed out starting the userland proxy for port 5432. Checkout/tests never ran. Preserve that failure as pre-test infrastructure evidence, not a product regression or passing test result. Fresh protection inspection requires strict `verify`, enforces admins and requires zero approving reviews; zero required reviews is not permission to bypass CI or this task's no-merge boundary.
 
-Add only a basic page showing job/session state, preview, files and costs. No new agent chat, node editor or streamed Blender desktop in this slice. Provide useful structured errors and resumable job handles.
+For future code: exercise the actual caller interface with behavioral TDD; use real PostgreSQL for durable ownership/concurrency where required, never SQLite substitution. Confirm each expected failure before the minimal implementation, then affected integration tests and exact-source review before protected PR delivery. After two failed fixes sharing a premise, stop and test the premise/state ownership rather than adding guards or weakening gates.
 
-Evaluate a narrow Patch Blender adapter only after a real existing client/workflow benefits. Compatibility must explicitly identify supported endpoints and behavior; a look-alike interface is not a drop-in compatibility claim.
+Current public CI uses `uv sync --frozen`, `uv lock --check`, `git diff --check`, `uv run python tools/scan_tracked_secrets.py`, Ruff, mypy, migration roundtrip, `uv run pytest -q` with required PostgreSQL, and an installed-image build. Read `.github/workflows/ci.yml` at execution time; include new acceptance tests in mandatory discovery. A local focused document check is not a full-suite result. Keep skipped, blocked, fixture, real-runtime, live-provider, published and deployed evidence separate.
 
-### Slice 6 — validate reuse without broadening the first release
+## Illustrative commercial proposal — unapproved
 
-- Crusher: map its existing service deployment/readiness/drain hooks into the same installation/release management boundary; preserve its product-owned migration and mail semantics.
-- Remesher: register one GPU pipeline through the runner capability/artifact contracts. Keep model-stage orchestration inside Remesher.
-- Generalize only a concrete contract mismatch observed in these integrations. Do not require all products to launch together.
+Customer-operated core remains useful and open. Provided cloud compute and optional managed operation can be prepaid/bounded; bring-your-own-agent avoids forcing a second reasoning subscription. Local execution has no proposed vendor compute charge, but customer electricity/hardware are not free.
 
-## Verification and implementation discipline
+**The following USD numbers are an unapproved discussion example, not published customer terms, a price commitment, a provider quote, measured costs, or authorization to spend or charge.** Approval, provider selection and workload measurements are still required before adopting a rate card.
 
-For every code slice: demonstrate the intended failing test, make the minimal implementation pass, run affected integration tests, review the exact candidate, then use protected PR delivery. Use real PostgreSQL for persistence, concurrency and ownership assertions; no SQLite substitution.
+| Illustrative item | Hypothetical proposal |
+| --- | --- |
+| Credit denomination | 1 credit = $0.01 USD; a $10 balance = 1,000 credits |
+| Cloud CPU compute | 20 credits per allocated CPU-instance hour = $0.20/hour; instance specification still to be chosen |
+| Cloud GPU compute | 120 credits per allocated GPU-instance hour = $1.20/hour; GPU specification still to be chosen |
+| Metering example | 10 allocated GPU minutes at that rate = 20 credits = $0.20, before separately disclosed storage/transfer/taxes |
+| Hypothetical economics | If provider GPU cost were $0.80/hour, $1.20/hour revenue leaves $0.40/hour (33.33%) before storage, transfer, idle capacity, payment fees, support, taxes and other overhead |
 
-Existing Fstack development uses `uv sync --frozen` and `uv run pytest -q` with an explicit `FSTACK_TEST_DATABASE_URL`. Re-read current CI before choosing exhaustive commands: this document does not claim that a generic pytest invocation covers every required gate. Proposed test paths above must be included in mandatory CI discovery. Use separate disposable test databases, not production.
+Arithmetic was checked with Python; the cost assumption was **not measured**. Do not infer a margin or sustainable business from it. Measure provisioned versus useful runtime, startup/teardown, idle capacity, retries and all ancillary charges; define rounding, minimums, refunds, cap headroom and retention before a real offer. Show dollar equivalents and distinguish cloud charges from local work. Keep rate revisions/ledger policy private and provider-neutral usage facts public; preserve stock OSS Lago/native Stripe rather than building billing into the local loop.
 
-Live acceptance must separately establish:
-- Local CPU and actual GPU execution.
-- Agent ownership/scopes, runner revocation and cross-installation isolation.
-- Immutable input packaging, complete outputs and authorized artifact access.
-- Retry/cancellation correctness, orphan-resource detection and cleanup readback.
-- Cloud upload consent and local-only operation without vendor services.
-- Spend reservation, hard admission limits, provider termination behavior and final cost reconciliation.
-- Version/dependency compatibility and representative visual correctness.
+## Non-goals and next gate
 
-A budget cap is not an assertion that a provider can never bill after an API outage. Document stopping latency and conservative headroom; stop new admission before the remaining allowance is insufficient.
+No new chat/editor, full Patch clone, universal multi-cloud scheduler, price arbitrage, Kubernetes requirement, new identity/billing/queue framework, shared cross-business customer database, production deployment or paid cloud test. No Remesher/Crusher adapter implementation in this delivery sequence.
 
-## Security and data handling
-
-A runner executes agent-controlled code. An ordinary container sharing a rootful Docker daemon is not a hostile-tenant isolation guarantee. For the first slice, use customer-trusted private runners and isolated managed job instances; do not schedule unrelated tenants into the same unrestricted runtime. Never hand agent code cloud control-plane credentials or a Docker socket.
-
-Customer-owned runners should make authenticated outbound connections; do not require exposing a workstation's management port publicly. Scope artifact access per installation/job. Explicitly decide which scene assets may leave the machine, and offer a local-only policy that cannot silently fall back to cloud.
-
-## Non-goals
-
-- Full Patch platform or SDK cloning; games, repository hosting and publishing.
-- Universal multi-cloud scheduling or automatic price arbitrage.
-- Transparent multi-machine single-frame rendering, distributed memory or arbitrary distributed simulation.
-- New identity platform, billing engine, queue framework or workflow rewrite.
-- A shared customer account/database across the three businesses.
-- Production fleet/compliance features before the first usable hybrid render.
-- Deployment of this plan or a paid cloud test without the appropriate separate authorization.
-
-## Business model
-
-Keep customer-operated core useful and open. Monetize provided cloud CPU/GPU capacity and optional managed operation. Show understandable money equivalents and distinguish cloud charges from customer-owned compute; do not imply local electricity is free. Start with prepaid/bounded cloud usage rather than an unlimited AI subscription. Bring-your-own-agent avoids forcing customers to purchase a second reasoning product.
+Next implementation gate (not authorized by this PR): freeze the exact local runtime file map and acceptance fixture, then prove the first local loop. Before cloud work, verify compatible local/cloud runtimes and actual provider capacity, secure explicit upload permission and a real dollar budget. The unapproved rate illustration is not that budget. Full Hermes capability parity, hosted live-session provisioning, plugin distribution and later hybrid rendering remain separately evidenced work; do not let them replace the first useful local outcome.
 
 ## Reference and compatibility notes
 
-Inspected on 2026-11-17:
-- https://docs.patch.gg/blender — session, checkpoint, rendering and usage workflow.
-- https://docs.patch.gg/cli — CLI/agent integration and structured responses.
-- https://docs.patch.gg/mcp-server — MCP mapping over the HTTP API.
-- https://patch.gg/api/v1/openapi.json — published HTTP surface.
-- https://www.npmjs.com/package/@patchgg/cli — inspected package metadata declares MIT and links to https://github.com/patch-gg/pch.
-
-These sources establish an interface reference, not a tested interoperability claim. Confirm actual repository licenses and dependency notices before reusing code; the CLI license does not imply that Patch's hosted backend is open source. Preserve Fstack core's Apache-2.0 boundary and any third-party notices.
-
-## Decisions still requiring implementation-time evidence
-
-No further product-direction decision is needed to begin Slice 0. Before spending or deployment, establish the actual bpy.dev repository, usable local runner host, supported Blender/GPU version combination, RunPod account/region capacity, an explicit test budget, and data-upload permission. Pick concrete numbers from measured workloads rather than adding speculative configuration up front.
+The earlier plan inspected https://docs.patch.gg/blender, https://docs.patch.gg/cli, https://docs.patch.gg/mcp-server, https://patch.gg/api/v1/openapi.json and https://www.npmjs.com/package/@patchgg/cli on 2026-11-17. These are interface references, not interoperability certification. The CLI package's MIT metadata does not imply its hosted backend is open source. Verify actual code licenses/notices before reuse and preserve Fstack core's Apache-2.0 boundary.
