@@ -165,6 +165,26 @@ class IdentityAuthority:
         if row is None or not set(scopes).issubset(row[0]):
             raise denied()
 
+    def require_agent_read(self, db: Connection, request: Request, account: UUID) -> datetime:
+        """Existing account:read authority; never authorizes workload execution."""
+        header = request.headers.get("authorization", "")
+        if not header.startswith("Bearer fs_a_") or len(header) > 256:
+            raise denied(401)
+        row = (
+            db.execute(
+                text("""SELECT * FROM auth_grants WHERE digest=:d AND account_id=:a
+                AND audience=:aud AND NOT revoked AND expires_at>clock_timestamp() FOR SHARE"""),
+                {"d": self.digest(header[7:]), "a": account, "aud": AUDIENCE},
+            )
+            .mappings()
+            .first()
+        )
+        if row is None or "account:read" not in row["scopes"]:
+            raise denied()
+        self.member(db, row["principal_id"], account, row["scopes"])
+        self.live(db, row["expires_at"])
+        return row["expires_at"]  # type: ignore[no-any-return]
+
     def require_owner(self, db: Connection, request: Request, account: UUID) -> UUID:
         """Human current owner only; account:read agent grants confer no authority here."""
         principal, expires = self.human(db, request)
@@ -518,26 +538,12 @@ def mount_identity(engine: Engine, config: AuthConfiguration) -> APIRouter:
 
     @router.get("/v1/agent/accounts/{account}")
     def account_read(account: UUID, request: Request) -> dict[str, str]:
-        header = request.headers.get("authorization", "")
-        if not header.startswith("Bearer fs_a_") or len(header) > 256:
-            raise denied(401)
         with engine.begin() as db:
-            row = (
-                db.execute(
-                    text("""SELECT * FROM auth_grants WHERE digest=:d AND account_id=:a
-                AND audience=:aud AND NOT revoked AND expires_at>clock_timestamp() FOR SHARE"""),
-                    {"d": digest(header[7:]), "a": account, "aud": AUDIENCE},
-                )
-                .mappings()
-                .first()
-            )
-            if row is None or "account:read" not in row["scopes"]:
-                raise denied()
-            member(db, row["principal_id"], account, row["scopes"])
+            expires = authority.require_agent_read(db, request, account)
             name: str = db.execute(
                 text("SELECT name FROM organizations WHERE id=:a"), {"a": account}
             ).scalar_one()
-            live(db, row["expires_at"])
+            live(db, expires)
         return {"account_id": str(account), "name": name}
 
     @router.post("/v1/auth/grants/{grant}/revoke")
