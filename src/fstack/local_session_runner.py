@@ -107,7 +107,9 @@ def _supervise() -> int:
         signal.signal(signal.SIGINT, lambda *_: stopped.set())
 
         def eof():  # type: ignore[no-untyped-def]
-            sys.stdin.buffer.read(1)
+            # A daemon may still be waiting at interpreter shutdown on expiry.
+            # Never hold Python's buffered-reader lock across this blocking read.
+            os.read(sys.stdin.fileno(), 1)
             stopped.set()
 
         threading.Thread(target=eof, daemon=True).start()

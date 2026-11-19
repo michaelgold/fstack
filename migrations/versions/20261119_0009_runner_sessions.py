@@ -76,6 +76,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Admission locks the runner before touching sessions. Fence both relations
+    # in that order, without waiting behind an uncommitted admission/history row.
+    op.execute("LOCK TABLE local_runners, local_sessions IN ACCESS EXCLUSIVE MODE NOWAIT")
     op.execute("""DO $$ BEGIN
         IF EXISTS (SELECT 1 FROM local_sessions) THEN
             RAISE EXCEPTION 'retained session history prevents downgrade';
