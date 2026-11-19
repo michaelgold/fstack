@@ -33,6 +33,7 @@ from fstack.provisioning import (
     ProvisioningResponse,
     ProvisioningStatusResponse,
 )
+from fstack.runner_discovery import mount_runner_discovery
 from fstack.service import (
     EntitlementQuotaExceededError,
     EntitlementStateUnavailableError,
@@ -121,13 +122,14 @@ def create_app(*, auth_configuration: AuthConfiguration | None = None) -> FastAP
     identity = auth_configuration or load_auth_configuration()
     if identity is not None:
         app.include_router(mount_identity(engine, identity))
+        app.include_router(mount_runner_discovery(engine, identity))
 
     @app.middleware("http")
     async def identity_privacy(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        if not request.url.path.startswith(("/v1/auth/", "/v1/agent/", "/auth/")):
+        if not request.url.path.startswith(("/v1/auth/", "/v1/agent/", "/v1/runners/", "/auth/")):
             return await call_next(request)
         try:
             response = await call_next(request)
