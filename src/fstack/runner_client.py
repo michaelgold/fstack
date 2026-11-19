@@ -8,17 +8,11 @@ import os
 import stat
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from uuid import UUID
 
 from fstack.runner_discovery import Report
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
-        raise HTTPError("", 403, "redirect refused", {}, None)  # type: ignore[arg-type]
+from fstack.runner_transport import exchange_json
 
 
 def report_once(
@@ -60,28 +54,23 @@ def report_once(
         raise ValueError("invalid runner configuration")
     runner = UUID(runner_id)
     report = Report(sequence=sequence, available_slots=available_slots, queue_depth=queue_depth)
-    request = Request(
-        f"{origin}/v1/runners/{runner}/report",
-        data=report.model_dump_json().encode(),
-        method="POST",
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
-    )
     result: dict[str, Any] | None = None
     try:
-        with build_opener(ProxyHandler({}), NoRedirect()).open(request, timeout=10) as response:
-            raw = response.read(4097)
-            if response.status != 200 or len(raw) > 4096:
-                raise ValueError
-            decoded = json.loads(raw)
-            if (
-                not isinstance(decoded, dict)
-                or set(decoded) != {"runner_id", "sequence", "observed_at"}
-                or decoded["runner_id"] != str(runner)
-                or decoded["sequence"] != sequence
-                or not isinstance(decoded["observed_at"], str)
-            ):
-                raise ValueError
-            result = decoded
+        decoded = exchange_json(
+            origin,
+            f"/v1/runners/{runner}/report",
+            token,
+            report.model_dump(),
+            allow_loopback_http=allow_loopback_http,
+        )
+        if (
+            set(decoded) != {"runner_id", "sequence", "observed_at"}
+            or decoded["runner_id"] != str(runner)
+            or decoded["sequence"] != sequence
+            or not isinstance(decoded["observed_at"], str)
+        ):
+            raise ValueError
+        result = decoded
     except Exception:
         pass  # No URL, token, response body, or exception context is exposed.
     if result is None:
